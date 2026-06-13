@@ -1,0 +1,5 @@
+[mcp_servers.sqlserver_mcp]
+type = "stdio"
+command = 'C:\Tools\sqlserver-mcp\sqlserver_mcp.exe'
+args = ["--config", 'C:\Tools\sqlserver-mcp\sqlserver_mcp.json']
+startup_timeout_sec = 30

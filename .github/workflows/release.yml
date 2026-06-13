@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet test SqlServerMcp.sln --nologo
+      - name: Publish
+        shell: pwsh
+        run: |
+          dotnet publish src\SqlServerMcp\SqlServerMcp.csproj -c Release -r win-x64 --self-contained false -o artifacts\publish
+          Copy-Item docs\sqlserver_mcp.example.json artifacts\publish\sqlserver_mcp.example.json
+          Copy-Item LICENSE artifacts\publish\LICENSE
+          Copy-Item README.md artifacts\publish\README.md
+          Copy-Item README.zh-CN.md artifacts\publish\README.zh-CN.md
+          Compress-Archive -Path artifacts\publish\* -DestinationPath artifacts\sqlserver-mcp-win-x64.zip
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME artifacts\sqlserver-mcp-win-x64.zip --title $env:GITHUB_REF_NAME --generate-notes

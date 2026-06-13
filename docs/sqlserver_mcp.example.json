@@ -1,0 +1,30 @@
+{
+  "server": "localhost,1433",
+  "database": "SampleDb",
+  "credentialTarget": "sqlserver-mcp/SampleDb",
+  "limits": {
+    "defaultLimit": 50,
+    "maxRows": 500,
+    "maxResultMb": 5,
+    "maxTextLength": 1000,
+    "lockTimeoutMs": 5000,
+    "commandTimeoutSeconds": 20,
+    "connectTimeoutSeconds": 10
+  },
+  "security": {
+    "allowDmvQueries": true,
+    "allowServerLevelDmv": false,
+    "allowCrossDatabase": false,
+    "allowSystemDatabases": false
+  },
+  "logging": {
+    "logSql": false,
+    "maxFileSizeMb": 10,
+    "maxRetainedFiles": 7
+  },
+  "connection": {
+    "encrypt": true,
+    "trustServerCertificate": false,
+    "applicationIntent": "ReadOnly"
+  }
+}
