@@ -22,7 +22,7 @@ public static class SqlServerMcpTools
         return service.HealthCheckAsync(cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Find SQL Server tables, views, procedures, and functions by object name, schema, columns, or MS_Description.")]
+    [McpServerTool(ReadOnly = true), Description("First-step discovery for tables, views, procedures, and functions by object name, schema, columns, or MS_Description. Use before overview/definition tools when the exact object is unknown.")]
     public static Task<string> FindObjects(
         SqlServerToolService service,
         [Description("Keyword text. Space-separated terms are matched independently.")] string keyword,
@@ -46,7 +46,7 @@ public static class SqlServerMcpTools
         return service.DescribeTableAsync(schema, name, includeIndexes, includeConstraints, includeForeignKeys, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Return a compact overview for a table, view, procedure, function, or trigger: object metadata, storage estimate, columns, indexes, constraints, foreign keys, and optional dependencies.")]
+    [McpServerTool(ReadOnly = true), Description("Object card for a known table, view, procedure, function, or trigger: metadata, dates, storage estimate, columns, indexes, constraints, foreign keys, triggers, and optional dependencies.")]
     public static Task<string> GetObjectOverview(
         SqlServerToolService service,
         [Description("Schema name, usually dbo.")] string schema,
@@ -100,7 +100,7 @@ public static class SqlServerMcpTools
         return service.GetForeignKeysAsync(schema, name, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Search view, procedure, function, and trigger definitions by keyword.")]
+    [McpServerTool(ReadOnly = true), Description("Search SQL module definitions by keyword and return snippets. Use get_module_definition with keyword/startLine for deeper inspection of a selected module.")]
     public static Task<string> SearchSqlModules(
         SqlServerToolService service,
         [Description("Keyword text to search in sys.sql_modules.definition.")] string keyword,
@@ -111,14 +111,27 @@ public static class SqlServerMcpTools
         return service.SearchSqlModulesAsync(keyword, objectTypes, limit, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Return a view, procedure, function, or trigger definition. Returns a clear VIEW DEFINITION error if SQL Server hides the definition.")]
+    [McpServerTool(ReadOnly = true), Description("Return a view, procedure, function, or trigger definition. Optionally return a line range or keyword-centered slices with line numbers.")]
     public static Task<string> GetModuleDefinition(
         SqlServerToolService service,
         [Description("Schema name, usually dbo.")] string schema,
         [Description("Module name.")] string name,
+        [Description("Optional keyword. When no line range is supplied, only matching lines plus context are returned.")] string? keyword = null,
+        [Description("Optional 1-based start line. Use with endLine to return a slice.")] int? startLine = null,
+        [Description("Optional 1-based end line. Defaults to the final line when startLine is supplied.")] int? endLine = null,
+        [Description("Context lines around keyword matches. Defaults to 3 and is capped.")] int? contextLines = null,
+        [Description("Include a structured lines array with lineNumber and text. Returned automatically for partial selections.")] bool includeLineNumbers = false,
         CancellationToken cancellationToken = default)
     {
-        return service.GetModuleDefinitionAsync(schema, name, cancellationToken);
+        return service.GetModuleDefinitionAsync(
+            schema,
+            name,
+            keyword,
+            startLine,
+            endLine,
+            contextLines,
+            includeLineNumbers,
+            cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Return incoming and/or outgoing SQL Server dependencies for an object using sys.sql_expression_dependencies plus text-search fallback for incoming module references.")]
@@ -132,7 +145,7 @@ public static class SqlServerMcpTools
         return service.GetDependenciesAsync(schema, name, direction, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Find where a table, column, procedure, function, or token is used in columns and SQL module definitions, returning structured matches and snippets.")]
+    [McpServerTool(ReadOnly = true), Description("Usage discovery for a table, column, procedure, function, or token across column names and SQL module definitions, returning structured matches and snippets.")]
     public static Task<string> FindUsage(
         SqlServerToolService service,
         [Description("Object, column, or token name to search for.")] string name,
@@ -144,17 +157,39 @@ public static class SqlServerMcpTools
         return service.FindUsageAsync(name, schema, objectTypes, limit, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Run one read-only SELECT or WITH CTE query. Complex joins are allowed; writes, DDL, EXEC, WAITFOR, SELECT INTO, USE, and cross-database references are rejected.")]
+    [McpServerTool(ReadOnly = true), Description("Search configured application/configuration text columns by keyword. Targets are allow-listed in sqlserver_mcp.json textSearch.targets.")]
+    public static Task<string> SearchConfigText(
+        SqlServerToolService service,
+        [Description("Keyword text. Space-separated terms are matched independently.")] string keyword,
+        [Description("Optional configured text search profile name. When omitted, all enabled profiles are searched.")] string? profile = null,
+        [Description("Maximum matches to return; capped by server config.")] int? limit = null,
+        CancellationToken cancellationToken = default)
+    {
+        return service.SearchConfigTextAsync(keyword, profile, limit, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Run one guarded read-only SELECT or WITH CTE query with optional named parameters. Use describe_query_result first when only result shape is needed.")]
     public static Task<string> RunReadonlyQuery(
         SqlServerToolService service,
         [Description("Single read-only SELECT or WITH CTE query.")] string sql,
+        [Description("Optional named SQL parameters, for example { \"id\": 123, \"name\": \"abc\" }. Use @id and @name in SQL.")] Dictionary<string, object?>? parameters = null,
         [Description("Maximum rows to return; capped by server config.")] int? maxRows = null,
         CancellationToken cancellationToken = default)
     {
-        return service.RunReadonlyQueryAsync(sql, maxRows, cancellationToken);
+        return service.RunReadonlyQueryAsync(sql, parameters, maxRows, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Return SQL Server SHOWPLAN XML for one read-only SELECT or WITH CTE query without executing the target query.")]
+    [McpServerTool(ReadOnly = true), Description("Describe the result columns for one guarded read-only SELECT or WITH CTE query without executing it.")]
+    public static Task<string> DescribeQueryResult(
+        SqlServerToolService service,
+        [Description("Single read-only SELECT or WITH CTE query to describe.")] string sql,
+        [Description("Optional named SQL parameters used to infer parameter definitions.")] Dictionary<string, object?>? parameters = null,
+        CancellationToken cancellationToken = default)
+    {
+        return service.DescribeQueryResultAsync(sql, parameters, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Return SQL Server SHOWPLAN XML for one guarded read-only SELECT or WITH CTE query without executing the target query.")]
     public static Task<string> ExplainQueryPlan(
         SqlServerToolService service,
         [Description("Single read-only SELECT or WITH CTE query to explain.")] string sql,

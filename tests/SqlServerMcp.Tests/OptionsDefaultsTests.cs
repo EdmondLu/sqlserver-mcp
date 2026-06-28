@@ -21,4 +21,13 @@ public sealed class OptionsDefaultsTests
 
         Assert.False(options.LogSql);
     }
+
+    [Fact]
+    public void TextSearchOptions_HaveNoTargetsByDefault()
+    {
+        var options = new TextSearchOptions();
+
+        Assert.Empty(options.Targets);
+        Assert.Equal(240, options.SnippetLength);
+    }
 }

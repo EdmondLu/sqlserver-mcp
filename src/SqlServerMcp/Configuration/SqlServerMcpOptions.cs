@@ -16,6 +16,8 @@ public sealed class SqlServerMcpOptions
 
     public SecurityOptions Security { get; init; } = new();
 
+    public TextSearchOptions TextSearch { get; init; } = new();
+
     public LoggingOptions Logging { get; init; } = new();
 
     public ConnectionOptions Connection { get; init; } = new();
@@ -82,6 +84,7 @@ public sealed class SqlServerMcpOptions
         }
 
         Limits.Normalize();
+        TextSearch.Normalize();
         Logging.Normalize();
     }
 }
@@ -141,6 +144,38 @@ public sealed class SecurityOptions
     public bool AllowCrossDatabase { get; set; }
 
     public bool AllowSystemDatabases { get; set; }
+}
+
+public sealed class TextSearchOptions
+{
+    public TextSearchTargetOptions[] Targets { get; set; } = [];
+
+    public int SnippetLength { get; set; } = 240;
+
+    public void Normalize()
+    {
+        SnippetLength = Math.Clamp(SnippetLength, 80, 1000);
+        Targets = Targets
+            .Where(target => target is not null)
+            .ToArray();
+    }
+}
+
+public sealed class TextSearchTargetOptions
+{
+    public string Profile { get; set; } = "default";
+
+    public string Schema { get; set; } = "dbo";
+
+    public string Table { get; set; } = string.Empty;
+
+    public string TextColumn { get; set; } = string.Empty;
+
+    public string? KeyColumn { get; set; }
+
+    public string? NameColumn { get; set; }
+
+    public bool Enabled { get; set; } = true;
 }
 
 public sealed class LoggingOptions

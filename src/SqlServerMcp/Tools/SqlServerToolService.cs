@@ -108,11 +108,27 @@ public sealed class SqlServerToolService
         return ExecuteAsync("search_sql_modules", () => _metadataService.SearchSqlModulesAsync(keyword, objectTypes, limit, cancellationToken));
     }
 
-    public Task<string> GetModuleDefinitionAsync(string schema, string name, CancellationToken cancellationToken)
+    public Task<string> GetModuleDefinitionAsync(
+        string schema,
+        string name,
+        string? keyword,
+        int? startLine,
+        int? endLine,
+        int? contextLines,
+        bool includeLineNumbers,
+        CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "get_module_definition",
-            () => _metadataService.GetModuleDefinitionAsync(schema, name, cancellationToken),
+            () => _metadataService.GetModuleDefinitionAsync(
+                schema,
+                name,
+                keyword,
+                startLine,
+                endLine,
+                contextLines,
+                includeLineNumbers,
+                cancellationToken),
             schema,
             name);
     }
@@ -144,11 +160,37 @@ public sealed class SqlServerToolService
             name);
     }
 
-    public Task<string> RunReadonlyQueryAsync(string sql, int? maxRows, CancellationToken cancellationToken)
+    public Task<string> SearchConfigTextAsync(
+        string keyword,
+        string? profile,
+        int? limit,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "search_config_text",
+            () => _metadataService.SearchConfigTextAsync(keyword, profile, limit, cancellationToken));
+    }
+
+    public Task<string> RunReadonlyQueryAsync(
+        string sql,
+        IReadOnlyDictionary<string, object?>? parameters,
+        int? maxRows,
+        CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "run_readonly_query",
-            () => _metadataService.RunReadonlyQueryAsync(sql, maxRows, cancellationToken),
+            () => _metadataService.RunReadonlyQueryAsync(sql, parameters, maxRows, cancellationToken),
+            sql: _options.Logging.LogSql ? sql : null);
+    }
+
+    public Task<string> DescribeQueryResultAsync(
+        string sql,
+        IReadOnlyDictionary<string, object?>? parameters,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "describe_query_result",
+            () => _metadataService.DescribeQueryResultAsync(sql, parameters, cancellationToken),
             sql: _options.Logging.LogSql ? sql : null);
     }
 

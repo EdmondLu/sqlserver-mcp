@@ -1,6 +1,8 @@
 using System.Data;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Data.SqlClient;
 using SqlServerMcp.Configuration;
 using SqlServerMcp.Infrastructure;
@@ -9,6 +11,9 @@ namespace SqlServerMcp.Sql;
 
 public sealed class SqlMetadataService
 {
+    private const int DefaultModuleContextLines = 3;
+    private const int MaxModuleContextLines = 50;
+
     private readonly SqlServerMcpOptions _options;
     private readonly SqlConnectionFactory _connectionFactory;
     private readonly ReadonlySqlGuard _sqlGuard;
@@ -156,6 +161,19 @@ public sealed class SqlMetadataService
             },
             limits = _options.Limits,
             security = _options.Security,
+            textSearch = new
+            {
+                snippetLength = _options.TextSearch.SnippetLength,
+                targetCount = _options.TextSearch.Targets.Length,
+                enabledTargetCount = _options.TextSearch.Targets.Count(target => target.Enabled),
+                profiles = _options.TextSearch.Targets
+                    .Where(target => target.Enabled)
+                    .Select(target => target.Profile)
+                    .Where(profile => !string.IsNullOrWhiteSpace(profile))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(profile => profile)
+                    .ToArray()
+            },
             connection,
             permissions,
             error,
@@ -177,7 +195,7 @@ public sealed class SqlMetadataService
 
         var objectTypeCodes = ObjectTypeMapper.MapObjectTypes(objectTypes);
         var effectiveLimit = _options.Limits.ClampRows(limit);
-        var rowLimit = Math.Min(effectiveLimit * 20, 5000);
+        var rowLimit = Math.Min((effectiveLimit + 1) * 20, 5000);
         var parameters = new List<SqlParameter>
         {
             new("@rowLimit", SqlDbType.Int) { Value = rowLimit }
@@ -247,6 +265,8 @@ public sealed class SqlMetadataService
             reader.GetBooleanFromInt("matched_column_description")),
             cancellationToken);
 
+        var distinctObjectCount = rows.Select(row => row.ObjectId).Distinct().Count();
+        var truncated = distinctObjectCount > effectiveLimit || rows.Count >= rowLimit;
         var items = rows
             .GroupBy(row => row.ObjectId)
             .Take(effectiveLimit)
@@ -286,7 +306,11 @@ public sealed class SqlMetadataService
         {
             items,
             count = items.Length,
-            truncated = rows.Select(row => row.ObjectId).Distinct().Count() > effectiveLimit
+            limit = effectiveLimit,
+            truncated,
+            hint = truncated
+                ? "Narrow keyword terms, pass objectTypes, or increase limit within the configured server cap."
+                : null
         };
     }
 
@@ -363,6 +387,9 @@ public sealed class SqlMetadataService
             foreignKeys = isTableOrView
                 ? await GetForeignKeysCoreAsync(dbObject.ObjectId, cancellationToken)
                 : null,
+            triggers = isTableOrView
+                ? await GetTriggersCoreAsync(dbObject.ObjectId, cancellationToken)
+                : null,
             dependencies = includeDependencies
                 ? await GetDependenciesAsync(dbObject.Schema, dbObject.Name, null, cancellationToken)
                 : null
@@ -381,6 +408,7 @@ public sealed class SqlMetadataService
         }
 
         var effectiveLimit = _options.Limits.ClampRows(limit);
+        var queryLimit = effectiveLimit + 1;
         var sql = $"""
                    SELECT TOP (@limit)
                        schema_name=S.name,
@@ -413,7 +441,7 @@ public sealed class SqlMetadataService
         var rows = await QueryAsync(
             sql,
             [
-                new("@limit", SqlDbType.Int) { Value = effectiveLimit },
+                new("@limit", SqlDbType.Int) { Value = queryLimit },
                 new("@column", SqlDbType.NVarChar, 256) { Value = parameterValue }
             ],
             reader => new
@@ -435,8 +463,13 @@ public sealed class SqlMetadataService
 
         return new
         {
-            items = rows,
-            count = rows.Count
+            items = rows.Take(effectiveLimit).ToArray(),
+            count = Math.Min(rows.Count, effectiveLimit),
+            limit = effectiveLimit,
+            truncated = rows.Count > effectiveLimit,
+            hint = rows.Count > effectiveLimit
+                ? "Use exact=true for a specific column, add a narrower column search text, or increase limit within the configured cap."
+                : null
         };
     }
 
@@ -495,7 +528,7 @@ public sealed class SqlMetadataService
         var effectiveLimit = _options.Limits.ClampRows(limit);
         var parameters = new List<SqlParameter>
         {
-            new("@limit", SqlDbType.Int) { Value = effectiveLimit }
+            new("@limit", SqlDbType.Int) { Value = effectiveLimit + 1 }
         };
 
         var termPredicates = new List<string>();
@@ -542,14 +575,30 @@ public sealed class SqlMetadataService
             },
             cancellationToken);
 
+        var items = rows.Take(effectiveLimit).ToArray();
+        var truncated = rows.Count > effectiveLimit;
+
         return new
         {
-            items = rows,
-            count = rows.Count
+            items,
+            count = items.Length,
+            limit = effectiveLimit,
+            truncated,
+            hint = truncated
+                ? "Use objectTypes or get_module_definition with keyword/startLine to inspect a narrower module slice."
+                : null
         };
     }
 
-    public async Task<object> GetModuleDefinitionAsync(string schema, string name, CancellationToken cancellationToken)
+    public async Task<object> GetModuleDefinitionAsync(
+        string schema,
+        string name,
+        string? keyword,
+        int? startLine,
+        int? endLine,
+        int? contextLines,
+        bool includeLineNumbers,
+        CancellationToken cancellationToken)
     {
         const string sql = """
                            SELECT TOP 1
@@ -596,7 +645,41 @@ public sealed class SqlMetadataService
                 "Grant VIEW DEFINITION to the MCP SQL login, or inspect the module definition from source control.");
         }
 
-        return module;
+        var definition = module.definition!;
+        var slice = BuildModuleDefinitionSlice(
+            definition,
+            keyword,
+            startLine,
+            endLine,
+            contextLines,
+            _options.Limits.MaxRows);
+
+        return new
+        {
+            module.schema,
+            module.name,
+            module.type,
+            module.typeDesc,
+            definition = slice.Definition,
+            definitionLength = definition.Length,
+            definitionSha256 = ComputeSha256Hex(definition),
+            lineCount = slice.TotalLines,
+            selection = new
+            {
+                slice.Reason,
+                keyword = string.IsNullOrWhiteSpace(keyword) ? null : keyword,
+                slice.ContextLines,
+                slice.StartLine,
+                slice.EndLine,
+                slice.SelectedLineCount,
+                slice.IsPartial,
+                slice.Truncated,
+                slice.MatchedLines
+            },
+            lines = includeLineNumbers || slice.IsPartial
+                ? slice.Lines
+                : null
+        };
     }
 
     public async Task<object> GetDependenciesAsync(
@@ -652,8 +735,12 @@ public sealed class SqlMetadataService
         }
 
         var effectiveLimit = _options.Limits.ClampRows(limit);
-        var columnMatches = await FindUsageColumnMatchesAsync(name, schema, effectiveLimit, cancellationToken);
-        var moduleMatches = await FindUsageModuleMatchesAsync(name, schema, objectTypes, effectiveLimit, cancellationToken);
+        var columnMatchesRaw = await FindUsageColumnMatchesAsync(name, schema, effectiveLimit + 1, cancellationToken);
+        var moduleMatchesRaw = await FindUsageModuleMatchesAsync(name, schema, objectTypes, effectiveLimit + 1, cancellationToken);
+        var columnMatches = columnMatchesRaw.Take(effectiveLimit).ToArray();
+        var moduleMatches = moduleMatchesRaw.Take(effectiveLimit).ToArray();
+        var columnMatchesTruncated = columnMatchesRaw.Length > effectiveLimit;
+        var moduleMatchesTruncated = moduleMatchesRaw.Length > effectiveLimit;
 
         return new
         {
@@ -662,7 +749,100 @@ public sealed class SqlMetadataService
             columnMatches,
             moduleMatches,
             columnMatchCount = columnMatches.Length,
-            moduleMatchCount = moduleMatches.Length
+            moduleMatchCount = moduleMatches.Length,
+            limit = effectiveLimit,
+            truncated = columnMatchesTruncated || moduleMatchesTruncated,
+            sections = new
+            {
+                columnMatches = new
+                {
+                    count = columnMatches.Length,
+                    truncated = columnMatchesTruncated
+                },
+                moduleMatches = new
+                {
+                    count = moduleMatches.Length,
+                    truncated = moduleMatchesTruncated
+                }
+            },
+            hint = columnMatchesTruncated || moduleMatchesTruncated
+                ? "Pass schema/objectTypes, use a more specific token, or inspect modules with get_module_definition keyword slices."
+                : null
+        };
+    }
+
+    public async Task<object> SearchConfigTextAsync(
+        string keyword,
+        string? profile,
+        int? limit,
+        CancellationToken cancellationToken)
+    {
+        var terms = SplitKeyword(keyword);
+        if (terms.Count == 0)
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "keyword is required.");
+        }
+
+        var targets = _options.TextSearch.Targets
+            .Where(target => target.Enabled)
+            .Where(target => string.IsNullOrWhiteSpace(profile)
+                || string.Equals(target.Profile, profile, StringComparison.OrdinalIgnoreCase))
+            .Where(IsValidTextSearchTarget)
+            .ToArray();
+
+        if (targets.Length == 0)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "No text search targets are configured for search_config_text.",
+                string.IsNullOrWhiteSpace(profile) ? null : $"profile={profile}",
+                "Add allow-listed textSearch.targets to sqlserver_mcp.json.");
+        }
+
+        var effectiveLimit = _options.Limits.ClampRows(limit);
+        var items = new List<object>();
+        var truncated = false;
+
+        foreach (var target in targets)
+        {
+            var remaining = effectiveLimit - items.Count;
+            if (remaining <= 0)
+            {
+                truncated = true;
+                break;
+            }
+
+            var targetRows = await SearchConfigTextTargetAsync(target, terms, remaining + 1, cancellationToken);
+            if (targetRows.Count > remaining)
+            {
+                truncated = true;
+                items.AddRange(targetRows.Take(remaining));
+                break;
+            }
+
+            items.AddRange(targetRows);
+        }
+
+        return new
+        {
+            keyword,
+            profile,
+            searchedTargets = targets.Select(target => new
+            {
+                target.Profile,
+                target.Schema,
+                target.Table,
+                target.TextColumn,
+                target.KeyColumn,
+                target.NameColumn
+            }).ToArray(),
+            items,
+            count = items.Count,
+            truncated,
+            limit = effectiveLimit,
+            hint = truncated
+                ? "Use profile, a narrower keyword, or increase limit within the configured server cap."
+                : null
         };
     }
 
@@ -703,23 +883,121 @@ public sealed class SqlMetadataService
         }
     }
 
-    public async Task<object> RunReadonlyQueryAsync(string sql, int? maxRows, CancellationToken cancellationToken)
+    public async Task<object> DescribeQueryResultAsync(
+        string sql,
+        IReadOnlyDictionary<string, object?>? parameters,
+        CancellationToken cancellationToken)
     {
         _sqlGuard.ValidateReadonlyQuery(sql);
 
+        var parameterSpecs = BuildUserSqlParameters(parameters);
+        const string metadataSql = """
+                                   SELECT
+                                       column_ordinal,
+                                       name,
+                                       is_nullable,
+                                       system_type_name,
+                                       system_type_id,
+                                       max_length,
+                                       precision,
+                                       scale,
+                                       collation_name,
+                                       error_number,
+                                       error_severity,
+                                       error_state,
+                                       error_message
+                                   FROM sys.dm_exec_describe_first_result_set(@tsql, @params, 0)
+                                   ORDER BY CASE WHEN column_ordinal IS NULL THEN 2147483647 ELSE column_ordinal END;
+                                   """;
+
+        var rows = await QueryAsync(
+            metadataSql,
+            [
+                new("@tsql", SqlDbType.NVarChar, -1) { Value = sql },
+                new("@params", SqlDbType.NVarChar, -1)
+                {
+                    Value = parameterSpecs.Count == 0
+                        ? DBNull.Value
+                        : BuildParameterDefinitionList(parameterSpecs)
+                }
+            ],
+            reader => new QueryResultColumnMetadata(
+                reader.GetNullableInt32("column_ordinal"),
+                reader.GetNullableString("name"),
+                reader.GetNullableInt32("is_nullable"),
+                reader.GetNullableString("system_type_name"),
+                reader.GetNullableInt32("system_type_id"),
+                reader.GetNullableInt32("max_length"),
+                reader.GetNullableInt32("precision"),
+                reader.GetNullableInt32("scale"),
+                reader.GetNullableString("collation_name"),
+                reader.GetNullableInt32("error_number"),
+                reader.GetNullableInt32("error_severity"),
+                reader.GetNullableInt32("error_state"),
+                reader.GetNullableString("error_message")),
+            cancellationToken);
+
+        var error = rows.FirstOrDefault(row => row.ErrorNumber is not null);
+
+        return new
+        {
+            ok = error is null,
+            parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
+            columns = rows
+                .Where(row => row.ColumnOrdinal is not null)
+                .Select(row => new
+                {
+                    ordinal = row.ColumnOrdinal,
+                    row.Name,
+                    nullable = row.IsNullable == 1,
+                    systemTypeName = row.SystemTypeName,
+                    row.SystemTypeId,
+                    row.MaxLength,
+                    row.Precision,
+                    row.Scale,
+                    row.CollationName
+                })
+                .ToArray(),
+            columnCount = rows.Count(row => row.ColumnOrdinal is not null),
+            error = error is null
+                ? null
+                : new
+                {
+                    errorNumber = error.ErrorNumber,
+                    errorSeverity = error.ErrorSeverity,
+                    errorState = error.ErrorState,
+                    errorMessage = error.ErrorMessage
+                }
+        };
+    }
+
+    public async Task<object> RunReadonlyQueryAsync(
+        string sql,
+        IReadOnlyDictionary<string, object?>? parameters,
+        int? maxRows,
+        CancellationToken cancellationToken)
+    {
+        _sqlGuard.ValidateReadonlyQuery(sql);
+
+        var parameterSpecs = BuildUserSqlParameters(parameters);
         var effectiveMaxRows = _options.Limits.ClampRows(maxRows);
         var resultLimitBytes = _options.Limits.MaxResultMb * 1024L * 1024L;
         var stopwatch = Stopwatch.StartNew();
         var rows = new List<Dictionary<string, object?>>();
         var columns = new List<object>();
+        var truncation = new QueryValueTruncationInfo();
         long estimatedBytes = 0;
-        var truncated = false;
+        var rowLimitTruncated = false;
 
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var command = CreateCommand(
             connection,
             $"SET LOCK_TIMEOUT {_options.Limits.LockTimeoutMs};\n{sql}");
         command.CommandTimeout = _options.Limits.CommandTimeoutSeconds;
+        foreach (var parameter in parameterSpecs.Select(CreateSqlParameter))
+        {
+            command.Parameters.Add(parameter);
+        }
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
@@ -736,14 +1014,14 @@ public sealed class SqlMetadataService
         {
             if (rows.Count >= effectiveMaxRows)
             {
-                truncated = true;
+                rowLimitTruncated = true;
                 break;
             }
 
             var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             for (var i = 0; i < reader.FieldCount; i++)
             {
-                var value = ReadValue(reader, i);
+                var value = ReadValue(reader, i, truncation);
                 row[reader.GetName(i)] = value;
                 estimatedBytes += EstimateBytes(value);
             }
@@ -766,7 +1044,28 @@ public sealed class SqlMetadataService
             columns,
             rows,
             rowCount = rows.Count,
-            truncated,
+            truncated = rowLimitTruncated,
+            truncation = new
+            {
+                rowLimitTruncated,
+                textValuesTruncated = truncation.TextValuesTruncated,
+                columnsWithTruncatedText = truncation.ColumnsWithTruncatedText.OrderBy(column => column).ToArray(),
+                maxRows = effectiveMaxRows,
+                maxTextLength = _options.Limits.MaxTextLength,
+                maxResultMb = _options.Limits.MaxResultMb,
+                estimatedBytes,
+                reason = rowLimitTruncated
+                    ? "maxRows"
+                    : truncation.TextValuesTruncated > 0
+                        ? "maxTextLength"
+                        : null,
+                hint = rowLimitTruncated
+                    ? "Add WHERE filters, select fewer rows, or raise maxRows within the configured server cap."
+                    : truncation.TextValuesTruncated > 0
+                        ? "Select shorter expressions, use SUBSTRING in SQL, or raise limits.maxTextLength in config."
+                        : null
+            },
+            parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
             elapsedMs = stopwatch.ElapsedMilliseconds
         };
     }
@@ -1433,6 +1732,37 @@ public sealed class SqlMetadataService
         return rows.Cast<object>().ToArray();
     }
 
+    private async Task<object[]> GetTriggersCoreAsync(int objectId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+                           SELECT
+                               trigger_name=T.name,
+                               is_disabled=T.is_disabled,
+                               is_instead_of_trigger=T.is_instead_of_trigger,
+                               create_date=T.create_date,
+                               modify_date=T.modify_date
+                           FROM sys.triggers T
+                           WHERE T.parent_id=@objectId
+                               AND T.is_ms_shipped=0
+                           ORDER BY T.name;
+                           """;
+
+        var rows = await QueryAsync(
+            sql,
+            [new("@objectId", SqlDbType.Int) { Value = objectId }],
+            reader => new
+            {
+                name = reader.GetString("trigger_name"),
+                isDisabled = reader.GetBoolean("is_disabled"),
+                isInsteadOfTrigger = reader.GetBoolean("is_instead_of_trigger"),
+                createDate = reader.GetDateTime("create_date"),
+                modifyDate = reader.GetDateTime("modify_date")
+            },
+            cancellationToken);
+
+        return rows.Cast<object>().ToArray();
+    }
+
     private async Task<object[]> GetForeignKeysCoreAsync(int objectId, CancellationToken cancellationToken)
     {
         const string sql = """
@@ -1507,6 +1837,92 @@ public sealed class SqlMetadataService
             .ToArray();
     }
 
+    private async Task<List<object>> SearchConfigTextTargetAsync(
+        TextSearchTargetOptions target,
+        IReadOnlyList<string> terms,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        var textExpression = $"CONVERT(NVARCHAR(MAX), {QuoteIdentifier(target.TextColumn)})";
+        var keyExpression = string.IsNullOrWhiteSpace(target.KeyColumn)
+            ? "CONVERT(NVARCHAR(4000), NULL)"
+            : $"CONVERT(NVARCHAR(4000), {QuoteIdentifier(target.KeyColumn!)})";
+        var nameExpression = string.IsNullOrWhiteSpace(target.NameColumn)
+            ? "CONVERT(NVARCHAR(4000), NULL)"
+            : $"CONVERT(NVARCHAR(4000), {QuoteIdentifier(target.NameColumn!)})";
+
+        var parameters = new List<SqlParameter>
+        {
+            new("@limit", SqlDbType.Int) { Value = limit },
+            new("@snippetTerm", SqlDbType.NVarChar, 4000) { Value = terms[0] },
+            new("@snippetLength", SqlDbType.Int) { Value = _options.TextSearch.SnippetLength },
+            new("@snippetBefore", SqlDbType.Int) { Value = _options.TextSearch.SnippetLength / 3 }
+        };
+
+        var predicates = new List<string>();
+        for (var i = 0; i < terms.Count; i++)
+        {
+            var parameterName = $"@term{i}";
+            parameters.Add(new SqlParameter(parameterName, SqlDbType.NVarChar, 4000) { Value = $"%{terms[i]}%" });
+            predicates.Add($"{textExpression} LIKE {parameterName}");
+        }
+
+        var qualifiedTable = $"{QuoteIdentifier(target.Schema)}.{QuoteIdentifier(target.Table)}";
+        var sql = $"""
+                   SET LOCK_TIMEOUT {_options.Limits.LockTimeoutMs};
+
+                   WITH matches AS
+                   (
+                       SELECT TOP (@limit)
+                           key_value={keyExpression},
+                           name_value={nameExpression},
+                           text_value={textExpression}
+                       FROM {qualifiedTable}
+                       WHERE {QuoteIdentifier(target.TextColumn)} IS NOT NULL
+                           AND ({string.Join(" OR ", predicates)})
+                       ORDER BY {BuildTextSearchOrderBy(target)}
+                   )
+                   SELECT
+                       key_value,
+                       name_value,
+                       text_length=LEN(text_value),
+                       matched_snippet=
+                           CASE
+                               WHEN CHARINDEX(@snippetTerm, text_value) > 0 THEN
+                                   SUBSTRING(
+                                       text_value,
+                                       CASE
+                                           WHEN CHARINDEX(@snippetTerm, text_value) > @snippetBefore
+                                               THEN CHARINDEX(@snippetTerm, text_value) - @snippetBefore
+                                           ELSE 1
+                                       END,
+                                       @snippetLength)
+                               ELSE LEFT(text_value, @snippetLength)
+                           END
+                   FROM matches;
+                   """;
+
+        var rows = await QueryAsync(
+            sql,
+            parameters,
+            reader => new
+            {
+                profile = target.Profile,
+                schema = target.Schema,
+                table = target.Table,
+                textColumn = target.TextColumn,
+                keyColumn = string.IsNullOrWhiteSpace(target.KeyColumn) ? null : target.KeyColumn,
+                keyValue = reader.GetNullableString("key_value"),
+                nameColumn = string.IsNullOrWhiteSpace(target.NameColumn) ? null : target.NameColumn,
+                nameValue = reader.GetNullableString("name_value"),
+                textLength = reader.GetNullableInt32("text_length"),
+                matchedSnippet = NormalizeSnippet(reader.GetNullableString("matched_snippet") ?? string.Empty)
+            },
+            cancellationToken);
+
+        return rows.Cast<object>().ToList();
+    }
+
     private async Task<List<T>> QueryAsync<T>(
         string sql,
         IEnumerable<SqlParameter> parameters,
@@ -1566,7 +1982,28 @@ public sealed class SqlMetadataService
         };
     }
 
-    private object? ReadValue(SqlDataReader reader, int ordinal)
+    private static SqlParameter CreateSqlParameter(UserSqlParameterSpec spec)
+    {
+        var parameter = new SqlParameter(spec.Name, spec.DbType)
+        {
+            Value = spec.Value ?? DBNull.Value
+        };
+
+        if (spec.Size is not null)
+        {
+            parameter.Size = spec.Size.Value;
+        }
+
+        if (spec.DbType == SqlDbType.Decimal)
+        {
+            parameter.Precision = 38;
+            parameter.Scale = 10;
+        }
+
+        return parameter;
+    }
+
+    private object? ReadValue(SqlDataReader reader, int ordinal, QueryValueTruncationInfo truncation)
     {
         if (reader.IsDBNull(ordinal))
         {
@@ -1584,7 +2021,7 @@ public sealed class SqlMetadataService
         var value = reader.GetValue(ordinal);
         return value switch
         {
-            string text => TruncateText(text),
+            string text => TruncateText(text, reader.GetName(ordinal), truncation),
             DateTime dateTime => dateTime.ToString("O"),
             DateTimeOffset dateTimeOffset => dateTimeOffset.ToString("O"),
             TimeSpan timeSpan => timeSpan.ToString(),
@@ -1593,11 +2030,16 @@ public sealed class SqlMetadataService
         };
     }
 
-    private string TruncateText(string text)
+    private string TruncateText(string text, string columnName, QueryValueTruncationInfo truncation)
     {
-        return text.Length <= _options.Limits.MaxTextLength
-            ? text
-            : string.Concat(text.AsSpan(0, _options.Limits.MaxTextLength), "...<truncated>");
+        if (text.Length <= _options.Limits.MaxTextLength)
+        {
+            return text;
+        }
+
+        truncation.TextValuesTruncated++;
+        truncation.ColumnsWithTruncatedText.Add(columnName);
+        return string.Concat(text.AsSpan(0, _options.Limits.MaxTextLength), "...<truncated>");
     }
 
     private static long EstimateBytes(object? value)
@@ -1618,6 +2060,307 @@ public sealed class SqlMetadataService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(5)
             .ToArray();
+    }
+
+    internal static ModuleDefinitionSlice BuildModuleDefinitionSlice(
+        string definition,
+        string? keyword,
+        int? startLine,
+        int? endLine,
+        int? contextLines,
+        int maxLines)
+    {
+        var lines = SplitDefinitionLines(definition);
+        var totalLines = lines.Length;
+        var cleanKeyword = string.IsNullOrWhiteSpace(keyword) ? null : keyword.Trim();
+        var hasLineRange = startLine.HasValue || endLine.HasValue;
+        var effectiveMaxLines = Math.Clamp(maxLines, 1, 5000);
+        var effectiveContextLines = Math.Clamp(contextLines ?? DefaultModuleContextLines, 0, MaxModuleContextLines);
+
+        if (hasLineRange)
+        {
+            var start = startLine ?? 1;
+            var end = endLine ?? totalLines;
+            if (start < 1 || end < 1 || start > end)
+            {
+                throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "Invalid module definition line range.",
+                    $"startLine={startLine}, endLine={endLine}",
+                    "Use 1-based line numbers with startLine less than or equal to endLine.");
+            }
+
+            if (start > totalLines)
+            {
+                throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "Module definition line range starts after the final line.",
+                    $"lineCount={totalLines}, startLine={start}",
+                    "Use a startLine within the returned lineCount.");
+            }
+
+            end = Math.Min(end, totalLines);
+            return BuildSlice(
+                lines,
+                [(start, end)],
+                cleanKeyword,
+                totalLines,
+                "line_range",
+                effectiveContextLines,
+                effectiveMaxLines);
+        }
+
+        if (!string.IsNullOrWhiteSpace(cleanKeyword))
+        {
+            var ranges = new List<(int Start, int End)>();
+            for (var i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Contains(cleanKeyword, StringComparison.OrdinalIgnoreCase))
+                {
+                    var lineNumber = i + 1;
+                    ranges.Add((
+                        Math.Max(1, lineNumber - effectiveContextLines),
+                        Math.Min(totalLines, lineNumber + effectiveContextLines)));
+                }
+            }
+
+            return BuildSlice(
+                lines,
+                ranges,
+                cleanKeyword,
+                totalLines,
+                "keyword",
+                effectiveContextLines,
+                effectiveMaxLines);
+        }
+
+        return BuildSlice(
+            lines,
+            [(1, totalLines)],
+            null,
+            totalLines,
+            "full",
+            effectiveContextLines,
+            totalLines);
+    }
+
+    private static ModuleDefinitionSlice BuildSlice(
+        string[] allLines,
+        IReadOnlyList<(int Start, int End)> ranges,
+        string? keyword,
+        int totalLines,
+        string reason,
+        int contextLines,
+        int maxLines)
+    {
+        var mergedRanges = MergeLineRanges(ranges);
+        var selectedLines = new List<ModuleDefinitionLine>();
+        var matchedLines = new List<int>();
+        var truncated = false;
+
+        foreach (var range in mergedRanges)
+        {
+            for (var lineNumber = range.Start; lineNumber <= range.End; lineNumber++)
+            {
+                if (selectedLines.Count >= maxLines)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                var text = allLines[lineNumber - 1];
+                selectedLines.Add(new ModuleDefinitionLine(lineNumber, text));
+                if (!string.IsNullOrWhiteSpace(keyword)
+                    && text.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                {
+                    matchedLines.Add(lineNumber);
+                }
+            }
+
+            if (truncated)
+            {
+                break;
+            }
+        }
+
+        var isPartial = reason != "full" || truncated;
+        return new ModuleDefinitionSlice(
+            string.Join(Environment.NewLine, selectedLines.Select(line => line.Text)),
+            totalLines,
+            selectedLines.Count == 0 ? null : selectedLines[0].LineNumber,
+            selectedLines.Count == 0 ? null : selectedLines[^1].LineNumber,
+            selectedLines.Count,
+            isPartial,
+            truncated,
+            reason,
+            contextLines,
+            matchedLines.Distinct().ToArray(),
+            selectedLines.ToArray());
+    }
+
+    private static IReadOnlyList<(int Start, int End)> MergeLineRanges(IReadOnlyList<(int Start, int End)> ranges)
+    {
+        if (ranges.Count == 0)
+        {
+            return [];
+        }
+
+        var ordered = ranges
+            .OrderBy(range => range.Start)
+            .ThenBy(range => range.End)
+            .ToArray();
+        var merged = new List<(int Start, int End)> { ordered[0] };
+
+        foreach (var range in ordered.Skip(1))
+        {
+            var previous = merged[^1];
+            if (range.Start <= previous.End + 1)
+            {
+                merged[^1] = (previous.Start, Math.Max(previous.End, range.End));
+            }
+            else
+            {
+                merged.Add(range);
+            }
+        }
+
+        return merged;
+    }
+
+    private static string[] SplitDefinitionLines(string definition)
+    {
+        var normalized = definition.Replace("\r\n", "\n").Replace('\r', '\n');
+        if (normalized.EndsWith('\n'))
+        {
+            normalized = normalized[..^1];
+        }
+
+        return normalized.Length == 0
+            ? [string.Empty]
+            : normalized.Split('\n');
+    }
+
+    internal static IReadOnlyList<UserSqlParameterSpec> BuildUserSqlParameters(
+        IReadOnlyDictionary<string, object?>? parameters)
+    {
+        if (parameters is null || parameters.Count == 0)
+        {
+            return [];
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<UserSqlParameterSpec>();
+        foreach (var (rawName, rawValue) in parameters)
+        {
+            var name = NormalizeParameterName(rawName);
+            if (!seen.Add(name))
+            {
+                throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "Duplicate SQL parameter name.",
+                    name,
+                    "Use unique parameter names after removing the optional @ prefix.");
+            }
+
+            result.Add(BuildUserSqlParameter(name, rawValue));
+        }
+
+        return result;
+    }
+
+    private static UserSqlParameterSpec BuildUserSqlParameter(string name, object? rawValue)
+    {
+        var value = NormalizeParameterValue(rawValue);
+        return value switch
+        {
+            null => new UserSqlParameterSpec(name, null, SqlDbType.NVarChar, 4000, $"{name} nvarchar(4000)"),
+            bool boolean => new UserSqlParameterSpec(name, boolean, SqlDbType.Bit, null, $"{name} bit"),
+            int integer => new UserSqlParameterSpec(name, integer, SqlDbType.Int, null, $"{name} int"),
+            long integer => new UserSqlParameterSpec(name, integer, SqlDbType.BigInt, null, $"{name} bigint"),
+            decimal number => new UserSqlParameterSpec(name, number, SqlDbType.Decimal, null, $"{name} decimal(38,10)"),
+            double number => new UserSqlParameterSpec(name, number, SqlDbType.Float, null, $"{name} float"),
+            DateTime dateTime => new UserSqlParameterSpec(name, dateTime, SqlDbType.DateTime2, null, $"{name} datetime2"),
+            DateTimeOffset dateTimeOffset => new UserSqlParameterSpec(name, dateTimeOffset, SqlDbType.DateTimeOffset, null, $"{name} datetimeoffset"),
+            Guid guid => new UserSqlParameterSpec(name, guid, SqlDbType.UniqueIdentifier, null, $"{name} uniqueidentifier"),
+            string text => new UserSqlParameterSpec(
+                name,
+                text,
+                SqlDbType.NVarChar,
+                text.Length > 4000 ? -1 : 4000,
+                text.Length > 4000 ? $"{name} nvarchar(max)" : $"{name} nvarchar(4000)"),
+            _ => throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Unsupported SQL parameter value type.",
+                $"{name}: {value.GetType().Name}",
+                "Use JSON string, number, boolean, or null values.")
+        };
+    }
+
+    private static object? NormalizeParameterValue(object? value)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        if (value is JsonElement element)
+        {
+            return element.ValueKind switch
+            {
+                JsonValueKind.Null => null,
+                JsonValueKind.Undefined => null,
+                JsonValueKind.String => element.GetString(),
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.Number when element.TryGetInt32(out var intValue) => intValue,
+                JsonValueKind.Number when element.TryGetInt64(out var longValue) => longValue,
+                JsonValueKind.Number when element.TryGetDecimal(out var decimalValue) => decimalValue,
+                JsonValueKind.Number when element.TryGetDouble(out var doubleValue) => doubleValue,
+                _ => throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "Unsupported SQL parameter JSON value.",
+                    element.ValueKind.ToString(),
+                    "Use JSON string, number, boolean, or null values.")
+            };
+        }
+
+        return value;
+    }
+
+    private static string NormalizeParameterName(string rawName)
+    {
+        var name = rawName.Trim();
+        if (name.StartsWith('@'))
+        {
+            name = name[1..];
+        }
+
+        if (name.Length is < 1 or > 128
+            || !(char.IsAsciiLetter(name[0]) || name[0] == '_')
+            || name.Any(character => !(char.IsAsciiLetterOrDigit(character) || character == '_')))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Invalid SQL parameter name.",
+                rawName,
+                "Use names like id, customer_id, or @customer_id.");
+        }
+
+        return $"@{name}";
+    }
+
+    private static string BuildParameterDefinitionList(IReadOnlyList<UserSqlParameterSpec> parameters)
+    {
+        return string.Join(", ", parameters.Select(parameter => parameter.Definition));
+    }
+
+    private static object ToParameterSummary(UserSqlParameterSpec parameter)
+    {
+        return new
+        {
+            name = parameter.Name,
+            sqlType = parameter.Definition[(parameter.Name.Length + 1)..]
+        };
     }
 
     private static string BuildLikeAny(string expression, int termCount)
@@ -1661,6 +2404,55 @@ public sealed class SqlMetadataService
             : maxLength;
     }
 
+    private static bool IsValidTextSearchTarget(TextSearchTargetOptions target)
+    {
+        return !string.IsNullOrWhiteSpace(target.Schema)
+               && !string.IsNullOrWhiteSpace(target.Table)
+               && !string.IsNullOrWhiteSpace(target.TextColumn)
+               && IsSafeIdentifier(target.Schema)
+               && IsSafeIdentifier(target.Table)
+               && IsSafeIdentifier(target.TextColumn)
+               && (string.IsNullOrWhiteSpace(target.KeyColumn) || IsSafeIdentifier(target.KeyColumn))
+               && (string.IsNullOrWhiteSpace(target.NameColumn) || IsSafeIdentifier(target.NameColumn));
+    }
+
+    private static bool IsSafeIdentifier(string value)
+    {
+        return value.Length is > 0 and <= 128
+               && value.All(character => char.IsLetterOrDigit(character) || character == '_' || character == '#');
+    }
+
+    private static string QuoteIdentifier(string identifier)
+    {
+        return $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
+    }
+
+    private static string BuildTextSearchOrderBy(TextSearchTargetOptions target)
+    {
+        if (!string.IsNullOrWhiteSpace(target.NameColumn))
+        {
+            return QuoteIdentifier(target.NameColumn!);
+        }
+
+        if (!string.IsNullOrWhiteSpace(target.KeyColumn))
+        {
+            return QuoteIdentifier(target.KeyColumn!);
+        }
+
+        return "(SELECT NULL)";
+    }
+
+    private static string NormalizeSnippet(string text)
+    {
+        return string.Join(" ", text.Split(['\r', '\n', '\t'], StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static string ComputeSha256Hex(string text)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(text));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
+
     private static string BuildSnippet(string definition, string keyword)
     {
         if (string.IsNullOrEmpty(definition))
@@ -1699,6 +2491,50 @@ public sealed class SqlMetadataService
         string? MappedName,
         bool ResolvedFromPrefix,
         bool UsedFallback);
+
+    internal sealed record ModuleDefinitionSlice(
+        string Definition,
+        int TotalLines,
+        int? StartLine,
+        int? EndLine,
+        int SelectedLineCount,
+        bool IsPartial,
+        bool Truncated,
+        string Reason,
+        int ContextLines,
+        int[] MatchedLines,
+        ModuleDefinitionLine[] Lines);
+
+    internal sealed record ModuleDefinitionLine(int LineNumber, string Text);
+
+    internal sealed record UserSqlParameterSpec(
+        string Name,
+        object? Value,
+        SqlDbType DbType,
+        int? Size,
+        string Definition);
+
+    private sealed class QueryValueTruncationInfo
+    {
+        public int TextValuesTruncated { get; set; }
+
+        public HashSet<string> ColumnsWithTruncatedText { get; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed record QueryResultColumnMetadata(
+        int? ColumnOrdinal,
+        string? Name,
+        int? IsNullable,
+        string? SystemTypeName,
+        int? SystemTypeId,
+        int? MaxLength,
+        int? Precision,
+        int? Scale,
+        string? CollationName,
+        int? ErrorNumber,
+        int? ErrorSeverity,
+        int? ErrorState,
+        string? ErrorMessage);
 
     private sealed record ObjectMatchRow(
         int ObjectId,

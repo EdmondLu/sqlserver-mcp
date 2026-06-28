@@ -62,6 +62,8 @@ GRANT SHOWPLAN TO [readonly_user];
 
 安全默认值为：禁止跨库和系统库，禁止服务器级 DMV，连接加密开启，不默认信任服务器证书，SQL 日志关闭。相对路径的 `logs`、`cache`、`tmp` 目录会创建在配置文件旁边。
 
+`search_config_text` 只搜索 `textSearch.targets` 中显式配置的文本列；默认不扫描全库文本列。
+
 SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql`。
 
 ## 工具
@@ -71,7 +73,7 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 - `describe_table`、`get_object_overview`
 - `get_indexes`、`get_constraints`、`get_foreign_keys`
 - `search_sql_modules`、`get_module_definition`、`get_dependencies`
-- `run_readonly_query`、`explain_query_plan`
+- `search_config_text`、`run_readonly_query`、`describe_query_result`、`explain_query_plan`
 - `reload_connection`
 
 结构工具会识别 `vwp_`、`vwpr_`、`vwt_`、`vwtr_` 这四种历史视图前缀，并优先尝试对应的无前缀物理表。

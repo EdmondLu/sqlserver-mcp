@@ -17,6 +17,20 @@
     "allowCrossDatabase": false,
     "allowSystemDatabases": false
   },
+  "textSearch": {
+    "snippetLength": 240,
+    "targets": [
+      {
+        "profile": "default",
+        "schema": "dbo",
+        "table": "AppConfigScripts",
+        "textColumn": "script_text",
+        "keyColumn": "id",
+        "nameColumn": "name",
+        "enabled": false
+      }
+    ]
+  },
   "logging": {
     "logSql": false,
     "maxFileSizeMb": 10,

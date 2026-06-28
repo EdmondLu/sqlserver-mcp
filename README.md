@@ -80,6 +80,8 @@ See [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json) for a c
 | `security.allowServerLevelDmv` | `false` | Allow server-level DMVs |
 | `security.allowCrossDatabase` | `false` | Allow three/four-part object references |
 | `security.allowSystemDatabases` | `false` | Allow system databases |
+| `textSearch.targets` | `[]` | Allow-listed text columns for `search_config_text` |
+| `textSearch.snippetLength` | `240` | Snippet length for configured text searches |
 | `logging.logSql` | `false` | Include submitted SQL text in file logs |
 | `connection.encrypt` | `true` | Encrypt SQL connections |
 | `connection.trustServerCertificate` | `false` | Skip certificate-chain validation |
@@ -101,10 +103,12 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `get_constraints` | Inspect key, unique, default, and check constraints |
 | `get_foreign_keys` | Inspect incoming and outgoing foreign keys |
 | `search_sql_modules` | Search SQL module definitions |
-| `get_module_definition` | Read a view, procedure, function, or trigger definition |
+| `get_module_definition` | Read a module definition, optionally by keyword or line range |
 | `get_dependencies` | Find incoming and outgoing dependencies |
 | `find_usage` | Find object, column, or token usage |
-| `run_readonly_query` | Run one guarded read-only query |
+| `search_config_text` | Search configured application/configuration text columns |
+| `run_readonly_query` | Run one guarded read-only query with optional named parameters |
+| `describe_query_result` | Describe guarded query result columns without executing the query |
 | `explain_query_plan` | Return estimated SHOWPLAN XML without executing the query |
 | `reload_connection` | Clear cached credentials and SQL connection pools |
 
