@@ -13,6 +13,7 @@ public sealed class SqlMetadataService
 {
     private const int DefaultModuleContextLines = 3;
     private const int MaxModuleContextLines = 50;
+    private const long MaxCompareFileBytes = 10 * 1024 * 1024;
 
     private readonly SqlServerMcpOptions _options;
     private readonly SqlConnectionFactory _connectionFactory;
@@ -600,52 +601,8 @@ public sealed class SqlMetadataService
         bool includeLineNumbers,
         CancellationToken cancellationToken)
     {
-        const string sql = """
-                           SELECT TOP 1
-                               schema_name=S.name,
-                               object_name=O.name,
-                               object_type=O.type,
-                               object_type_desc=O.type_desc,
-                               definition=OBJECT_DEFINITION(O.object_id)
-                           FROM sys.objects O
-                           INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
-                           WHERE S.name=@schema
-                               AND O.name=@name
-                               AND O.type IN (N'V', N'P', N'PC', N'FN', N'IF', N'TF', N'TR');
-                           """;
-
-        var rows = await QueryAsync(
-            sql,
-            [
-                new("@schema", SqlDbType.NVarChar, 128) { Value = schema },
-                new("@name", SqlDbType.NVarChar, 128) { Value = name }
-            ],
-            reader => new
-            {
-                schema = reader.GetString("schema_name"),
-                name = reader.GetString("object_name"),
-                type = ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
-                typeDesc = reader.GetString("object_type_desc"),
-                definition = reader.GetNullableString("definition")
-            },
-            cancellationToken);
-
-        var module = rows.SingleOrDefault();
-        if (module is null)
-        {
-            throw new SqlMcpException(ErrorCodes.ObjectNotFound, $"Module '{schema}.{name}' was not found.");
-        }
-
-        if (string.IsNullOrWhiteSpace(module.definition))
-        {
-            throw new SqlMcpException(
-                ErrorCodes.ViewDefinitionPermissionRequired,
-                $"Definition for '{schema}.{name}' is not available.",
-                "OBJECT_DEFINITION returned NULL.",
-                "Grant VIEW DEFINITION to the MCP SQL login, or inspect the module definition from source control.");
-        }
-
-        var definition = module.definition!;
+        var module = await GetModuleDefinitionCoreAsync(schema, name, cancellationToken);
+        var definition = module.Definition;
         var slice = BuildModuleDefinitionSlice(
             definition,
             keyword,
@@ -656,10 +613,12 @@ public sealed class SqlMetadataService
 
         return new
         {
-            module.schema,
-            module.name,
-            module.type,
-            module.typeDesc,
+            schema = module.Schema,
+            name = module.Name,
+            type = module.Type,
+            typeDesc = module.TypeDesc,
+            createDate = module.CreateDate,
+            modifyDate = module.ModifyDate,
             definition = slice.Definition,
             definitionLength = definition.Length,
             definitionSha256 = ComputeSha256Hex(definition),
@@ -679,6 +638,52 @@ public sealed class SqlMetadataService
             lines = includeLineNumbers || slice.IsPartial
                 ? slice.Lines
                 : null
+        };
+    }
+
+    public async Task<object> CompareModuleToFileAsync(
+        string schema,
+        string name,
+        string filePath,
+        int? contextLines,
+        CancellationToken cancellationToken)
+    {
+        var module = await GetModuleDefinitionCoreAsync(schema, name, cancellationToken);
+        var file = GetReadableCompareFile(filePath);
+        var fileText = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
+        var effectiveContextLines = Math.Clamp(contextLines ?? 5, 0, MaxModuleContextLines);
+        var dbNormalized = NormalizeTextForComparison(module.Definition);
+        var fileNormalized = NormalizeTextForComparison(fileText);
+        var diff = BuildLineDiff(module.Definition, fileText, effectiveContextLines);
+
+        return new
+        {
+            schema = module.Schema,
+            name = module.Name,
+            type = module.Type,
+            typeDesc = module.TypeDesc,
+            database = new
+            {
+                module.CreateDate,
+                module.ModifyDate,
+                definitionLength = module.Definition.Length,
+                lineCount = SplitDefinitionLines(module.Definition).Length,
+                sha256 = ComputeSha256Hex(module.Definition),
+                normalizedSha256 = ComputeSha256Hex(dbNormalized)
+            },
+            file = new
+            {
+                path = file.FullName,
+                lengthBytes = file.Length,
+                lastWriteTime = file.LastWriteTime,
+                textLength = fileText.Length,
+                lineCount = SplitDefinitionLines(fileText).Length,
+                sha256 = ComputeSha256Hex(fileText),
+                normalizedSha256 = ComputeSha256Hex(fileNormalized)
+            },
+            exactMatch = string.Equals(module.Definition, fileText, StringComparison.Ordinal),
+            normalizedMatch = string.Equals(dbNormalized, fileNormalized, StringComparison.Ordinal),
+            diff
         };
     }
 
@@ -2003,6 +2008,95 @@ public sealed class SqlMetadataService
         return parameter;
     }
 
+    private async Task<ModuleDefinitionInfo> GetModuleDefinitionCoreAsync(
+        string schema,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+                           SELECT TOP 1
+                               schema_name=S.name,
+                               object_name=O.name,
+                               object_type=O.type,
+                               object_type_desc=O.type_desc,
+                               create_date=O.create_date,
+                               modify_date=O.modify_date,
+                               definition=OBJECT_DEFINITION(O.object_id)
+                           FROM sys.objects O
+                           INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
+                           WHERE S.name=@schema
+                               AND O.name=@name
+                               AND O.type IN (N'V', N'P', N'PC', N'FN', N'IF', N'TF', N'TR');
+                           """;
+
+        var rows = await QueryAsync(
+            sql,
+            [
+                new("@schema", SqlDbType.NVarChar, 128) { Value = schema },
+                new("@name", SqlDbType.NVarChar, 128) { Value = name }
+            ],
+            reader => new ModuleDefinitionInfo(
+                reader.GetString("schema_name"),
+                reader.GetString("object_name"),
+                ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
+                reader.GetString("object_type_desc"),
+                reader.GetDateTime("create_date"),
+                reader.GetDateTime("modify_date"),
+                reader.GetNullableString("definition") ?? string.Empty),
+            cancellationToken);
+
+        var module = rows.SingleOrDefault();
+        if (module is null)
+        {
+            throw new SqlMcpException(ErrorCodes.ObjectNotFound, $"Module '{schema}.{name}' was not found.");
+        }
+
+        if (string.IsNullOrWhiteSpace(module.Definition))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ViewDefinitionPermissionRequired,
+                $"Definition for '{schema}.{name}' is not available.",
+                "OBJECT_DEFINITION returned NULL.",
+                "Grant VIEW DEFINITION to the MCP SQL login, or inspect the module definition from source control.");
+        }
+
+        return module;
+    }
+
+    private static FileInfo GetReadableCompareFile(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "filePath is required.");
+        }
+
+        if (!Path.IsPathFullyQualified(filePath))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "filePath must be an absolute path.",
+                filePath,
+                "Pass the full local path to the .sql file.");
+        }
+
+        var file = new FileInfo(filePath);
+        if (!file.Exists)
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "Local compare file was not found.", file.FullName);
+        }
+
+        if (file.Length > MaxCompareFileBytes)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Local compare file is too large.",
+                $"{file.FullName} is {file.Length} bytes; max is {MaxCompareFileBytes} bytes.",
+                "Pass a smaller SQL file.");
+        }
+
+        return file;
+    }
+
     private object? ReadValue(SqlDataReader reader, int ordinal, QueryValueTruncationInfo truncation)
     {
         if (reader.IsDBNull(ordinal))
@@ -2238,6 +2332,92 @@ public sealed class SqlMetadataService
         return normalized.Length == 0
             ? [string.Empty]
             : normalized.Split('\n');
+    }
+
+    internal static ModuleFileDiff BuildLineDiff(string databaseDefinition, string fileText, int contextLines)
+    {
+        var databaseLines = SplitDefinitionLines(databaseDefinition);
+        var fileLines = SplitDefinitionLines(fileText);
+        var prefix = 0;
+        while (prefix < databaseLines.Length
+               && prefix < fileLines.Length
+               && string.Equals(databaseLines[prefix], fileLines[prefix], StringComparison.Ordinal))
+        {
+            prefix++;
+        }
+
+        if (prefix == databaseLines.Length && prefix == fileLines.Length)
+        {
+            return new ModuleFileDiff(true, null, 0, 0, []);
+        }
+
+        var suffix = 0;
+        while (suffix + prefix < databaseLines.Length
+               && suffix + prefix < fileLines.Length
+               && string.Equals(
+                   databaseLines[databaseLines.Length - 1 - suffix],
+                   fileLines[fileLines.Length - 1 - suffix],
+                   StringComparison.Ordinal))
+        {
+            suffix++;
+        }
+
+        var databaseChangedStart = prefix + 1;
+        var fileChangedStart = prefix + 1;
+        var databaseChangedEnd = databaseLines.Length - suffix;
+        var fileChangedEnd = fileLines.Length - suffix;
+        var hunkDatabaseStart = Math.Max(1, databaseChangedStart - contextLines);
+        var hunkFileStart = Math.Max(1, fileChangedStart - contextLines);
+        var hunkDatabaseEnd = Math.Min(databaseLines.Length, Math.Max(databaseChangedStart, databaseChangedEnd) + contextLines);
+        var hunkFileEnd = Math.Min(fileLines.Length, Math.Max(fileChangedStart, fileChangedEnd) + contextLines);
+
+        var hunk = new ModuleFileDiffHunk(
+            hunkDatabaseStart,
+            hunkDatabaseEnd,
+            hunkFileStart,
+            hunkFileEnd,
+            BuildDiffLines(databaseLines, hunkDatabaseStart, hunkDatabaseEnd, databaseChangedStart, databaseChangedEnd),
+            BuildDiffLines(fileLines, hunkFileStart, hunkFileEnd, fileChangedStart, fileChangedEnd));
+
+        return new ModuleFileDiff(
+            false,
+            prefix + 1,
+            Math.Max(0, databaseChangedEnd - databaseChangedStart + 1),
+            Math.Max(0, fileChangedEnd - fileChangedStart + 1),
+            [hunk]);
+    }
+
+    private static ModuleFileDiffLine[] BuildDiffLines(
+        string[] lines,
+        int startLine,
+        int endLine,
+        int changedStart,
+        int changedEnd)
+    {
+        if (lines.Length == 0 || startLine > endLine)
+        {
+            return [];
+        }
+
+        var result = new List<ModuleFileDiffLine>();
+        for (var lineNumber = startLine; lineNumber <= endLine; lineNumber++)
+        {
+            result.Add(new ModuleFileDiffLine(
+                lineNumber,
+                lines[lineNumber - 1],
+                lineNumber >= changedStart && lineNumber <= changedEnd));
+        }
+
+        return result.ToArray();
+    }
+
+    private static string NormalizeTextForComparison(string text)
+    {
+        return string.Join(
+                "\n",
+                SplitDefinitionLines(text.Trim('\uFEFF'))
+                    .Select(line => line.TrimEnd()))
+            .Trim();
     }
 
     internal static IReadOnlyList<UserSqlParameterSpec> BuildUserSqlParameters(
@@ -2506,6 +2686,32 @@ public sealed class SqlMetadataService
         ModuleDefinitionLine[] Lines);
 
     internal sealed record ModuleDefinitionLine(int LineNumber, string Text);
+
+    private sealed record ModuleDefinitionInfo(
+        string Schema,
+        string Name,
+        string Type,
+        string TypeDesc,
+        DateTime CreateDate,
+        DateTime ModifyDate,
+        string Definition);
+
+    internal sealed record ModuleFileDiff(
+        bool Equal,
+        int? FirstDifferentLine,
+        int DatabaseChangedLineCount,
+        int FileChangedLineCount,
+        ModuleFileDiffHunk[] Hunks);
+
+    internal sealed record ModuleFileDiffHunk(
+        int DatabaseStartLine,
+        int DatabaseEndLine,
+        int FileStartLine,
+        int FileEndLine,
+        ModuleFileDiffLine[] DatabaseLines,
+        ModuleFileDiffLine[] FileLines);
+
+    internal sealed record ModuleFileDiffLine(int LineNumber, string Text, bool Changed);
 
     internal sealed record UserSqlParameterSpec(
         string Name,

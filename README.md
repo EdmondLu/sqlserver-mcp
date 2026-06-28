@@ -104,6 +104,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `get_foreign_keys` | Inspect incoming and outgoing foreign keys |
 | `search_sql_modules` | Search SQL module definitions |
 | `get_module_definition` | Read a module definition, optionally by keyword or line range |
+| `compare_module_to_file` | Compare a database module definition with a local file |
 | `get_dependencies` | Find incoming and outgoing dependencies |
 | `find_usage` | Find object, column, or token usage |
 | `search_config_text` | Search configured application/configuration text columns |

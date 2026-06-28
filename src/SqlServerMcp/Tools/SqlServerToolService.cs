@@ -133,6 +133,20 @@ public sealed class SqlServerToolService
             name);
     }
 
+    public Task<string> CompareModuleToFileAsync(
+        string schema,
+        string name,
+        string filePath,
+        int? contextLines,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "compare_module_to_file",
+            () => _metadataService.CompareModuleToFileAsync(schema, name, filePath, contextLines, cancellationToken),
+            schema,
+            name);
+    }
+
     public Task<string> GetDependenciesAsync(
         string schema,
         string name,

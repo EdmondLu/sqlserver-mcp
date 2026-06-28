@@ -72,7 +72,7 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 - `find_objects`、`find_column`、`find_usage`
 - `describe_table`、`get_object_overview`
 - `get_indexes`、`get_constraints`、`get_foreign_keys`
-- `search_sql_modules`、`get_module_definition`、`get_dependencies`
+- `search_sql_modules`、`get_module_definition`、`compare_module_to_file`、`get_dependencies`
 - `search_config_text`、`run_readonly_query`、`describe_query_result`、`explain_query_plan`
 - `reload_connection`
 

@@ -134,6 +134,18 @@ public static class SqlServerMcpTools
             cancellationToken);
     }
 
+    [McpServerTool(ReadOnly = true), Description("Compare a SQL Server module definition with a local file path, returning hashes, modify times, match flags, and compact line diff context.")]
+    public static Task<string> CompareModuleToFile(
+        SqlServerToolService service,
+        [Description("Schema name, usually dbo.")] string schema,
+        [Description("Module name.")] string name,
+        [Description("Absolute local file path to compare with the database module definition.")] string filePath,
+        [Description("Context lines around the changed block. Defaults to 5 and is capped.")] int? contextLines = null,
+        CancellationToken cancellationToken = default)
+    {
+        return service.CompareModuleToFileAsync(schema, name, filePath, contextLines, cancellationToken);
+    }
+
     [McpServerTool(ReadOnly = true), Description("Return incoming and/or outgoing SQL Server dependencies for an object using sys.sql_expression_dependencies plus text-search fallback for incoming module references.")]
     public static Task<string> GetDependencies(
         SqlServerToolService service,

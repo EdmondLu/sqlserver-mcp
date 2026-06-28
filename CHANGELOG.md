@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 1.2.0 - 2026-06-28
+
+- Added `compare_module_to_file` to compare a database module definition with a local file, returning hashes, modify times, match flags, and compact line diff context.
+
 ## 1.1.0 - 2026-06-28
 
 - Added `describe_query_result` for guarded query result-shape inspection without executing the target query.
