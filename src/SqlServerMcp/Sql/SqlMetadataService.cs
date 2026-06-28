@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
 using SqlServerMcp.Configuration;
 using SqlServerMcp.Infrastructure;
@@ -14,6 +15,7 @@ public sealed class SqlMetadataService
     private const int DefaultModuleContextLines = 3;
     private const int MaxModuleContextLines = 50;
     private const long MaxCompareFileBytes = 10 * 1024 * 1024;
+    private static readonly Regex TempTableNameRegex = new(@"(?<![#\w])#[A-Za-z_][A-Za-z0-9_]*", RegexOptions.Compiled);
 
     private readonly SqlServerMcpOptions _options;
     private readonly SqlConnectionFactory _connectionFactory;
@@ -684,6 +686,27 @@ public sealed class SqlMetadataService
             exactMatch = string.Equals(module.Definition, fileText, StringComparison.Ordinal),
             normalizedMatch = string.Equals(dbNormalized, fileNormalized, StringComparison.Ordinal),
             diff
+        };
+    }
+
+    public async Task<object> AnalyzeModuleTempTablesAsync(
+        string schema,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        var module = await GetModuleDefinitionCoreAsync(schema, name, cancellationToken);
+        var analysis = AnalyzeTempTables(module.Definition);
+
+        return new
+        {
+            schema = module.Schema,
+            name = module.Name,
+            type = module.Type,
+            typeDesc = module.TypeDesc,
+            module.ModifyDate,
+            lineCount = SplitDefinitionLines(module.Definition).Length,
+            tempTableCount = analysis.TempTables.Length,
+            analysis.TempTables
         };
     }
 
@@ -2420,6 +2443,181 @@ public sealed class SqlMetadataService
             .Trim();
     }
 
+    internal static TempTableAnalysis AnalyzeTempTables(string definition)
+    {
+        var lines = SplitDefinitionLines(definition);
+        var tables = new Dictionary<string, TempTableBuilder>(StringComparer.OrdinalIgnoreCase);
+
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var lineNumber = i + 1;
+            var line = lines[i];
+            foreach (Match match in TempTableNameRegex.Matches(line))
+            {
+                var tableName = match.Value;
+                var builder = GetTempTableBuilder(tables, tableName);
+                builder.SetFirstLine(lineNumber);
+                var operation = ClassifyTempTableOperation(line, tableName);
+                builder.References.Add(new TempTableReference(lineNumber, operation, line.Trim()));
+
+                if (operation is "create_table" or "select_into")
+                {
+                    builder.Creations.Add(new TempTableCreation(lineNumber, operation, line.Trim()));
+                }
+
+                if (operation == "create_table")
+                {
+                    builder.Columns.AddRange(ExtractTempTableColumns(lines, i));
+                }
+            }
+        }
+
+        var items = tables.Values
+            .OrderBy(table => table.FirstLine)
+            .Select(table => new TempTableInfo(
+                table.Name,
+                table.FirstLine,
+                table.Creations.ToArray(),
+                table.Columns
+                    .GroupBy(column => column.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(group => group.First())
+                    .ToArray(),
+                table.References
+                    .GroupBy(reference => new { reference.LineNumber, reference.Operation, reference.Text })
+                    .Select(group => group.First())
+                    .OrderBy(reference => reference.LineNumber)
+                    .ToArray(),
+                table.References
+                    .GroupBy(reference => reference.Operation, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(group => group.Key)
+                    .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase)))
+            .ToArray();
+
+        return new TempTableAnalysis(items);
+    }
+
+    private static TempTableBuilder GetTempTableBuilder(
+        Dictionary<string, TempTableBuilder> tables,
+        string tableName)
+    {
+        if (!tables.TryGetValue(tableName, out var builder))
+        {
+            builder = new TempTableBuilder(tableName);
+            tables.Add(tableName, builder);
+        }
+
+        return builder;
+    }
+
+    private static string ClassifyTempTableOperation(string line, string tableName)
+    {
+        var normalized = NormalizeSqlLine(line);
+        var table = Regex.Escape(tableName);
+
+        if (Regex.IsMatch(normalized, $@"\bCREATE\s+TABLE\s+{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "create_table";
+        }
+
+        if (Regex.IsMatch(normalized, $@"\bINSERT\s+(?:INTO\s+)?{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "insert";
+        }
+
+        if (Regex.IsMatch(normalized, $@"\bINTO\s+{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "select_into";
+        }
+
+        if (Regex.IsMatch(normalized, $@"\bUPDATE\s+{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "update";
+        }
+
+        if (Regex.IsMatch(normalized, $@"\bDELETE\s+(?:FROM\s+)?{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "delete";
+        }
+
+        if (Regex.IsMatch(normalized, $@"\bJOIN\s+{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "join";
+        }
+
+        if (Regex.IsMatch(normalized, $@"\bFROM\s+{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "read";
+        }
+
+        if (Regex.IsMatch(normalized, $@"\bMERGE\s+{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "merge";
+        }
+
+        return "reference";
+    }
+
+    private static string NormalizeSqlLine(string line)
+    {
+        return Regex.Replace(line, @"\s+", " ").Trim();
+    }
+
+    private static IReadOnlyList<TempTableColumn> ExtractTempTableColumns(string[] lines, int createLineIndex)
+    {
+        var columns = new List<TempTableColumn>();
+        var openParenSeen = false;
+        for (var i = createLineIndex; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            if (!openParenSeen)
+            {
+                var openIndex = line.IndexOf('(');
+                if (openIndex < 0)
+                {
+                    continue;
+                }
+
+                openParenSeen = true;
+                line = line[(openIndex + 1)..];
+            }
+
+            var closeIndex = line.IndexOf(')');
+            var candidate = closeIndex >= 0 ? line[..closeIndex] : line;
+            var column = ParseTempTableColumn(i + 1, candidate);
+            if (column is not null)
+            {
+                columns.Add(column);
+            }
+
+            if (closeIndex >= 0)
+            {
+                break;
+            }
+        }
+
+        return columns;
+    }
+
+    private static TempTableColumn? ParseTempTableColumn(int lineNumber, string line)
+    {
+        var trimmed = line.Trim().TrimEnd(',');
+        if (trimmed.Length == 0
+            || trimmed.StartsWith("--", StringComparison.Ordinal)
+            || trimmed.StartsWith("CONSTRAINT", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("PRIMARY ", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("UNIQUE ", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("INDEX ", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("CHECK ", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var match = Regex.Match(trimmed, @"^\[?(?<name>[A-Za-z_][A-Za-z0-9_]*)\]?\s+(?<definition>.+)$");
+        return match.Success
+            ? new TempTableColumn(lineNumber, match.Groups["name"].Value, match.Groups["definition"].Value.Trim())
+            : null;
+    }
+
     internal static IReadOnlyList<UserSqlParameterSpec> BuildUserSqlParameters(
         IReadOnlyDictionary<string, object?>? parameters)
     {
@@ -2712,6 +2910,48 @@ public sealed class SqlMetadataService
         ModuleFileDiffLine[] FileLines);
 
     internal sealed record ModuleFileDiffLine(int LineNumber, string Text, bool Changed);
+
+    internal sealed record TempTableAnalysis(TempTableInfo[] TempTables);
+
+    internal sealed record TempTableInfo(
+        string Name,
+        int FirstLine,
+        TempTableCreation[] Creations,
+        TempTableColumn[] Columns,
+        TempTableReference[] References,
+        IReadOnlyDictionary<string, int> OperationCounts);
+
+    internal sealed record TempTableCreation(int LineNumber, string Operation, string Text);
+
+    internal sealed record TempTableColumn(int LineNumber, string Name, string Definition);
+
+    internal sealed record TempTableReference(int LineNumber, string Operation, string Text);
+
+    private sealed class TempTableBuilder
+    {
+        public TempTableBuilder(string name)
+        {
+            Name = name;
+        }
+
+        public string Name { get; }
+
+        public int FirstLine { get; private set; }
+
+        public List<TempTableCreation> Creations { get; } = [];
+
+        public List<TempTableColumn> Columns { get; } = [];
+
+        public List<TempTableReference> References { get; } = [];
+
+        public void SetFirstLine(int lineNumber)
+        {
+            if (FirstLine == 0 || lineNumber < FirstLine)
+            {
+                FirstLine = lineNumber;
+            }
+        }
+    }
 
     internal sealed record UserSqlParameterSpec(
         string Name,

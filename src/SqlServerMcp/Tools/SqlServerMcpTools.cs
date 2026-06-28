@@ -146,6 +146,16 @@ public static class SqlServerMcpTools
         return service.CompareModuleToFileAsync(schema, name, filePath, contextLines, cancellationToken);
     }
 
+    [McpServerTool(ReadOnly = true), Description("Analyze local temp table usage inside a stored procedure, function, trigger, or view definition, including CREATE TABLE, SELECT INTO, writes, reads, joins, and line numbers.")]
+    public static Task<string> AnalyzeModuleTempTables(
+        SqlServerToolService service,
+        [Description("Schema name, usually dbo.")] string schema,
+        [Description("Module name.")] string name,
+        CancellationToken cancellationToken = default)
+    {
+        return service.AnalyzeModuleTempTablesAsync(schema, name, cancellationToken);
+    }
+
     [McpServerTool(ReadOnly = true), Description("Return incoming and/or outgoing SQL Server dependencies for an object using sys.sql_expression_dependencies plus text-search fallback for incoming module references.")]
     public static Task<string> GetDependencies(
         SqlServerToolService service,

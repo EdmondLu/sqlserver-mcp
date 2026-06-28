@@ -147,6 +147,18 @@ public sealed class SqlServerToolService
             name);
     }
 
+    public Task<string> AnalyzeModuleTempTablesAsync(
+        string schema,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "analyze_module_temp_tables",
+            () => _metadataService.AnalyzeModuleTempTablesAsync(schema, name, cancellationToken),
+            schema,
+            name);
+    }
+
     public Task<string> GetDependenciesAsync(
         string schema,
         string name,

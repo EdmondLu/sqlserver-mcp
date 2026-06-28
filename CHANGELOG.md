@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 1.3.0 - 2026-06-29
+
+- Added `analyze_module_temp_tables` to statically inspect local temp table creation, writes, reads, joins, and CREATE TABLE column definitions inside SQL modules.
+
 ## 1.2.0 - 2026-06-28
 
 - Added `compare_module_to_file` to compare a database module definition with a local file, returning hashes, modify times, match flags, and compact line diff context.
