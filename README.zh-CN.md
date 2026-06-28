@@ -6,7 +6,7 @@
 
 ## 特性
 
-- 提供 16 个固定工具，覆盖连接检查、对象搜索、结构查看、依赖分析、SQL 模块搜索、只读查询和预估执行计划。
+- 提供 20 个固定工具，覆盖连接检查、对象搜索、结构查看、依赖分析、SQL 模块搜索、只读查询和预估执行计划。
 - 启动时只注册工具，不连接数据库，也不扫描全库；首次数据库调用时才建立连接。
 - SQL 用户名和密码从 Windows Credential Manager 读取，不写入 JSON 配置。
 - 基于 ScriptDom 的只读 Guard 只接受单条 `SELECT` 或 `WITH` 查询，并拒绝写操作、DDL、执行语句、跨库引用、服务器级 DMV、链接服务器和外部数据源。
@@ -75,6 +75,8 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 - `search_sql_modules`、`get_module_definition`、`compare_module_to_file`、`analyze_module_temp_tables`、`get_dependencies`
 - `search_config_text`、`run_readonly_query`、`describe_query_result`、`explain_query_plan`
 - `reload_connection`
+
+`explain_query_plan` 返回原始 SHOWPLAN XML，同时附带扫描、缺失索引、隐式转换、排序、hash、lookup、并行和 warning 的结构化摘要。
 
 结构工具会识别 `vwp_`、`vwpr_`、`vwt_`、`vwtr_` 这四种历史视图前缀，并优先尝试对应的无前缀物理表。
 

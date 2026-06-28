@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 1.4.0 - 2026-06-29
+
+- Added structured `explain_query_plan` summaries for SHOWPLAN XML, including scan, lookup, sort, hash, parallelism, missing-index, implicit-conversion, warning, and expensive-operator signals.
+
 ## 1.3.0 - 2026-06-29
 
 - Added `analyze_module_temp_tables` to statically inspect local temp table creation, writes, reads, joins, and CREATE TABLE column definitions inside SQL modules.

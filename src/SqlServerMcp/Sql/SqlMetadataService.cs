@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml.Linq;
 using Microsoft.Data.SqlClient;
 using SqlServerMcp.Configuration;
 using SqlServerMcp.Infrastructure;
@@ -901,6 +902,7 @@ public sealed class SqlMetadataService
             return new
             {
                 statementCount = plans.Count,
+                summary = SummarizeShowplanXml(plans),
                 showplanXml = plans,
                 elapsedMs = stopwatch.ElapsedMilliseconds
             };
@@ -2851,6 +2853,351 @@ public sealed class SqlMetadataService
         var suffix = start + length < compact.Length ? "..." : string.Empty;
         return string.Concat(prefix, compact.AsSpan(start, length), suffix);
     }
+
+    internal static ShowplanSummary SummarizeShowplanXml(IReadOnlyList<string> plans)
+    {
+        var statementCount = 0;
+        var estimatedTotalSubtreeCost = 0m;
+        var operators = new List<ShowplanOperatorSummary>();
+        var missingIndexes = new List<ShowplanMissingIndex>();
+        var warnings = new List<ShowplanWarningSummary>();
+        var parseErrors = new List<string>();
+        var implicitConversionCount = 0;
+
+        foreach (var plan in plans.Where(plan => !string.IsNullOrWhiteSpace(plan)))
+        {
+            XDocument document;
+            try
+            {
+                document = XDocument.Parse(plan, LoadOptions.None);
+            }
+            catch (Exception ex) when (ex is System.Xml.XmlException or InvalidOperationException)
+            {
+                parseErrors.Add(ex.Message);
+                continue;
+            }
+
+            if (document.Root is null)
+            {
+                parseErrors.Add("Showplan XML document has no root element.");
+                continue;
+            }
+
+            var statements = DescendantsByLocalName(document.Root, "StmtSimple").ToArray();
+            statementCount += statements.Length == 0 ? 1 : statements.Length;
+            foreach (var statement in statements)
+            {
+                estimatedTotalSubtreeCost += ReadDecimalAttribute(statement, "StatementSubTreeCost") ?? 0m;
+            }
+
+            var rootOperators = DescendantsByLocalName(document.Root, "RelOp")
+                .Select(ReadShowplanOperator)
+                .ToArray();
+            operators.AddRange(rootOperators);
+            missingIndexes.AddRange(ReadMissingIndexes(document.Root));
+            warnings.AddRange(ReadShowplanWarnings(document.Root));
+            implicitConversionCount += Math.Max(
+                DescendantsByLocalName(document.Root, "PlanAffectingConvert").Count(),
+                DescendantsByLocalName(document.Root, "ScalarOperator")
+                    .Count(element => (ReadAttribute(element, "ScalarString") ?? string.Empty)
+                        .Contains("CONVERT_IMPLICIT", StringComparison.OrdinalIgnoreCase)));
+        }
+
+        if (statementCount == 0 && parseErrors.Count == 0)
+        {
+            statementCount = plans.Count;
+        }
+
+        var counts = new ShowplanOperatorCounts(
+            operators.Count(operatorSummary => IsScanOperator(operatorSummary.PhysicalOp)),
+            operators.Count(operatorSummary => ContainsOperator(operatorSummary.PhysicalOp, "Key Lookup")),
+            operators.Count(operatorSummary => ContainsOperator(operatorSummary.PhysicalOp, "Sort")),
+            operators.Count(operatorSummary => ContainsOperator(operatorSummary.PhysicalOp, "Hash Match")),
+            operators.Count(operatorSummary => ContainsOperator(operatorSummary.PhysicalOp, "Parallelism")),
+            missingIndexes.Count,
+            implicitConversionCount,
+            warnings.Count);
+
+        return new ShowplanSummary(
+            statementCount,
+            estimatedTotalSubtreeCost,
+            counts,
+            BuildShowplanRisks(counts),
+            operators
+                .Where(operatorSummary => operatorSummary.EstimatedSubtreeCost is not null)
+                .OrderByDescending(operatorSummary => operatorSummary.EstimatedSubtreeCost)
+                .ThenBy(operatorSummary => operatorSummary.NodeId)
+                .Take(10)
+                .ToArray(),
+            missingIndexes
+                .OrderByDescending(index => index.Impact)
+                .Take(10)
+                .ToArray(),
+            warnings.Take(20).ToArray(),
+            parseErrors.ToArray());
+    }
+
+    private static ShowplanRisk[] BuildShowplanRisks(ShowplanOperatorCounts counts)
+    {
+        var risks = new List<ShowplanRisk>();
+
+        if (counts.MissingIndexCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "missing_index",
+                "high",
+                $"Plan reports {counts.MissingIndexCount} missing index suggestion(s).",
+                "Review the suggested keys/includes against workload and write cost before creating indexes."));
+        }
+
+        if (counts.ImplicitConversionCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "implicit_conversion",
+                "high",
+                $"Plan reports {counts.ImplicitConversionCount} plan-affecting implicit conversion(s).",
+                "Check mismatched parameter, variable, and column data types; conversions on indexed columns can block seeks."));
+        }
+
+        if (counts.ScanCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "scan",
+                "medium",
+                $"Plan contains {counts.ScanCount} scan operator(s).",
+                "Validate expected selectivity; add predicates or indexes only when the scan is not intentional."));
+        }
+
+        if (counts.KeyLookupCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "key_lookup",
+                "medium",
+                $"Plan contains {counts.KeyLookupCount} key lookup operator(s).",
+                "If lookups run many times, consider covering needed columns in an existing index."));
+        }
+
+        if (counts.SortCount + counts.HashMatchCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "sort_or_hash",
+                "medium",
+                $"Plan contains {counts.SortCount} sort and {counts.HashMatchCount} hash match operator(s).",
+                "Check memory grant, row estimates, and whether join/order keys can be supported by indexes."));
+        }
+
+        if (counts.WarningCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "warning",
+                "medium",
+                $"Plan contains {counts.WarningCount} warning node(s).",
+                "Inspect warnings for spills, no-join-predicate, cardinality, or conversion issues."));
+        }
+
+        if (counts.ParallelismCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "parallelism",
+                "info",
+                $"Plan contains {counts.ParallelismCount} parallelism operator(s).",
+                "Parallelism is not necessarily bad; review only if the query is unexpectedly expensive or blocking."));
+        }
+
+        return risks.ToArray();
+    }
+
+    private static ShowplanOperatorSummary ReadShowplanOperator(XElement element)
+    {
+        var objectRef = ReadShowplanObject(element);
+        return new ShowplanOperatorSummary(
+            ReadIntAttribute(element, "NodeId"),
+            ReadAttribute(element, "PhysicalOp"),
+            ReadAttribute(element, "LogicalOp"),
+            ReadDecimalAttribute(element, "EstimatedTotalSubtreeCost"),
+            ReadDecimalAttribute(element, "EstimateRows"),
+            objectRef);
+    }
+
+    private static ShowplanObjectReference? ReadShowplanObject(XElement element)
+    {
+        var objectElement = DescendantsByLocalName(element, "Object").FirstOrDefault();
+        if (objectElement is null)
+        {
+            return null;
+        }
+
+        var database = ReadAttribute(objectElement, "Database");
+        var schema = ReadAttribute(objectElement, "Schema");
+        var table = ReadAttribute(objectElement, "Table");
+        var index = ReadAttribute(objectElement, "Index");
+        return database is null && schema is null && table is null && index is null
+            ? null
+            : new ShowplanObjectReference(database, schema, table, index);
+    }
+
+    private static IEnumerable<ShowplanMissingIndex> ReadMissingIndexes(XElement root)
+    {
+        foreach (var missingIndex in DescendantsByLocalName(root, "MissingIndex"))
+        {
+            var group = missingIndex.Ancestors()
+                .FirstOrDefault(element => element.Name.LocalName.Equals("MissingIndexGroup", StringComparison.Ordinal));
+            yield return new ShowplanMissingIndex(
+                ReadAttribute(missingIndex, "Database"),
+                ReadAttribute(missingIndex, "Schema"),
+                ReadAttribute(missingIndex, "Table"),
+                group is null ? null : ReadDecimalAttribute(group, "Impact"),
+                ReadMissingIndexColumns(missingIndex, "EQUALITY"),
+                ReadMissingIndexColumns(missingIndex, "INEQUALITY"),
+                ReadMissingIndexColumns(missingIndex, "INCLUDE"));
+        }
+    }
+
+    private static string[] ReadMissingIndexColumns(XElement missingIndex, string usage)
+    {
+        return DescendantsByLocalName(missingIndex, "ColumnGroup")
+            .Where(group => string.Equals(ReadAttribute(group, "Usage"), usage, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(group => DescendantsByLocalName(group, "Column"))
+            .Select(column => ReadAttribute(column, "Name"))
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static IEnumerable<ShowplanWarningSummary> ReadShowplanWarnings(XElement root)
+    {
+        foreach (var warning in DescendantsByLocalName(root, "Warnings"))
+        {
+            var details = new List<string>();
+            details.AddRange(warning.Attributes()
+                .Where(attribute => !string.IsNullOrWhiteSpace(attribute.Value))
+                .Select(attribute => $"{attribute.Name.LocalName}={attribute.Value}"));
+
+            details.AddRange(warning.Descendants()
+                .Where(element => element.Name.LocalName is "PlanAffectingConvert" or "SpillToTempDb" or "ColumnsWithNoStatistics")
+                .Select(ReadWarningDetail));
+
+            var relOp = warning.Ancestors()
+                .FirstOrDefault(element => element.Name.LocalName.Equals("RelOp", StringComparison.Ordinal));
+            yield return new ShowplanWarningSummary(
+                relOp is null ? null : ReadIntAttribute(relOp, "NodeId"),
+                relOp is null ? null : ReadAttribute(relOp, "PhysicalOp"),
+                details.Distinct(StringComparer.OrdinalIgnoreCase).Take(10).ToArray());
+        }
+    }
+
+    private static string ReadWarningDetail(XElement element)
+    {
+        var attributes = string.Join(
+            ", ",
+            element.Attributes()
+                .Where(attribute => !string.IsNullOrWhiteSpace(attribute.Value))
+                .Select(attribute => $"{attribute.Name.LocalName}={attribute.Value}"));
+        return string.IsNullOrWhiteSpace(attributes)
+            ? element.Name.LocalName
+            : $"{element.Name.LocalName}: {attributes}";
+    }
+
+    private static IEnumerable<XElement> DescendantsByLocalName(XContainer root, string localName)
+    {
+        return root.Descendants()
+            .Where(element => element.Name.LocalName.Equals(localName, StringComparison.Ordinal));
+    }
+
+    private static string? ReadAttribute(XElement element, string attributeName)
+    {
+        return element.Attributes()
+            .FirstOrDefault(attribute => attribute.Name.LocalName.Equals(attributeName, StringComparison.Ordinal))
+            ?.Value;
+    }
+
+    private static int? ReadIntAttribute(XElement element, string attributeName)
+    {
+        return int.TryParse(
+            ReadAttribute(element, attributeName),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var value)
+            ? value
+            : null;
+    }
+
+    private static decimal? ReadDecimalAttribute(XElement element, string attributeName)
+    {
+        return decimal.TryParse(
+            ReadAttribute(element, attributeName),
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var value)
+            ? value
+            : null;
+    }
+
+    private static bool IsScanOperator(string? physicalOp)
+    {
+        return ContainsOperator(physicalOp, "Scan")
+               && !ContainsOperator(physicalOp, "Constant Scan");
+    }
+
+    private static bool ContainsOperator(string? physicalOp, string token)
+    {
+        return physicalOp?.Contains(token, StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    internal sealed record ShowplanSummary(
+        int StatementCount,
+        decimal EstimatedTotalSubtreeCost,
+        ShowplanOperatorCounts OperatorCounts,
+        ShowplanRisk[] Risks,
+        ShowplanOperatorSummary[] ExpensiveOperators,
+        ShowplanMissingIndex[] MissingIndexes,
+        ShowplanWarningSummary[] Warnings,
+        string[] ParseErrors);
+
+    internal sealed record ShowplanOperatorCounts(
+        int ScanCount,
+        int KeyLookupCount,
+        int SortCount,
+        int HashMatchCount,
+        int ParallelismCount,
+        int MissingIndexCount,
+        int ImplicitConversionCount,
+        int WarningCount);
+
+    internal sealed record ShowplanRisk(
+        string Code,
+        string Severity,
+        string Message,
+        string Hint);
+
+    internal sealed record ShowplanOperatorSummary(
+        int? NodeId,
+        string? PhysicalOp,
+        string? LogicalOp,
+        decimal? EstimatedSubtreeCost,
+        decimal? EstimatedRows,
+        ShowplanObjectReference? Object);
+
+    internal sealed record ShowplanObjectReference(
+        string? Database,
+        string? Schema,
+        string? Table,
+        string? Index);
+
+    internal sealed record ShowplanMissingIndex(
+        string? Database,
+        string? Schema,
+        string? Table,
+        decimal? Impact,
+        string[] EqualityColumns,
+        string[] InequalityColumns,
+        string[] IncludeColumns);
+
+    internal sealed record ShowplanWarningSummary(
+        int? NodeId,
+        string? PhysicalOp,
+        string[] Details);
 
     private sealed record DbObjectInfo(
         int ObjectId,
