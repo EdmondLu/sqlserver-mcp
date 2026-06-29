@@ -20,8 +20,10 @@ public sealed class SqlMetadataService
     private const int MaxRepoCompareCandidateLimit = 50;
     private const int MaxRepoCompareFilesScanned = 20_000;
     private const int MaxDiffSyncLookahead = 200;
-    private const int MaxDiffHunks = 8;
-    private const int MaxDiffLinesPerSide = 120;
+    private const int DefaultCompactDiffHunks = 8;
+    private const int DefaultCompactDiffLinesPerSide = 120;
+    private const int MaxConfiguredDiffHunks = 50;
+    private const int MaxConfiguredDiffLinesPerSide = 1000;
     private static readonly Regex TempTableNameRegex = new(@"(?<![#\w])#[A-Za-z_][A-Za-z0-9_]*", RegexOptions.Compiled);
     private static readonly Regex SqlBatchSeparatorRegex = new(@"^\s*GO(?:\s+\d+)?\s*;?\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex SqlModuleCreateRegex = new(
@@ -750,11 +752,15 @@ public sealed class SqlMetadataService
         string name,
         string filePath,
         int? contextLines,
+        string? diffMode,
+        int? maxHunks,
+        int? maxDiffLinesPerSide,
         CancellationToken cancellationToken)
     {
         var module = await GetModuleDefinitionCoreAsync(schema, name, cancellationToken);
         var file = GetReadableCompareFile(filePath);
-        return await BuildModuleFileComparisonAsync(module, file, contextLines, cancellationToken);
+        var diffOptions = BuildDiffOutputOptions(contextLines, diffMode, maxHunks, maxDiffLinesPerSide);
+        return await BuildModuleFileComparisonAsync(module, file, diffOptions, cancellationToken);
     }
 
     public async Task<object> CompareModuleToRepoAsync(
@@ -762,12 +768,16 @@ public sealed class SqlMetadataService
         string name,
         string? root,
         string[]? patterns,
+        string[]? excludePatterns,
         int? maxCandidates,
         int? contextLines,
+        string? diffMode,
+        int? maxHunks,
+        int? maxDiffLinesPerSide,
         CancellationToken cancellationToken)
     {
         var module = await GetModuleDefinitionCoreAsync(schema, name, cancellationToken);
-        var discovery = FindModuleSqlFileDiscovery(root, module.Schema, module.Name, patterns, maxCandidates);
+        var discovery = FindModuleSqlFileDiscovery(root, module.Schema, module.Name, patterns, excludePatterns, maxCandidates);
         if (discovery.SelectedCandidate is null)
         {
             return new
@@ -789,7 +799,8 @@ public sealed class SqlMetadataService
         }
 
         var selectedFile = GetReadableCompareFile(discovery.SelectedCandidate.Path);
-        var comparison = await BuildModuleFileComparisonAsync(module, selectedFile, contextLines, cancellationToken);
+        var diffOptions = BuildDiffOutputOptions(contextLines, diffMode, maxHunks, maxDiffLinesPerSide);
+        var comparison = await BuildModuleFileComparisonAsync(module, selectedFile, diffOptions, cancellationToken);
 
         return new
         {
@@ -802,9 +813,12 @@ public sealed class SqlMetadataService
             candidateCount = discovery.CandidateCount,
             discovery,
             selectedFile = discovery.SelectedCandidate,
+            comparison.Summary,
             comparison,
             exactMatch = comparison.ExactMatch,
             normalizedMatch = comparison.NormalizedMatch,
+            sqlNormalizedMatch = comparison.SqlNormalizedMatch,
+            differenceKind = comparison.DifferenceKind,
             nextActions = ModuleCompareNextActions
         };
     }
@@ -2433,16 +2447,21 @@ public sealed class SqlMetadataService
     private async Task<ModuleFileComparisonResult> BuildModuleFileComparisonAsync(
         ModuleDefinitionInfo module,
         FileInfo file,
-        int? contextLines,
+        DiffOutputOptions diffOptions,
         CancellationToken cancellationToken)
     {
         var fileText = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
-        var effectiveContextLines = Math.Clamp(contextLines ?? 5, 0, MaxModuleContextLines);
         var dbNormalized = NormalizeTextForComparison(module.Definition);
         var fileNormalized = NormalizeTextForComparison(fileText);
         var dbSqlNormalized = NormalizeSqlModuleTextForComparison(module.Definition);
         var fileSqlNormalized = NormalizeSqlModuleTextForComparison(fileText);
-        var diff = BuildLineDiff(module.Definition, fileText, effectiveContextLines);
+        var diff = BuildLineDiff(module.Definition, fileText, diffOptions);
+        var exactMatch = string.Equals(module.Definition, fileText, StringComparison.Ordinal);
+        var normalizedMatch = string.Equals(dbNormalized, fileNormalized, StringComparison.Ordinal);
+        var sqlNormalizedMatch = string.Equals(dbSqlNormalized, fileSqlNormalized, StringComparison.Ordinal);
+        var differenceKind = ClassifyModuleFileDifference(exactMatch, normalizedMatch, sqlNormalizedMatch);
+        var ignoredWrapperDifferences = DetectIgnoredWrapperDifferences(module.Definition, fileText);
+        var summary = BuildModuleFileComparisonSummary(file, diff, exactMatch, normalizedMatch, sqlNormalizedMatch, differenceKind);
 
         return new ModuleFileComparisonResult(
             module.Schema,
@@ -2466,9 +2485,12 @@ public sealed class SqlMetadataService
                 ComputeSha256Hex(fileText),
                 ComputeSha256Hex(fileNormalized),
                 ComputeSha256Hex(fileSqlNormalized)),
-            string.Equals(module.Definition, fileText, StringComparison.Ordinal),
-            string.Equals(dbNormalized, fileNormalized, StringComparison.Ordinal),
-            string.Equals(dbSqlNormalized, fileSqlNormalized, StringComparison.Ordinal),
+            exactMatch,
+            normalizedMatch,
+            sqlNormalizedMatch,
+            differenceKind,
+            ignoredWrapperDifferences,
+            summary,
             diff,
             ModuleCompareNextActions);
     }
@@ -2478,10 +2500,12 @@ public sealed class SqlMetadataService
         string schema,
         string name,
         string[]? patterns,
+        string[]? excludePatterns,
         int? maxCandidates)
     {
         var directory = GetReadableCompareRoot(root);
         var effectivePatterns = NormalizeRepoComparePatterns(patterns);
+        var effectiveExcludePatterns = NormalizeRepoComparePatterns(excludePatterns, []);
         var effectiveMaxCandidates = Math.Clamp(maxCandidates ?? DefaultRepoCompareCandidateLimit, 1, MaxRepoCompareCandidateLimit);
         var candidates = new List<ModuleSqlFileCandidate>();
         var scannedFileCount = 0;
@@ -2498,6 +2522,12 @@ public sealed class SqlMetadataService
             scannedFileCount++;
             var relativePath = Path.GetRelativePath(directory.FullName, file.FullName).Replace('\\', '/');
             if (!MatchesRepoComparePatterns(relativePath, file.Name, effectivePatterns))
+            {
+                continue;
+            }
+
+            if (effectiveExcludePatterns.Length > 0
+                && MatchesRepoComparePatterns(relativePath, file.Name, effectiveExcludePatterns))
             {
                 continue;
             }
@@ -2528,6 +2558,7 @@ public sealed class SqlMetadataService
         return new ModuleSqlFileDiscovery(
             directory.FullName,
             effectivePatterns,
+            effectiveExcludePatterns,
             scannedFileCount,
             searchTruncated,
             orderedCandidates.Length,
@@ -2535,10 +2566,16 @@ public sealed class SqlMetadataService
             visibleCandidates,
             selectedCandidate,
             ambiguous,
+            BuildRepoCompareSuggestedPatterns(visibleCandidates),
             hint);
     }
 
     private static string[] NormalizeRepoComparePatterns(string[]? patterns)
+    {
+        return NormalizeRepoComparePatterns(patterns, DefaultRepoComparePatterns);
+    }
+
+    private static string[] NormalizeRepoComparePatterns(string[]? patterns, string[] fallback)
     {
         var normalized = patterns?
             .Select(pattern => pattern?.Trim().Replace('\\', '/'))
@@ -2549,7 +2586,122 @@ public sealed class SqlMetadataService
 
         return normalized is { Length: > 0 }
             ? normalized
-            : DefaultRepoComparePatterns;
+            : fallback;
+    }
+
+    private static DiffOutputOptions BuildDiffOutputOptions(
+        int? contextLines,
+        string? diffMode,
+        int? maxHunks,
+        int? maxDiffLinesPerSide)
+    {
+        var mode = string.IsNullOrWhiteSpace(diffMode)
+            ? "compact"
+            : diffMode.Trim().ToLowerInvariant();
+        if (mode is not ("summary" or "compact" or "full"))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Invalid diffMode.",
+                diffMode,
+                "Use diffMode 'summary', 'compact', or 'full'.");
+        }
+
+        var defaultMaxHunks = mode == "full" ? MaxConfiguredDiffHunks : DefaultCompactDiffHunks;
+        var defaultMaxLines = mode == "full" ? MaxConfiguredDiffLinesPerSide : DefaultCompactDiffLinesPerSide;
+        var effectiveMaxHunks = Math.Clamp(maxHunks ?? defaultMaxHunks, 1, MaxConfiguredDiffHunks);
+        var effectiveMaxLines = Math.Clamp(maxDiffLinesPerSide ?? defaultMaxLines, 0, MaxConfiguredDiffLinesPerSide);
+        var includeLines = mode != "summary" && effectiveMaxLines > 0;
+
+        return new DiffOutputOptions(
+            mode,
+            Math.Clamp(contextLines ?? 5, 0, MaxModuleContextLines),
+            effectiveMaxHunks,
+            effectiveMaxLines,
+            includeLines);
+    }
+
+    private static string[] BuildRepoCompareSuggestedPatterns(ModuleSqlFileCandidate[] candidates)
+    {
+        return candidates
+            .Select(candidate => Path.GetDirectoryName(candidate.RelativePath)?.Replace('\\', '/'))
+            .Where(directory => !string.IsNullOrWhiteSpace(directory))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(5)
+            .Select(directory => $"{directory}/**/*.sql")
+            .ToArray();
+    }
+
+    private static string ClassifyModuleFileDifference(bool exactMatch, bool normalizedMatch, bool sqlNormalizedMatch)
+    {
+        if (exactMatch)
+        {
+            return "identical";
+        }
+
+        if (normalizedMatch)
+        {
+            return "whitespace_or_line_ending_only";
+        }
+
+        if (sqlNormalizedMatch)
+        {
+            return "script_wrapper_only";
+        }
+
+        return "body_changed";
+    }
+
+    private static string[] DetectIgnoredWrapperDifferences(string databaseDefinition, string fileText)
+    {
+        var differences = new List<string>();
+        var databaseLines = SplitDefinitionLines(databaseDefinition);
+        var fileLines = SplitDefinitionLines(fileText);
+
+        if (databaseLines.Any(line => SqlSessionSetRegex.IsMatch(line))
+            || fileLines.Any(line => SqlSessionSetRegex.IsMatch(line)))
+        {
+            differences.Add("session_set_options");
+        }
+
+        if (databaseLines.Any(line => SqlBatchSeparatorRegex.IsMatch(line))
+            || fileLines.Any(line => SqlBatchSeparatorRegex.IsMatch(line)))
+        {
+            differences.Add("batch_separator_go");
+        }
+
+        var databaseCreate = databaseLines.FirstOrDefault(line => SqlModuleCreateRegex.IsMatch(line));
+        var fileCreate = fileLines.FirstOrDefault(line => SqlModuleCreateRegex.IsMatch(line));
+        if (databaseCreate is not null
+            && fileCreate is not null
+            && !string.Equals(databaseCreate.Trim(), fileCreate.Trim(), StringComparison.OrdinalIgnoreCase)
+            && string.Equals(
+                NormalizeSqlModuleTextForComparison(databaseCreate),
+                NormalizeSqlModuleTextForComparison(fileCreate),
+                StringComparison.Ordinal))
+        {
+            differences.Add("create_or_alter_keyword");
+        }
+
+        return differences.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static string BuildModuleFileComparisonSummary(
+        FileInfo file,
+        ModuleFileDiff diff,
+        bool exactMatch,
+        bool normalizedMatch,
+        bool sqlNormalizedMatch,
+        string differenceKind)
+    {
+        var returnedDiffLineCount = diff.Hunks.Sum(hunk => hunk.DatabaseLines.Length + hunk.FileLines.Length);
+        var truncatedText = diff.Truncated ? "truncated" : "not truncated";
+        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; sqlNormalizedMatch={FormatBool(sqlNormalizedMatch)}; {diff.Hunks.Length} hunks; changedLines=db:{diff.DatabaseChangedLineCount},file:{diff.FileChangedLineCount}; returnedDiffLines={returnedDiffLineCount}; {truncatedText}";
+    }
+
+    private static string FormatBool(bool value)
+    {
+        return value ? "true" : "false";
     }
 
     private static IEnumerable<FileInfo> EnumerateSqlFiles(DirectoryInfo root)
@@ -2976,19 +3128,31 @@ public sealed class SqlMetadataService
 
     internal static ModuleFileDiff BuildLineDiff(string databaseDefinition, string fileText, int contextLines)
     {
+        return BuildLineDiff(
+            databaseDefinition,
+            fileText,
+            new DiffOutputOptions(
+                "compact",
+                Math.Clamp(contextLines, 0, MaxModuleContextLines),
+                DefaultCompactDiffHunks,
+                DefaultCompactDiffLinesPerSide,
+                true));
+    }
+
+    private static ModuleFileDiff BuildLineDiff(string databaseDefinition, string fileText, DiffOutputOptions options)
+    {
         var databaseLines = SplitDefinitionLines(databaseDefinition);
         var fileLines = SplitDefinitionLines(fileText);
-        var effectiveContextLines = Math.Clamp(contextLines, 0, MaxModuleContextLines);
         var segments = BuildDiffChangeSegments(databaseLines, fileLines);
         if (segments.Count == 0)
         {
-            return new ModuleFileDiff(true, null, 0, 0, false, 0, []);
+            return new ModuleFileDiff(true, null, 0, 0, options.Mode, false, 0, []);
         }
 
         var hunks = segments
-            .Select(segment => BuildDiffHunk(databaseLines, fileLines, segment, effectiveContextLines))
+            .Select(segment => BuildDiffHunk(databaseLines, fileLines, segment, options))
             .ToArray();
-        var visibleHunks = hunks.Take(MaxDiffHunks).ToArray();
+        var visibleHunks = hunks.Take(options.MaxHunks).ToArray();
         var omittedHunkCount = Math.Max(0, hunks.Length - visibleHunks.Length);
         var linesTruncated = visibleHunks.Any(hunk => hunk.DatabaseLinesTruncated || hunk.FileLinesTruncated);
 
@@ -2997,9 +3161,24 @@ public sealed class SqlMetadataService
             segments.Min(segment => Math.Min(segment.DatabaseDisplayLine, segment.FileDisplayLine)),
             segments.Sum(segment => segment.DatabaseChangedLineCount),
             segments.Sum(segment => segment.FileChangedLineCount),
+            options.Mode,
             omittedHunkCount > 0 || linesTruncated,
             omittedHunkCount,
             visibleHunks);
+    }
+
+    internal static ModuleFileDiff BuildLineDiff(
+        string databaseDefinition,
+        string fileText,
+        int? contextLines,
+        string? diffMode,
+        int? maxHunks,
+        int? maxDiffLinesPerSide)
+    {
+        return BuildLineDiff(
+            databaseDefinition,
+            fileText,
+            BuildDiffOutputOptions(contextLines, diffMode, maxHunks, maxDiffLinesPerSide));
     }
 
     private static List<DiffChangeSegment> BuildDiffChangeSegments(string[] databaseLines, string[] fileLines)
@@ -3104,10 +3283,10 @@ public sealed class SqlMetadataService
         string[] databaseLines,
         string[] fileLines,
         DiffChangeSegment segment,
-        int contextLines)
+        DiffOutputOptions options)
     {
-        var databaseRange = BuildHunkRange(databaseLines.Length, segment.DatabaseStartLine, segment.DatabaseEndLine, contextLines);
-        var fileRange = BuildHunkRange(fileLines.Length, segment.FileStartLine, segment.FileEndLine, contextLines);
+        var databaseRange = BuildHunkRange(databaseLines.Length, segment.DatabaseStartLine, segment.DatabaseEndLine, options.ContextLines);
+        var fileRange = BuildHunkRange(fileLines.Length, segment.FileStartLine, segment.FileEndLine, options.ContextLines);
 
         var databaseDiffLines = BuildDiffLines(
             databaseLines,
@@ -3115,6 +3294,8 @@ public sealed class SqlMetadataService
             databaseRange.End,
             segment.DatabaseStartLine,
             segment.DatabaseEndLine,
+            options.IncludeLines,
+            options.MaxDiffLinesPerSide,
             out var databaseLinesTruncated);
         var fileDiffLines = BuildDiffLines(
             fileLines,
@@ -3122,6 +3303,8 @@ public sealed class SqlMetadataService
             fileRange.End,
             segment.FileStartLine,
             segment.FileEndLine,
+            options.IncludeLines,
+            options.MaxDiffLinesPerSide,
             out var fileLinesTruncated);
 
         return new ModuleFileDiffHunk(
@@ -3161,9 +3344,16 @@ public sealed class SqlMetadataService
         int endLine,
         int changedStart,
         int changedEnd,
+        bool includeLines,
+        int maxDiffLinesPerSide,
         out bool truncated)
     {
         truncated = false;
+        if (!includeLines)
+        {
+            return [];
+        }
+
         if (lines.Length == 0 || startLine > endLine)
         {
             return [];
@@ -3172,7 +3362,7 @@ public sealed class SqlMetadataService
         var result = new List<ModuleFileDiffLine>();
         for (var lineNumber = startLine; lineNumber <= endLine; lineNumber++)
         {
-            if (result.Count >= MaxDiffLinesPerSide)
+            if (result.Count >= maxDiffLinesPerSide)
             {
                 truncated = true;
                 break;
@@ -5096,12 +5286,16 @@ public sealed class SqlMetadataService
         bool ExactMatch,
         bool NormalizedMatch,
         bool SqlNormalizedMatch,
+        string DifferenceKind,
+        string[] IgnoredWrapperDifferences,
+        string Summary,
         ModuleFileDiff Diff,
         string[] NextActions);
 
     internal sealed record ModuleSqlFileDiscovery(
         string Root,
         string[] Patterns,
+        string[] ExcludePatterns,
         int ScannedFileCount,
         bool SearchTruncated,
         int CandidateCount,
@@ -5109,6 +5303,7 @@ public sealed class SqlMetadataService
         ModuleSqlFileCandidate[] Candidates,
         ModuleSqlFileCandidate? SelectedCandidate,
         bool Ambiguous,
+        string[] SuggestedPatterns,
         string? Hint);
 
     internal sealed record ModuleSqlFileCandidate(
@@ -5125,9 +5320,17 @@ public sealed class SqlMetadataService
         int? FirstDifferentLine,
         int DatabaseChangedLineCount,
         int FileChangedLineCount,
+        string Mode,
         bool Truncated,
         int OmittedHunkCount,
         ModuleFileDiffHunk[] Hunks);
+
+    private sealed record DiffOutputOptions(
+        string Mode,
+        int ContextLines,
+        int MaxHunks,
+        int MaxDiffLinesPerSide,
+        bool IncludeLines);
 
     internal sealed record ModuleFileDiffHunk(
         int DatabaseStartLine,

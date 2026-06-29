@@ -138,11 +138,22 @@ public sealed class SqlServerToolService
         string name,
         string filePath,
         int? contextLines,
+        string? diffMode,
+        int? maxHunks,
+        int? maxDiffLinesPerSide,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "compare_module_to_file",
-            () => _metadataService.CompareModuleToFileAsync(schema, name, filePath, contextLines, cancellationToken),
+            () => _metadataService.CompareModuleToFileAsync(
+                schema,
+                name,
+                filePath,
+                contextLines,
+                diffMode,
+                maxHunks,
+                maxDiffLinesPerSide,
+                cancellationToken),
             schema,
             name);
     }
@@ -152,13 +163,28 @@ public sealed class SqlServerToolService
         string name,
         string? root,
         string[]? patterns,
+        string[]? excludePatterns,
         int? maxCandidates,
         int? contextLines,
+        string? diffMode,
+        int? maxHunks,
+        int? maxDiffLinesPerSide,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "compare_module_to_repo",
-            () => _metadataService.CompareModuleToRepoAsync(schema, name, root, patterns, maxCandidates, contextLines, cancellationToken),
+            () => _metadataService.CompareModuleToRepoAsync(
+                schema,
+                name,
+                root,
+                patterns,
+                excludePatterns,
+                maxCandidates,
+                contextLines,
+                diffMode,
+                maxHunks,
+                maxDiffLinesPerSide,
+                cancellationToken),
             schema,
             name);
     }

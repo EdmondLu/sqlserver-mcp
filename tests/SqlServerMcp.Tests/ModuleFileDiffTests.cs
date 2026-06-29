@@ -13,6 +13,7 @@ public sealed class ModuleFileDiffTests
 
         Assert.True(diff.Equal);
         Assert.Null(diff.FirstDifferentLine);
+        Assert.Equal("compact", diff.Mode);
         Assert.Empty(diff.Hunks);
     }
 
@@ -42,11 +43,48 @@ public sealed class ModuleFileDiffTests
         Assert.Equal(1, diff.FileChangedLineCount);
         Assert.False(diff.Truncated);
         Assert.Equal(0, diff.OmittedHunkCount);
+        Assert.Equal("compact", diff.Mode);
         var hunk = Assert.Single(diff.Hunks);
         Assert.Contains(hunk.DatabaseLines, line => line.LineNumber == 4 && line.Changed && line.Text.Contains("SELECT B = 2"));
         Assert.Contains(hunk.FileLines, line => line.LineNumber == 4 && line.Changed && line.Text.Contains("SELECT B = 20"));
         Assert.Contains(hunk.DatabaseLines, line => line.LineNumber == 3 && !line.Changed);
         Assert.Contains(hunk.FileLines, line => line.LineNumber == 5 && !line.Changed);
+    }
+
+    [Fact]
+    public void BuildLineDiff_SummaryModeReturnsRangesWithoutLineText()
+    {
+        const string databaseDefinition = """
+                                          CREATE PROC dbo.Sample
+                                          AS
+                                          SELECT A = 1
+                                          SELECT B = 2
+                                          SELECT C = 3
+                                          """;
+        const string fileText = """
+                                CREATE PROC dbo.Sample
+                                AS
+                                SELECT A = 1
+                                SELECT B = 20
+                                SELECT C = 3
+                                """;
+
+        var diff = SqlMetadataService.BuildLineDiff(
+            databaseDefinition,
+            fileText,
+            contextLines: 1,
+            diffMode: "summary",
+            maxHunks: null,
+            maxDiffLinesPerSide: null);
+
+        Assert.False(diff.Equal);
+        Assert.Equal("summary", diff.Mode);
+        Assert.False(diff.Truncated);
+        var hunk = Assert.Single(diff.Hunks);
+        Assert.Equal(3, hunk.DatabaseStartLine);
+        Assert.Equal(5, hunk.DatabaseEndLine);
+        Assert.Empty(hunk.DatabaseLines);
+        Assert.Empty(hunk.FileLines);
     }
 
     [Fact]
@@ -119,7 +157,7 @@ public sealed class ModuleFileDiffTests
             File.WriteAllText(Path.Combine(procedures.FullName, "dbo.SampleProc.sql"), "CREATE PROC dbo.SampleProc AS SELECT 1");
             File.WriteAllText(Path.Combine(procedures.FullName, "SampleProc_old.sql"), "CREATE PROC dbo.SampleProc AS SELECT 2");
 
-            var discovery = SqlMetadataService.FindModuleSqlFileDiscovery(root, "dbo", "SampleProc", null, null);
+            var discovery = SqlMetadataService.FindModuleSqlFileDiscovery(root, "dbo", "SampleProc", null, null, null);
 
             Assert.False(discovery.Ambiguous);
             Assert.NotNull(discovery.SelectedCandidate);
@@ -143,13 +181,44 @@ public sealed class ModuleFileDiffTests
             File.WriteAllText(Path.Combine(root, "a", "SampleProc.sql"), "SELECT 1");
             File.WriteAllText(Path.Combine(root, "b", "SampleProc.sql"), "SELECT 2");
 
-            var discovery = SqlMetadataService.FindModuleSqlFileDiscovery(root, "dbo", "SampleProc", null, null);
+            var discovery = SqlMetadataService.FindModuleSqlFileDiscovery(root, "dbo", "SampleProc", null, null, null);
 
             Assert.True(discovery.Ambiguous);
             Assert.Null(discovery.SelectedCandidate);
             Assert.Equal(2, discovery.CandidateCount);
             Assert.Equal(discovery.Candidates[0].Score, discovery.Candidates[1].Score);
+            Assert.NotEmpty(discovery.SuggestedPatterns);
             Assert.All(discovery.Candidates, candidate => Assert.Contains("exact object file name", candidate.Reasons));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FindModuleSqlFileDiscovery_AppliesExcludePatterns()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "procedures"));
+            Directory.CreateDirectory(Path.Combine(root, "archive"));
+            File.WriteAllText(Path.Combine(root, "procedures", "SampleProc.sql"), "SELECT 1");
+            File.WriteAllText(Path.Combine(root, "archive", "SampleProc.sql"), "SELECT 2");
+
+            var discovery = SqlMetadataService.FindModuleSqlFileDiscovery(
+                root,
+                "dbo",
+                "SampleProc",
+                ["**/*.sql"],
+                ["archive/**"],
+                null);
+
+            var candidate = Assert.Single(discovery.Candidates);
+            Assert.Equal("procedures/SampleProc.sql", candidate.RelativePath);
+            Assert.Equal(["archive/**"], discovery.ExcludePatterns);
+            Assert.Same(candidate, discovery.SelectedCandidate);
         }
         finally
         {
@@ -173,6 +242,7 @@ public sealed class ModuleFileDiffTests
                 "dbo",
                 "SampleProc",
                 ["procedures/*.sql"],
+                null,
                 null);
 
             var candidate = Assert.Single(discovery.Candidates);

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 1.13.0 - 2026-06-29
+
+- Added readable comparison summaries, `differenceKind`, `ignoredWrapperDifferences`, and `diff.mode` to module/file comparison results.
+- Added `diffMode`, `maxHunks`, and `maxDiffLinesPerSide` to `compare_module_to_file` and `compare_module_to_repo` so callers can choose summary, compact, or fuller diff output.
+- Added `excludePatterns` and `suggestedPatterns` to repository module comparison discovery for easier narrowing when old or backup SQL files share the same object name.
+
 ## 1.12.0 - 2026-06-29
 
 - Improved module/file diff output to resynchronize after matching lines, return multiple compact hunks, and cap hunk/line output with truncation metadata.

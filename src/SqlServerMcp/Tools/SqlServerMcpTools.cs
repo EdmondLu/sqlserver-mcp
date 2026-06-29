@@ -141,9 +141,20 @@ public static class SqlServerMcpTools
         [Description("Module name.")] string name,
         [Description("Absolute local file path to compare with the database module definition.")] string filePath,
         [Description("Context lines around the changed block. Defaults to 5 and is capped.")] int? contextLines = null,
+        [Description("Diff output mode: summary, compact, or full. Defaults to compact.")] string? diffMode = null,
+        [Description("Maximum diff hunks to include. Defaults depend on diffMode and are capped.")] int? maxHunks = null,
+        [Description("Maximum returned diff lines per side per hunk. Defaults depend on diffMode and are capped.")] int? maxDiffLinesPerSide = null,
         CancellationToken cancellationToken = default)
     {
-        return service.CompareModuleToFileAsync(schema, name, filePath, contextLines, cancellationToken);
+        return service.CompareModuleToFileAsync(
+            schema,
+            name,
+            filePath,
+            contextLines,
+            diffMode,
+            maxHunks,
+            maxDiffLinesPerSide,
+            cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Auto-discover matching .sql files under a local repository/folder, then compare the best unambiguous candidate with a SQL Server module definition. Use when checking whether a repo SQL script has already been deployed to the target database.")]
@@ -153,11 +164,26 @@ public static class SqlServerMcpTools
         [Description("Module name.")] string name,
         [Description("Optional repository/folder root. Defaults to the MCP process current directory.")] string? root = null,
         [Description("Optional path glob patterns such as **/*.sql, procedures/*.sql, or *proc*.sql. Defaults to **/*.sql.")] string[]? patterns = null,
+        [Description("Optional path glob patterns to exclude from candidate discovery, such as backup/** or domain2/**.")] string[]? excludePatterns = null,
         [Description("Maximum ranked candidates to return when discovery is empty or ambiguous. Defaults to 10 and is capped.")] int? maxCandidates = null,
         [Description("Context lines around the changed block after a file is selected. Defaults to 5 and is capped.")] int? contextLines = null,
+        [Description("Diff output mode: summary, compact, or full. Defaults to compact.")] string? diffMode = null,
+        [Description("Maximum diff hunks to include. Defaults depend on diffMode and are capped.")] int? maxHunks = null,
+        [Description("Maximum returned diff lines per side per hunk. Defaults depend on diffMode and are capped.")] int? maxDiffLinesPerSide = null,
         CancellationToken cancellationToken = default)
     {
-        return service.CompareModuleToRepoAsync(schema, name, root, patterns, maxCandidates, contextLines, cancellationToken);
+        return service.CompareModuleToRepoAsync(
+            schema,
+            name,
+            root,
+            patterns,
+            excludePatterns,
+            maxCandidates,
+            contextLines,
+            diffMode,
+            maxHunks,
+            maxDiffLinesPerSide,
+            cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Analyze local temp table usage inside a stored procedure, function, trigger, or view definition, including CREATE TABLE, SELECT INTO, writes, reads, joins, and line numbers.")]

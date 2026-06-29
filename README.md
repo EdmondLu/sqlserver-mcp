@@ -10,7 +10,7 @@ A Windows-first, read-only [Model Context Protocol](https://modelcontextprotocol
 
 ## Highlights
 
-- 20 focused tools for connection checks, object discovery, schema inspection, dependency analysis, SQL module search, read-only queries, and estimated query plans.
+- 21 focused tools for connection checks, object discovery, schema inspection, dependency analysis, SQL module search, read-only queries, and estimated query plans.
 - Lazy database connections: startup registers tools but does not connect to SQL Server or scan the database.
 - Credentials are read from Windows Credential Manager and are never stored in the JSON config.
 - A ScriptDom-based guard accepts one `SELECT` or `WITH` query and rejects writes, DDL, execution, cross-database references, server-level DMVs, linked-server access, and bulk/external rowsets, while allowing selected read-only metadata functions.
@@ -120,7 +120,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 
 Search, definition-slice, configuration-text, usage, and read-only query tools expose `resultInfo` for consistent returned-count, limit, truncation, reason, and hint metadata.
 
-Module/file comparison returns compact multi-hunk diffs with truncation metadata. It also reports `sqlNormalizedMatch` and SQL-normalized hashes to ignore common deployment-script wrapper differences such as `CREATE OR ALTER`, leading `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`, and trailing `GO`.
+Module/file comparison returns a readable top-level summary, `differenceKind`, ignored wrapper-difference labels, and multi-hunk diffs with truncation metadata. Use `diffMode=summary` for ranges only, `compact` for the default focused diff, or `full` with larger `maxHunks` / `maxDiffLinesPerSide` caps. Repository comparison also accepts `excludePatterns` such as `backup/**` and returns `suggestedPatterns` for ambiguous candidates. It reports `sqlNormalizedMatch` and SQL-normalized hashes to ignore common deployment-script wrapper differences such as `CREATE OR ALTER`, leading `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`, and trailing `GO`.
 
 `describe_query_result` accepts optional `templateValues` for UI SQL placeholders, for example `{ "0": "1=1" }` replaces `{0}` before describing columns. Replacements are raw SQL fragments, and the final SQL is still parsed by the read-only guard.
 

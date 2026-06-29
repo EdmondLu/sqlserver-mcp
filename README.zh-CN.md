@@ -6,7 +6,7 @@
 
 ## 特性
 
-- 提供 20 个固定工具，覆盖连接检查、对象搜索、结构查看、依赖分析、SQL 模块搜索、只读查询和预估执行计划。
+- 提供 21 个固定工具，覆盖连接检查、对象搜索、结构查看、依赖分析、SQL 模块搜索、只读查询和预估执行计划。
 - 启动时只注册工具，不连接数据库，也不扫描全库；首次数据库调用时才建立连接。
 - SQL 用户名和密码从 Windows Credential Manager 读取，不写入 JSON 配置。
 - 基于 ScriptDom 的只读 Guard 只接受单条 `SELECT` 或 `WITH` 查询，并拒绝写操作、DDL、执行语句、跨库引用、服务器级 DMV、链接服务器和外部数据源，同时允许经过白名单确认的只读元数据函数。
@@ -83,7 +83,7 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 
 `compare_module_to_file` 适合已知道本地 SQL 文件路径时确认“仓库 SQL 是否已执行到数据库”；`compare_module_to_repo` 可按对象名在本地仓库/目录下自动发现 `.sql` 候选文件，唯一高分候选会直接比较，并列候选会返回列表让调用方收窄路径。
 
-模块/文件对比会返回多 hunk 紧凑 diff，并带截断信息，避免头尾少量差异造成整文件输出；同时返回 `sqlNormalizedMatch` 和 SQL 归一化 hash，用于忽略常见部署脚本包装差异，例如 `CREATE OR ALTER`、开头 `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`、结尾 `GO`。
+模块/文件对比会返回顶层可读摘要、`differenceKind`、被忽略的脚本包装差异标签，以及带截断信息的多 hunk diff。`diffMode=summary` 只返回差异范围，`compact` 是默认紧凑输出，`full` 可配合更大的 `maxHunks` / `maxDiffLinesPerSide` 查看更多行；仓库对比还支持 `excludePatterns` 排除 `backup/**` 等历史目录，并在候选并列时返回 `suggestedPatterns` 便于收窄。工具同时返回 `sqlNormalizedMatch` 和 SQL 归一化 hash，用于忽略常见部署脚本包装差异，例如 `CREATE OR ALTER`、开头 `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`、结尾 `GO`。
 
 搜索、模块定义切片、配置文本搜索、用法搜索和只读查询工具都会返回 `resultInfo`，用于统一判断结果是否被限制、为什么被截断以及下一步该如何缩小范围。
 
