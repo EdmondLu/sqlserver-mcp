@@ -83,6 +83,8 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 
 `compare_module_to_file` 适合已知道本地 SQL 文件路径时确认“仓库 SQL 是否已执行到数据库”；`compare_module_to_repo` 可按对象名在本地仓库/目录下自动发现 `.sql` 候选文件，唯一高分候选会直接比较，并列候选会返回列表让调用方收窄路径。
 
+模块/文件对比会返回多 hunk 紧凑 diff，并带截断信息，避免头尾少量差异造成整文件输出；同时返回 `sqlNormalizedMatch` 和 SQL 归一化 hash，用于忽略常见部署脚本包装差异，例如 `CREATE OR ALTER`、开头 `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`、结尾 `GO`。
+
 搜索、模块定义切片、配置文本搜索、用法搜索和只读查询工具都会返回 `resultInfo`，用于统一判断结果是否被限制、为什么被截断以及下一步该如何缩小范围。
 
 `describe_query_result` 可显式传入 `templateValues` 描述 UI SQL 模板，例如 `{ "0": "1=1" }` 会先把 `{0}` 替换为 `1=1`，再推断结果列。替换值按 SQL 片段处理，最终 SQL 仍会经过只读 Guard。

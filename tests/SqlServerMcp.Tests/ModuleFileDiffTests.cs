@@ -40,11 +40,73 @@ public sealed class ModuleFileDiffTests
         Assert.Equal(4, diff.FirstDifferentLine);
         Assert.Equal(1, diff.DatabaseChangedLineCount);
         Assert.Equal(1, diff.FileChangedLineCount);
+        Assert.False(diff.Truncated);
+        Assert.Equal(0, diff.OmittedHunkCount);
         var hunk = Assert.Single(diff.Hunks);
         Assert.Contains(hunk.DatabaseLines, line => line.LineNumber == 4 && line.Changed && line.Text.Contains("SELECT B = 2"));
         Assert.Contains(hunk.FileLines, line => line.LineNumber == 4 && line.Changed && line.Text.Contains("SELECT B = 20"));
         Assert.Contains(hunk.DatabaseLines, line => line.LineNumber == 3 && !line.Changed);
         Assert.Contains(hunk.FileLines, line => line.LineNumber == 5 && !line.Changed);
+    }
+
+    [Fact]
+    public void BuildLineDiff_SplitsHeaderAndTrailingGoNoiseIntoSmallHunks()
+    {
+        const string databaseDefinition = """
+                                          CREATE   PROCEDURE dbo.Sample
+                                          AS
+                                          BEGIN
+                                              SELECT A = 1
+                                              SELECT B = 2
+                                          END
+                                          """;
+        const string fileText = """
+                                SET ANSI_NULLS ON
+                                GO
+                                SET QUOTED_IDENTIFIER ON
+                                GO
+                                CREATE OR ALTER PROCEDURE dbo.Sample
+                                AS
+                                BEGIN
+                                    SELECT A = 1
+                                    SELECT B = 2
+                                END
+                                GO
+                                """;
+
+        var diff = SqlMetadataService.BuildLineDiff(databaseDefinition, fileText, 1);
+
+        Assert.False(diff.Equal);
+        Assert.False(diff.Truncated);
+        Assert.True(diff.Hunks.Length <= 3);
+        Assert.True(diff.Hunks.Sum(hunk => hunk.DatabaseLines.Length + hunk.FileLines.Length) < 20);
+        Assert.Contains(diff.Hunks, hunk => hunk.FileLines.Any(line => line.Text.Contains("CREATE OR ALTER PROCEDURE", StringComparison.Ordinal)));
+        Assert.Contains(diff.Hunks, hunk => hunk.FileLines.Any(line => line.Text == "GO" && line.Changed));
+    }
+
+    [Fact]
+    public void NormalizeSqlModuleTextForComparison_IgnoresCommonScriptWrapperNoise()
+    {
+        const string databaseDefinition = """
+                                          CREATE   PROCEDURE dbo.Sample
+                                          AS
+                                          SELECT 1
+                                          """;
+        const string fileText = """
+                                SET ANSI_NULLS ON
+                                GO
+                                SET QUOTED_IDENTIFIER ON
+                                GO
+                                CREATE OR ALTER PROCEDURE dbo.Sample
+                                AS
+                                SELECT 1
+                                GO
+                                """;
+
+        var databaseNormalized = SqlMetadataService.NormalizeSqlModuleTextForComparison(databaseDefinition);
+        var fileNormalized = SqlMetadataService.NormalizeSqlModuleTextForComparison(fileText);
+
+        Assert.Equal(databaseNormalized, fileNormalized);
     }
 
     [Fact]

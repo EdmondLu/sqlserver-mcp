@@ -19,7 +19,17 @@ public sealed class SqlMetadataService
     private const int DefaultRepoCompareCandidateLimit = 10;
     private const int MaxRepoCompareCandidateLimit = 50;
     private const int MaxRepoCompareFilesScanned = 20_000;
+    private const int MaxDiffSyncLookahead = 200;
+    private const int MaxDiffHunks = 8;
+    private const int MaxDiffLinesPerSide = 120;
     private static readonly Regex TempTableNameRegex = new(@"(?<![#\w])#[A-Za-z_][A-Za-z0-9_]*", RegexOptions.Compiled);
+    private static readonly Regex SqlBatchSeparatorRegex = new(@"^\s*GO(?:\s+\d+)?\s*;?\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex SqlModuleCreateRegex = new(
+        @"^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+(PROC(?:EDURE)?|FUNCTION|VIEW|TRIGGER)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex SqlSessionSetRegex = new(
+        @"^\s*SET\s+(?:ANSI_NULLS|QUOTED_IDENTIFIER)\s+(?:ON|OFF)\s*;?\s*$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly string[] DefaultRepoComparePatterns = ["**/*.sql"];
     private static readonly string[] ModuleSearchNextActions =
     [
@@ -766,7 +776,9 @@ public sealed class SqlMetadataService
                 name = module.Name,
                 type = module.Type,
                 typeDesc = module.TypeDesc,
+                status = discovery.Ambiguous ? "ambiguous" : "no_candidate",
                 compared = false,
+                candidateCount = discovery.CandidateCount,
                 discovery,
                 nextActions = new[]
                 {
@@ -785,7 +797,9 @@ public sealed class SqlMetadataService
             name = module.Name,
             type = module.Type,
             typeDesc = module.TypeDesc,
+            status = "compared",
             compared = true,
+            candidateCount = discovery.CandidateCount,
             discovery,
             selectedFile = discovery.SelectedCandidate,
             comparison,
@@ -2426,6 +2440,8 @@ public sealed class SqlMetadataService
         var effectiveContextLines = Math.Clamp(contextLines ?? 5, 0, MaxModuleContextLines);
         var dbNormalized = NormalizeTextForComparison(module.Definition);
         var fileNormalized = NormalizeTextForComparison(fileText);
+        var dbSqlNormalized = NormalizeSqlModuleTextForComparison(module.Definition);
+        var fileSqlNormalized = NormalizeSqlModuleTextForComparison(fileText);
         var diff = BuildLineDiff(module.Definition, fileText, effectiveContextLines);
 
         return new ModuleFileComparisonResult(
@@ -2439,7 +2455,8 @@ public sealed class SqlMetadataService
                 module.Definition.Length,
                 SplitDefinitionLines(module.Definition).Length,
                 ComputeSha256Hex(module.Definition),
-                ComputeSha256Hex(dbNormalized)),
+                ComputeSha256Hex(dbNormalized),
+                ComputeSha256Hex(dbSqlNormalized)),
             new ModuleCompareFileInfo(
                 file.FullName,
                 file.Length,
@@ -2447,9 +2464,11 @@ public sealed class SqlMetadataService
                 fileText.Length,
                 SplitDefinitionLines(fileText).Length,
                 ComputeSha256Hex(fileText),
-                ComputeSha256Hex(fileNormalized)),
+                ComputeSha256Hex(fileNormalized),
+                ComputeSha256Hex(fileSqlNormalized)),
             string.Equals(module.Definition, fileText, StringComparison.Ordinal),
             string.Equals(dbNormalized, fileNormalized, StringComparison.Ordinal),
+            string.Equals(dbSqlNormalized, fileSqlNormalized, StringComparison.Ordinal),
             diff,
             ModuleCompareNextActions);
     }
@@ -2959,53 +2978,181 @@ public sealed class SqlMetadataService
     {
         var databaseLines = SplitDefinitionLines(databaseDefinition);
         var fileLines = SplitDefinitionLines(fileText);
-        var prefix = 0;
-        while (prefix < databaseLines.Length
-               && prefix < fileLines.Length
-               && string.Equals(databaseLines[prefix], fileLines[prefix], StringComparison.Ordinal))
+        var effectiveContextLines = Math.Clamp(contextLines, 0, MaxModuleContextLines);
+        var segments = BuildDiffChangeSegments(databaseLines, fileLines);
+        if (segments.Count == 0)
         {
-            prefix++;
+            return new ModuleFileDiff(true, null, 0, 0, false, 0, []);
         }
 
-        if (prefix == databaseLines.Length && prefix == fileLines.Length)
-        {
-            return new ModuleFileDiff(true, null, 0, 0, []);
-        }
-
-        var suffix = 0;
-        while (suffix + prefix < databaseLines.Length
-               && suffix + prefix < fileLines.Length
-               && string.Equals(
-                   databaseLines[databaseLines.Length - 1 - suffix],
-                   fileLines[fileLines.Length - 1 - suffix],
-                   StringComparison.Ordinal))
-        {
-            suffix++;
-        }
-
-        var databaseChangedStart = prefix + 1;
-        var fileChangedStart = prefix + 1;
-        var databaseChangedEnd = databaseLines.Length - suffix;
-        var fileChangedEnd = fileLines.Length - suffix;
-        var hunkDatabaseStart = Math.Max(1, databaseChangedStart - contextLines);
-        var hunkFileStart = Math.Max(1, fileChangedStart - contextLines);
-        var hunkDatabaseEnd = Math.Min(databaseLines.Length, Math.Max(databaseChangedStart, databaseChangedEnd) + contextLines);
-        var hunkFileEnd = Math.Min(fileLines.Length, Math.Max(fileChangedStart, fileChangedEnd) + contextLines);
-
-        var hunk = new ModuleFileDiffHunk(
-            hunkDatabaseStart,
-            hunkDatabaseEnd,
-            hunkFileStart,
-            hunkFileEnd,
-            BuildDiffLines(databaseLines, hunkDatabaseStart, hunkDatabaseEnd, databaseChangedStart, databaseChangedEnd),
-            BuildDiffLines(fileLines, hunkFileStart, hunkFileEnd, fileChangedStart, fileChangedEnd));
+        var hunks = segments
+            .Select(segment => BuildDiffHunk(databaseLines, fileLines, segment, effectiveContextLines))
+            .ToArray();
+        var visibleHunks = hunks.Take(MaxDiffHunks).ToArray();
+        var omittedHunkCount = Math.Max(0, hunks.Length - visibleHunks.Length);
+        var linesTruncated = visibleHunks.Any(hunk => hunk.DatabaseLinesTruncated || hunk.FileLinesTruncated);
 
         return new ModuleFileDiff(
             false,
-            prefix + 1,
-            Math.Max(0, databaseChangedEnd - databaseChangedStart + 1),
-            Math.Max(0, fileChangedEnd - fileChangedStart + 1),
-            [hunk]);
+            segments.Min(segment => Math.Min(segment.DatabaseDisplayLine, segment.FileDisplayLine)),
+            segments.Sum(segment => segment.DatabaseChangedLineCount),
+            segments.Sum(segment => segment.FileChangedLineCount),
+            omittedHunkCount > 0 || linesTruncated,
+            omittedHunkCount,
+            visibleHunks);
+    }
+
+    private static List<DiffChangeSegment> BuildDiffChangeSegments(string[] databaseLines, string[] fileLines)
+    {
+        var segments = new List<DiffChangeSegment>();
+        var databaseIndex = 0;
+        var fileIndex = 0;
+
+        while (databaseIndex < databaseLines.Length || fileIndex < fileLines.Length)
+        {
+            if (databaseIndex < databaseLines.Length
+                && fileIndex < fileLines.Length
+                && string.Equals(databaseLines[databaseIndex], fileLines[fileIndex], StringComparison.Ordinal))
+            {
+                databaseIndex++;
+                fileIndex++;
+                continue;
+            }
+
+            var databaseStart = databaseIndex;
+            var fileStart = fileIndex;
+            var sync = FindNextDiffSync(databaseLines, fileLines, databaseIndex, fileIndex);
+            if (sync is null)
+            {
+                segments.Add(new DiffChangeSegment(databaseStart, databaseLines.Length - 1, fileStart, fileLines.Length - 1));
+                break;
+            }
+
+            segments.Add(new DiffChangeSegment(databaseStart, sync.Value.DatabaseIndex - 1, fileStart, sync.Value.FileIndex - 1));
+            databaseIndex = sync.Value.DatabaseIndex;
+            fileIndex = sync.Value.FileIndex;
+        }
+
+        return segments
+            .Where(segment => segment.DatabaseChangedLineCount > 0 || segment.FileChangedLineCount > 0)
+            .ToList();
+    }
+
+    private static (int DatabaseIndex, int FileIndex)? FindNextDiffSync(
+        string[] databaseLines,
+        string[] fileLines,
+        int databaseIndex,
+        int fileIndex)
+    {
+        var maxDatabaseIndex = Math.Min(databaseLines.Length - 1, databaseIndex + MaxDiffSyncLookahead);
+        var maxFileIndex = Math.Min(fileLines.Length - 1, fileIndex + MaxDiffSyncLookahead);
+        for (var offset = 1; offset <= MaxDiffSyncLookahead; offset++)
+        {
+            var candidateDatabaseIndex = databaseIndex + offset;
+            if (candidateDatabaseIndex <= maxDatabaseIndex
+                && fileIndex < fileLines.Length
+                && IsDiffSyncLine(databaseLines[candidateDatabaseIndex])
+                && string.Equals(databaseLines[candidateDatabaseIndex], fileLines[fileIndex], StringComparison.Ordinal))
+            {
+                return (candidateDatabaseIndex, fileIndex);
+            }
+
+            var candidateFileIndex = fileIndex + offset;
+            if (candidateFileIndex <= maxFileIndex
+                && databaseIndex < databaseLines.Length
+                && IsDiffSyncLine(fileLines[candidateFileIndex])
+                && string.Equals(databaseLines[databaseIndex], fileLines[candidateFileIndex], StringComparison.Ordinal))
+            {
+                return (databaseIndex, candidateFileIndex);
+            }
+        }
+
+        (int DatabaseIndex, int FileIndex)? best = null;
+        var bestDistance = int.MaxValue;
+        for (var i = databaseIndex + 1; i <= maxDatabaseIndex; i++)
+        {
+            if (!IsDiffSyncLine(databaseLines[i]))
+            {
+                continue;
+            }
+
+            for (var j = fileIndex + 1; j <= maxFileIndex; j++)
+            {
+                if (!string.Equals(databaseLines[i], fileLines[j], StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var distance = (i - databaseIndex) + (j - fileIndex);
+                if (distance < bestDistance)
+                {
+                    best = (i, j);
+                    bestDistance = distance;
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private static bool IsDiffSyncLine(string line)
+    {
+        return line.Trim().Length > 2;
+    }
+
+    private static ModuleFileDiffHunk BuildDiffHunk(
+        string[] databaseLines,
+        string[] fileLines,
+        DiffChangeSegment segment,
+        int contextLines)
+    {
+        var databaseRange = BuildHunkRange(databaseLines.Length, segment.DatabaseStartLine, segment.DatabaseEndLine, contextLines);
+        var fileRange = BuildHunkRange(fileLines.Length, segment.FileStartLine, segment.FileEndLine, contextLines);
+
+        var databaseDiffLines = BuildDiffLines(
+            databaseLines,
+            databaseRange.Start,
+            databaseRange.End,
+            segment.DatabaseStartLine,
+            segment.DatabaseEndLine,
+            out var databaseLinesTruncated);
+        var fileDiffLines = BuildDiffLines(
+            fileLines,
+            fileRange.Start,
+            fileRange.End,
+            segment.FileStartLine,
+            segment.FileEndLine,
+            out var fileLinesTruncated);
+
+        return new ModuleFileDiffHunk(
+            databaseRange.Start,
+            databaseRange.End,
+            fileRange.Start,
+            fileRange.End,
+            databaseLinesTruncated,
+            fileLinesTruncated,
+            databaseDiffLines,
+            fileDiffLines);
+    }
+
+    private static (int Start, int End) BuildHunkRange(int lineCount, int changedStart, int changedEnd, int contextLines)
+    {
+        if (lineCount == 0)
+        {
+            return (1, 0);
+        }
+
+        if (changedStart <= changedEnd)
+        {
+            return (
+                Math.Max(1, changedStart - contextLines),
+                Math.Min(lineCount, changedEnd + contextLines));
+        }
+
+        var anchor = Math.Clamp(changedStart, 1, lineCount);
+        return (
+            Math.Max(1, anchor - contextLines),
+            Math.Min(lineCount, anchor + contextLines));
     }
 
     private static ModuleFileDiffLine[] BuildDiffLines(
@@ -3013,8 +3160,10 @@ public sealed class SqlMetadataService
         int startLine,
         int endLine,
         int changedStart,
-        int changedEnd)
+        int changedEnd,
+        out bool truncated)
     {
+        truncated = false;
         if (lines.Length == 0 || startLine > endLine)
         {
             return [];
@@ -3023,6 +3172,12 @@ public sealed class SqlMetadataService
         var result = new List<ModuleFileDiffLine>();
         for (var lineNumber = startLine; lineNumber <= endLine; lineNumber++)
         {
+            if (result.Count >= MaxDiffLinesPerSide)
+            {
+                truncated = true;
+                break;
+            }
+
             result.Add(new ModuleFileDiffLine(
                 lineNumber,
                 lines[lineNumber - 1],
@@ -3039,6 +3194,55 @@ public sealed class SqlMetadataService
                 SplitDefinitionLines(text.Trim('\uFEFF'))
                     .Select(line => line.TrimEnd()))
             .Trim();
+    }
+
+    internal static string NormalizeSqlModuleTextForComparison(string text)
+    {
+        var lines = SplitDefinitionLines(text.Trim('\uFEFF'))
+            .Select(line => line.TrimEnd())
+            .ToList();
+
+        while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[0]))
+        {
+            lines.RemoveAt(0);
+        }
+
+        while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[^1]))
+        {
+            lines.RemoveAt(lines.Count - 1);
+        }
+
+        while (lines.Count > 0
+               && (SqlBatchSeparatorRegex.IsMatch(lines[0])
+                   || SqlSessionSetRegex.IsMatch(lines[0])
+                   || string.IsNullOrWhiteSpace(lines[0])))
+        {
+            lines.RemoveAt(0);
+        }
+
+        while (lines.Count > 0
+               && (SqlBatchSeparatorRegex.IsMatch(lines[^1])
+                   || string.IsNullOrWhiteSpace(lines[^1])))
+        {
+            lines.RemoveAt(lines.Count - 1);
+        }
+
+        for (var i = 0; i < lines.Count; i++)
+        {
+            if (string.IsNullOrWhiteSpace(lines[i]))
+            {
+                continue;
+            }
+
+            lines[i] = SqlModuleCreateRegex.Replace(lines[i], match =>
+            {
+                var objectType = Regex.Replace(match.Groups[1].Value.ToUpperInvariant(), @"\s+", " ");
+                return $"CREATE {objectType}";
+            });
+            break;
+        }
+
+        return string.Join("\n", lines).Trim();
     }
 
     internal static TempTableAnalysis AnalyzeTempTables(string definition)
@@ -4869,7 +5073,8 @@ public sealed class SqlMetadataService
         int DefinitionLength,
         int LineCount,
         string Sha256,
-        string NormalizedSha256);
+        string NormalizedSha256,
+        string SqlNormalizedSha256);
 
     private sealed record ModuleCompareFileInfo(
         string Path,
@@ -4878,7 +5083,8 @@ public sealed class SqlMetadataService
         int TextLength,
         int LineCount,
         string Sha256,
-        string NormalizedSha256);
+        string NormalizedSha256,
+        string SqlNormalizedSha256);
 
     private sealed record ModuleFileComparisonResult(
         string Schema,
@@ -4889,6 +5095,7 @@ public sealed class SqlMetadataService
         ModuleCompareFileInfo File,
         bool ExactMatch,
         bool NormalizedMatch,
+        bool SqlNormalizedMatch,
         ModuleFileDiff Diff,
         string[] NextActions);
 
@@ -4918,6 +5125,8 @@ public sealed class SqlMetadataService
         int? FirstDifferentLine,
         int DatabaseChangedLineCount,
         int FileChangedLineCount,
+        bool Truncated,
+        int OmittedHunkCount,
         ModuleFileDiffHunk[] Hunks);
 
     internal sealed record ModuleFileDiffHunk(
@@ -4925,10 +5134,28 @@ public sealed class SqlMetadataService
         int DatabaseEndLine,
         int FileStartLine,
         int FileEndLine,
+        bool DatabaseLinesTruncated,
+        bool FileLinesTruncated,
         ModuleFileDiffLine[] DatabaseLines,
         ModuleFileDiffLine[] FileLines);
 
     internal sealed record ModuleFileDiffLine(int LineNumber, string Text, bool Changed);
+
+    private sealed record DiffChangeSegment(
+        int DatabaseStartIndex,
+        int DatabaseEndIndex,
+        int FileStartIndex,
+        int FileEndIndex)
+    {
+        public int DatabaseStartLine => DatabaseStartIndex + 1;
+        public int DatabaseEndLine => DatabaseEndIndex + 1;
+        public int FileStartLine => FileStartIndex + 1;
+        public int FileEndLine => FileEndIndex + 1;
+        public int DatabaseChangedLineCount => Math.Max(0, DatabaseEndIndex - DatabaseStartIndex + 1);
+        public int FileChangedLineCount => Math.Max(0, FileEndIndex - FileStartIndex + 1);
+        public int DatabaseDisplayLine => DatabaseChangedLineCount > 0 ? DatabaseStartLine : Math.Max(1, DatabaseStartLine - 1);
+        public int FileDisplayLine => FileChangedLineCount > 0 ? FileStartLine : Math.Max(1, FileStartLine - 1);
+    }
 
     internal sealed record TempTableAnalysis(TempTableInfo[] TempTables);
 

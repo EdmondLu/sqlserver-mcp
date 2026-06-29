@@ -120,6 +120,8 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 
 Search, definition-slice, configuration-text, usage, and read-only query tools expose `resultInfo` for consistent returned-count, limit, truncation, reason, and hint metadata.
 
+Module/file comparison returns compact multi-hunk diffs with truncation metadata. It also reports `sqlNormalizedMatch` and SQL-normalized hashes to ignore common deployment-script wrapper differences such as `CREATE OR ALTER`, leading `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`, and trailing `GO`.
+
 `describe_query_result` accepts optional `templateValues` for UI SQL placeholders, for example `{ "0": "1=1" }` replaces `{0}` before describing columns. Replacements are raw SQL fragments, and the final SQL is still parsed by the read-only guard.
 
 Structure tools recognize the legacy view prefixes `vwp_`, `vwpr_`, `vwt_`, and `vwtr_`, and try the corresponding unprefixed physical table first.

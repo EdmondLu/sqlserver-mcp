@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 1.12.0 - 2026-06-29
+
+- Improved module/file diff output to resynchronize after matching lines, return multiple compact hunks, and cap hunk/line output with truncation metadata.
+- Added SQL module script normalization hashes and `sqlNormalizedMatch` for common deployment-script noise such as `CREATE OR ALTER`, leading `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`, and trailing `GO`.
+- Added top-level `status` and `candidateCount` to `compare_module_to_repo` responses for faster reading.
+
 ## 1.11.0 - 2026-06-29
 
 - Added `compare_module_to_repo` to auto-discover matching local repository `.sql` files and compare the best unambiguous candidate with a database module definition.
