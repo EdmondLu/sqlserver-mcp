@@ -3440,6 +3440,8 @@ public sealed class SqlMetadataService
         var operators = new List<ShowplanOperatorSummary>();
         var missingIndexes = new List<ShowplanMissingIndex>();
         var warnings = new List<ShowplanWarningSummary>();
+        var statements = new List<ShowplanStatementSummary>();
+        var memoryGrants = new List<ShowplanMemoryGrantNode>();
         var parseErrors = new List<string>();
         var implicitConversionCount = 0;
 
@@ -3462,13 +3464,15 @@ public sealed class SqlMetadataService
                 continue;
             }
 
-            var statements = DescendantsByLocalName(document.Root, "StmtSimple").ToArray();
-            statementCount += statements.Length == 0 ? 1 : statements.Length;
-            foreach (var statement in statements)
+            var statementNodes = DescendantsByLocalName(document.Root, "StmtSimple").ToArray();
+            statementCount += statementNodes.Length == 0 ? 1 : statementNodes.Length;
+            foreach (var statement in statementNodes)
             {
                 estimatedTotalSubtreeCost += ReadDecimalAttribute(statement, "StatementSubTreeCost") ?? 0m;
             }
 
+            statements.AddRange(ReadShowplanStatements(document.Root, statements.Count + 1));
+            memoryGrants.AddRange(DescendantsByLocalName(document.Root, "MemoryGrantInfo").Select(ReadShowplanMemoryGrant));
             var rootOperators = DescendantsByLocalName(document.Root, "RelOp")
                 .Select(ReadShowplanOperator)
                 .ToArray();
@@ -3496,12 +3500,21 @@ public sealed class SqlMetadataService
             missingIndexes.Count,
             implicitConversionCount,
             warnings.Count);
+        var warningCounts = BuildShowplanWarningCounts(warnings);
+        var memoryGrantSummary = BuildShowplanMemoryGrantSummary(memoryGrants);
 
         return new ShowplanSummary(
             statementCount,
             estimatedTotalSubtreeCost,
             counts,
-            BuildShowplanRisks(counts),
+            BuildShowplanRisks(counts, warningCounts, memoryGrantSummary, statements),
+            statements
+                .OrderByDescending(statement => statement.EstimatedSubtreeCost ?? 0m)
+                .ThenBy(statement => statement.Ordinal)
+                .Take(10)
+                .ToArray(),
+            memoryGrantSummary,
+            warningCounts,
             operators
                 .Where(operatorSummary => operatorSummary.EstimatedSubtreeCost is not null)
                 .OrderByDescending(operatorSummary => operatorSummary.EstimatedSubtreeCost)
@@ -3516,7 +3529,11 @@ public sealed class SqlMetadataService
             parseErrors.ToArray());
     }
 
-    private static ShowplanRisk[] BuildShowplanRisks(ShowplanOperatorCounts counts)
+    private static ShowplanRisk[] BuildShowplanRisks(
+        ShowplanOperatorCounts counts,
+        ShowplanWarningCounts warningCounts,
+        ShowplanMemoryGrantSummary memoryGrant,
+        IReadOnlyList<ShowplanStatementSummary> statements)
     {
         var risks = new List<ShowplanRisk>();
 
@@ -3574,6 +3591,45 @@ public sealed class SqlMetadataService
                 "Inspect warnings for spills, no-join-predicate, cardinality, or conversion issues."));
         }
 
+        if (warningCounts.SpillToTempDbCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "spill_to_tempdb",
+                "high",
+                $"Plan reports {warningCounts.SpillToTempDbCount} spill-to-tempdb warning(s).",
+                "Check memory grant, row estimates, sort/hash operators, and whether supporting indexes can reduce spill risk."));
+        }
+
+        if (warningCounts.NoJoinPredicateCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "no_join_predicate",
+                "high",
+                $"Plan reports {warningCounts.NoJoinPredicateCount} no-join-predicate warning(s).",
+                "Verify join conditions; accidental cross joins can explode row counts."));
+        }
+
+        var earlyAbortCount = statements.Count(statement => !string.IsNullOrWhiteSpace(statement.OptimizationEarlyAbortReason));
+        if (earlyAbortCount > 0)
+        {
+            risks.Add(new ShowplanRisk(
+                "optimizer_early_abort",
+                "medium",
+                $"Plan reports {earlyAbortCount} statement(s) with optimizer early-abort reason.",
+                "Inspect optimizationEarlyAbortReason; timeout or memory-limit reasons can mean the chosen plan is not fully optimized."));
+        }
+
+        if ((memoryGrant.MaxSerialDesiredMemoryKb ?? 0) >= 102_400
+            || (memoryGrant.MaxDesiredMemoryKb ?? 0) >= 102_400
+            || (memoryGrant.MaxRequestedMemoryKb ?? 0) >= 102_400)
+        {
+            risks.Add(new ShowplanRisk(
+                "large_memory_grant",
+                "medium",
+                "Plan has a large estimated memory grant.",
+                "Review sort/hash operators, estimated rows, and available indexes; large grants can reduce concurrency."));
+        }
+
         if (counts.ParallelismCount > 0)
         {
             risks.Add(new ShowplanRisk(
@@ -3584,6 +3640,89 @@ public sealed class SqlMetadataService
         }
 
         return risks.ToArray();
+    }
+
+    private static IEnumerable<ShowplanStatementSummary> ReadShowplanStatements(XElement root, int startingOrdinal)
+    {
+        var ordinal = startingOrdinal;
+        foreach (var statement in DescendantsByLocalName(root, "StmtSimple"))
+        {
+            yield return new ShowplanStatementSummary(
+                ordinal++,
+                TruncateShowplanText(ReadAttribute(statement, "StatementText"), 500),
+                ReadAttribute(statement, "StatementType"),
+                ReadDecimalAttribute(statement, "StatementSubTreeCost"),
+                ReadDecimalAttribute(statement, "StatementEstRows"),
+                ReadAttribute(statement, "StatementOptmLevel"),
+                ReadAttribute(statement, "StatementOptmEarlyAbortReason"),
+                ReadAttribute(statement, "NonParallelPlanReason"),
+                ReadAttribute(statement, "CardinalityEstimationModelVersion"));
+        }
+    }
+
+    private static ShowplanMemoryGrantNode ReadShowplanMemoryGrant(XElement element)
+    {
+        return new ShowplanMemoryGrantNode(
+            ReadLongAttribute(element, "SerialRequiredMemory"),
+            ReadLongAttribute(element, "SerialDesiredMemory"),
+            ReadLongAttribute(element, "RequiredMemory"),
+            ReadLongAttribute(element, "DesiredMemory"),
+            ReadLongAttribute(element, "RequestedMemory"),
+            ReadLongAttribute(element, "GrantedMemory"),
+            ReadLongAttribute(element, "MaxUsedMemory"),
+            ReadAttribute(element, "IsMemoryGrantFeedbackAdjusted"));
+    }
+
+    private static ShowplanMemoryGrantSummary BuildShowplanMemoryGrantSummary(
+        IReadOnlyList<ShowplanMemoryGrantNode> grants)
+    {
+        return new ShowplanMemoryGrantSummary(
+            grants.Count,
+            MaxOrNull(grants.Select(grant => grant.SerialRequiredMemoryKb)),
+            MaxOrNull(grants.Select(grant => grant.SerialDesiredMemoryKb)),
+            MaxOrNull(grants.Select(grant => grant.RequiredMemoryKb)),
+            MaxOrNull(grants.Select(grant => grant.DesiredMemoryKb)),
+            MaxOrNull(grants.Select(grant => grant.RequestedMemoryKb)),
+            MaxOrNull(grants.Select(grant => grant.GrantedMemoryKb)),
+            MaxOrNull(grants.Select(grant => grant.MaxUsedMemoryKb)),
+            grants
+                .Select(grant => grant.IsMemoryGrantFeedbackAdjusted)
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Select(value => value!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray());
+    }
+
+    private static ShowplanWarningCounts BuildShowplanWarningCounts(IReadOnlyList<ShowplanWarningSummary> warnings)
+    {
+        return new ShowplanWarningCounts(
+            warnings.Sum(warning => CountWarningDetails(warning, "SpillToTempDb")),
+            warnings.Sum(warning => CountWarningDetails(warning, "PlanAffectingConvert")),
+            warnings.Sum(warning => CountWarningDetails(warning, "ColumnsWithNoStatistics")),
+            warnings.Sum(warning => warning.Details.Count(detail => detail.Contains("NoJoinPredicate", StringComparison.OrdinalIgnoreCase))));
+    }
+
+    private static int CountWarningDetails(ShowplanWarningSummary warning, string token)
+    {
+        return warning.Details.Count(detail => detail.Contains(token, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static long? MaxOrNull(IEnumerable<long?> values)
+    {
+        var present = values.Where(value => value is not null).Select(value => value!.Value).ToArray();
+        return present.Length == 0 ? null : present.Max();
+    }
+
+    private static string? TruncateShowplanText(string? text, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return text;
+        }
+
+        return text.Length <= maxLength
+            ? text
+            : string.Concat(text.AsSpan(0, maxLength), "...<truncated>");
     }
 
     private static ShowplanOperatorSummary ReadShowplanOperator(XElement element)
@@ -3713,6 +3852,17 @@ public sealed class SqlMetadataService
             : null;
     }
 
+    private static long? ReadLongAttribute(XElement element, string attributeName)
+    {
+        return long.TryParse(
+            ReadAttribute(element, attributeName),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var value)
+            ? value
+            : null;
+    }
+
     private static bool IsScanOperator(string? physicalOp)
     {
         return ContainsOperator(physicalOp, "Scan")
@@ -3729,6 +3879,9 @@ public sealed class SqlMetadataService
         decimal EstimatedTotalSubtreeCost,
         ShowplanOperatorCounts OperatorCounts,
         ShowplanRisk[] Risks,
+        ShowplanStatementSummary[] Statements,
+        ShowplanMemoryGrantSummary MemoryGrant,
+        ShowplanWarningCounts WarningCounts,
         ShowplanOperatorSummary[] ExpensiveOperators,
         ShowplanMissingIndex[] MissingIndexes,
         ShowplanWarningSummary[] Warnings,
@@ -3749,6 +3902,44 @@ public sealed class SqlMetadataService
         string Severity,
         string Message,
         string Hint);
+
+    internal sealed record ShowplanStatementSummary(
+        int Ordinal,
+        string? StatementText,
+        string? StatementType,
+        decimal? EstimatedSubtreeCost,
+        decimal? EstimatedRows,
+        string? OptimizationLevel,
+        string? OptimizationEarlyAbortReason,
+        string? NonParallelPlanReason,
+        string? CardinalityEstimationModelVersion);
+
+    internal sealed record ShowplanMemoryGrantSummary(
+        int GrantNodeCount,
+        long? MaxSerialRequiredMemoryKb,
+        long? MaxSerialDesiredMemoryKb,
+        long? MaxRequiredMemoryKb,
+        long? MaxDesiredMemoryKb,
+        long? MaxRequestedMemoryKb,
+        long? MaxGrantedMemoryKb,
+        long? MaxUsedMemoryKb,
+        string[] FeedbackAdjustments);
+
+    private sealed record ShowplanMemoryGrantNode(
+        long? SerialRequiredMemoryKb,
+        long? SerialDesiredMemoryKb,
+        long? RequiredMemoryKb,
+        long? DesiredMemoryKb,
+        long? RequestedMemoryKb,
+        long? GrantedMemoryKb,
+        long? MaxUsedMemoryKb,
+        string? IsMemoryGrantFeedbackAdjusted);
+
+    internal sealed record ShowplanWarningCounts(
+        int SpillToTempDbCount,
+        int PlanAffectingConvertCount,
+        int ColumnsWithNoStatisticsCount,
+        int NoJoinPredicateCount);
 
     internal sealed record ShowplanOperatorSummary(
         int? NodeId,

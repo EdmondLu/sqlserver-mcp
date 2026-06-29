@@ -12,8 +12,9 @@ public sealed class ShowplanSummaryTests
                              <BatchSequence>
                                <Batch>
                                  <Statements>
-                                   <StmtSimple StatementText="SELECT * FROM dbo.Plan" StatementSubTreeCost="3.14">
+                                   <StmtSimple StatementText="SELECT * FROM dbo.Plan" StatementType="SELECT" StatementSubTreeCost="3.14" StatementEstRows="1000" StatementOptmLevel="FULL" StatementOptmEarlyAbortReason="TimeOut" CardinalityEstimationModelVersion="160">
                                      <QueryPlan>
+                                       <MemoryGrantInfo SerialRequiredMemory="1024" SerialDesiredMemory="204800" RequiredMemory="2048" DesiredMemory="409600" RequestedMemory="409600" GrantedMemory="409600" MaxUsedMemory="2048" IsMemoryGrantFeedbackAdjusted="No" />
                                        <MissingIndexes>
                                          <MissingIndexGroup Impact="87.5">
                                            <MissingIndex Database="[TDSCM]" Schema="[dbo]" Table="[Plan]">
@@ -38,6 +39,7 @@ public sealed class ShowplanSummaryTests
                                        <RelOp NodeId="5" PhysicalOp="Nested Loops" LogicalOp="Inner Join">
                                          <Warnings NoJoinPredicate="1">
                                            <PlanAffectingConvert ConvertIssue="Cardinality Estimate" Expression="CONVERT_IMPLICIT(int,[dbo].[Plan].[Code],0)" />
+                                           <SpillToTempDb SpillLevel="1" />
                                          </Warnings>
                                        </RelOp>
                                      </QueryPlan>
@@ -59,8 +61,23 @@ public sealed class ShowplanSummaryTests
         Assert.Equal(1, summary.OperatorCounts.HashMatchCount);
         Assert.Equal(1, summary.OperatorCounts.KeyLookupCount);
         Assert.Equal(1, summary.OperatorCounts.ParallelismCount);
+        Assert.Equal(1, summary.WarningCounts.SpillToTempDbCount);
+        Assert.Equal(1, summary.WarningCounts.NoJoinPredicateCount);
+        Assert.Equal(1, summary.WarningCounts.PlanAffectingConvertCount);
         Assert.Contains(summary.Risks, risk => risk.Code == "missing_index" && risk.Severity == "high");
         Assert.Contains(summary.Risks, risk => risk.Code == "implicit_conversion" && risk.Severity == "high");
+        Assert.Contains(summary.Risks, risk => risk.Code == "spill_to_tempdb" && risk.Severity == "high");
+        Assert.Contains(summary.Risks, risk => risk.Code == "no_join_predicate" && risk.Severity == "high");
+        Assert.Contains(summary.Risks, risk => risk.Code == "optimizer_early_abort");
+        Assert.Contains(summary.Risks, risk => risk.Code == "large_memory_grant");
+
+        var statement = Assert.Single(summary.Statements);
+        Assert.Equal("SELECT", statement.StatementType);
+        Assert.Equal("TimeOut", statement.OptimizationEarlyAbortReason);
+        Assert.Equal("160", statement.CardinalityEstimationModelVersion);
+        Assert.Equal(204800, summary.MemoryGrant.MaxSerialDesiredMemoryKb);
+        Assert.Equal(409600, summary.MemoryGrant.MaxRequestedMemoryKb);
+        Assert.Contains("No", summary.MemoryGrant.FeedbackAdjustments);
 
         var missingIndex = Assert.Single(summary.MissingIndexes);
         Assert.Equal("[Plan]", missingIndex.Table);
@@ -72,6 +89,7 @@ public sealed class ShowplanSummaryTests
         var warning = Assert.Single(summary.Warnings);
         Assert.Equal(5, warning.NodeId);
         Assert.Contains(warning.Details, detail => detail.Contains("PlanAffectingConvert"));
+        Assert.Contains(warning.Details, detail => detail.Contains("SpillToTempDb"));
     }
 
     [Fact]

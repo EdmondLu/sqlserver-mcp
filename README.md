@@ -113,7 +113,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `search_config_text` | Search configured application/configuration text columns with locator and audit metadata |
 | `run_readonly_query` | Run one guarded read-only query with optional named parameters |
 | `describe_query_result` | Describe guarded query result columns without executing the query |
-| `explain_query_plan` | Return estimated SHOWPLAN XML plus a compact risk summary without executing the query |
+| `explain_query_plan` | Return estimated SHOWPLAN XML plus statement, memory, warning, and risk summaries without executing the query |
 | `reload_connection` | Clear cached credentials and SQL connection pools |
 
 Structure tools recognize the legacy view prefixes `vwp_`, `vwpr_`, `vwt_`, and `vwtr_`, and try the corresponding unprefixed physical table first.

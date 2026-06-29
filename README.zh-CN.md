@@ -76,7 +76,7 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 - `search_config_text`、`run_readonly_query`、`describe_query_result`、`explain_query_plan`
 - `reload_connection`
 
-`explain_query_plan` 返回原始 SHOWPLAN XML，同时附带扫描、缺失索引、隐式转换、排序、hash、lookup、并行和 warning 的结构化摘要。
+`explain_query_plan` 返回原始 SHOWPLAN XML，同时附带语句、内存授予、warning、扫描、缺失索引、隐式转换、排序、hash、lookup、并行等结构化摘要。
 
 `analyze_module_temp_tables` 会分析模块内本地临时表的创建、读写、JOIN、跨行 INSERT/SELECT INTO/UPDATE 和字段流转摘要。
 

@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 1.7.0 - 2026-06-29
+
+- Enhanced `explain_query_plan` summaries with statement cards, memory grant aggregation, warning counters, spill/no-join/optimizer-early-abort risks, and large-memory-grant hints.
+
 ## 1.6.0 - 2026-06-29
 
 - Enhanced `analyze_module_temp_tables` with statement-window analysis, multiline INSERT/SELECT INTO/UPDATE detection, extracted target/projection/update columns, and per-temp-table column flow summaries.
