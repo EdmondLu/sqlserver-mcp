@@ -78,6 +78,8 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 
 `explain_query_plan` 返回原始 SHOWPLAN XML，同时附带扫描、缺失索引、隐式转换、排序、hash、lookup、并行和 warning 的结构化摘要。
 
+`analyze_module_temp_tables` 会分析模块内本地临时表的创建、读写、JOIN、跨行 INSERT/SELECT INTO/UPDATE 和字段流转摘要。
+
 结构工具会识别 `vwp_`、`vwpr_`、`vwt_`、`vwtr_` 这四种历史视图前缀，并优先尝试对应的无前缀物理表。
 
 ## 构建与测试

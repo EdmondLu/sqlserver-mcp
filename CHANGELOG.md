@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 1.6.0 - 2026-06-29
+
+- Enhanced `analyze_module_temp_tables` with statement-window analysis, multiline INSERT/SELECT INTO/UPDATE detection, extracted target/projection/update columns, and per-temp-table column flow summaries.
+
 ## 1.5.0 - 2026-06-29
 
 - Enhanced `search_config_text` with locator labels, audit fields, configured/detected content kind, and richer target metadata.

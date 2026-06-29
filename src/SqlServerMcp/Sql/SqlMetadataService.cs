@@ -2521,17 +2521,34 @@ public sealed class SqlMetadataService
                 var tableName = match.Value;
                 var builder = GetTempTableBuilder(tables, tableName);
                 builder.SetFirstLine(lineNumber);
-                var operation = ClassifyTempTableOperation(line, tableName);
-                builder.References.Add(new TempTableReference(lineNumber, operation, line.Trim()));
+                var statement = BuildTempTableStatement(lines, i);
+                var operation = ClassifyTempTableOperation(statement.CompactText, tableName);
+                var referenceColumns = ExtractTempTableReferenceColumns(statement.CompactText, tableName, operation);
+                builder.References.Add(new TempTableReference(
+                    lineNumber,
+                    operation,
+                    BuildStatementPreview(statement.CompactText),
+                    statement.EndLine,
+                    referenceColumns));
+                builder.ColumnFlowEvents.AddRange(referenceColumns
+                    .Select(column => new TempTableColumnFlowEvent(column, operation, lineNumber)));
 
                 if (operation is "create_table" or "select_into")
                 {
-                    builder.Creations.Add(new TempTableCreation(lineNumber, operation, line.Trim()));
+                    builder.Creations.Add(new TempTableCreation(
+                        lineNumber,
+                        operation,
+                        BuildStatementPreview(statement.CompactText),
+                        statement.EndLine,
+                        referenceColumns));
                 }
 
                 if (operation == "create_table")
                 {
-                    builder.Columns.AddRange(ExtractTempTableColumns(lines, i));
+                    var columns = ExtractTempTableColumns(lines, i);
+                    builder.Columns.AddRange(columns);
+                    builder.ColumnFlowEvents.AddRange(columns
+                        .Select(column => new TempTableColumnFlowEvent(column.Name, "create_table", column.LineNumber)));
                 }
             }
         }
@@ -2554,10 +2571,27 @@ public sealed class SqlMetadataService
                 table.References
                     .GroupBy(reference => reference.Operation, StringComparer.OrdinalIgnoreCase)
                     .OrderBy(group => group.Key)
-                    .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase)))
+                    .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase),
+                BuildTempTableColumnFlow(table)))
             .ToArray();
 
         return new TempTableAnalysis(items);
+    }
+
+    private static TempTableColumnFlow[] BuildTempTableColumnFlow(TempTableBuilder table)
+    {
+        return table.ColumnFlowEvents
+            .Where(flow => !string.IsNullOrWhiteSpace(flow.Column))
+            .GroupBy(flow => flow.Column, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => group.Key)
+            .Select(group => new TempTableColumnFlow(
+                group.Key,
+                group
+                    .GroupBy(flow => flow.Operation, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(operationGroup => operationGroup.Key)
+                    .ToDictionary(operationGroup => operationGroup.Key, operationGroup => operationGroup.Count(), StringComparer.OrdinalIgnoreCase),
+                group.Select(flow => flow.LineNumber).Distinct().OrderBy(line => line).ToArray()))
+            .ToArray();
     }
 
     private static TempTableBuilder GetTempTableBuilder(
@@ -2598,6 +2632,11 @@ public sealed class SqlMetadataService
             return "update";
         }
 
+        if (Regex.IsMatch(normalized, $@"\bUPDATE\s+\w+\b.*\bFROM\s+{table}\b", RegexOptions.IgnoreCase))
+        {
+            return "update";
+        }
+
         if (Regex.IsMatch(normalized, $@"\bDELETE\s+(?:FROM\s+)?{table}\b", RegexOptions.IgnoreCase))
         {
             return "delete";
@@ -2624,6 +2663,216 @@ public sealed class SqlMetadataService
     private static string NormalizeSqlLine(string line)
     {
         return Regex.Replace(line, @"\s+", " ").Trim();
+    }
+
+    private static TempTableStatement BuildTempTableStatement(string[] lines, int lineIndex)
+    {
+        var start = lineIndex;
+        for (var i = lineIndex; i >= Math.Max(0, lineIndex - 8); i--)
+        {
+            var trimmed = lines[i].Trim();
+            if (i < lineIndex && trimmed.Contains(';', StringComparison.Ordinal))
+            {
+                break;
+            }
+
+            start = i;
+            if (Regex.IsMatch(trimmed, @"^(CREATE\s+TABLE|SELECT|INSERT|UPDATE|DELETE|MERGE)\b", RegexOptions.IgnoreCase))
+            {
+                break;
+            }
+
+            if (i < lineIndex && string.IsNullOrWhiteSpace(trimmed))
+            {
+                start = i + 1;
+                break;
+            }
+        }
+
+        var end = lineIndex;
+        for (var i = lineIndex; i < Math.Min(lines.Length, lineIndex + 40); i++)
+        {
+            var trimmed = lines[i].Trim();
+            if (i > lineIndex
+                && Regex.IsMatch(trimmed, @"^(CREATE\s+TABLE|SELECT|INSERT|UPDATE|DELETE|MERGE)\b", RegexOptions.IgnoreCase))
+            {
+                end = i - 1;
+                break;
+            }
+
+            end = i;
+            if (trimmed.Contains(';', StringComparison.Ordinal))
+            {
+                break;
+            }
+        }
+
+        var text = string.Join(Environment.NewLine, lines.Skip(start).Take(end - start + 1));
+        return new TempTableStatement(start + 1, end + 1, text, NormalizeSqlLine(text));
+    }
+
+    private static string BuildStatementPreview(string compactText)
+    {
+        return compactText.Length <= 500
+            ? compactText
+            : string.Concat(compactText.AsSpan(0, 500), "...<truncated>");
+    }
+
+    private static string[] ExtractTempTableReferenceColumns(string statement, string tableName, string operation)
+    {
+        return operation switch
+        {
+            "insert" => ExtractInsertTargetColumns(statement, tableName),
+            "select_into" => ExtractSelectIntoColumns(statement, tableName),
+            "update" => ExtractUpdateSetColumns(statement),
+            "create_table" => [],
+            _ => []
+        };
+    }
+
+    private static string[] ExtractInsertTargetColumns(string statement, string tableName)
+    {
+        var match = Regex.Match(
+            statement,
+            $@"\bINSERT\s+(?:INTO\s+)?{Regex.Escape(tableName)}\s*\((?<columns>[^)]*)\)",
+            RegexOptions.IgnoreCase);
+
+        return match.Success
+            ? ParseColumnList(match.Groups["columns"].Value)
+            : [];
+    }
+
+    private static string[] ExtractSelectIntoColumns(string statement, string tableName)
+    {
+        var match = Regex.Match(
+            statement,
+            $@"\bSELECT\s+(?<select>.*?)\s+\bINTO\s+{Regex.Escape(tableName)}\b",
+            RegexOptions.IgnoreCase);
+
+        return match.Success
+            ? SplitTopLevelCommas(match.Groups["select"].Value)
+                .Select(ExtractProjectionColumnName)
+                .Where(column => !string.IsNullOrWhiteSpace(column))
+                .Select(column => column!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray()
+            : [];
+    }
+
+    private static string[] ExtractUpdateSetColumns(string statement)
+    {
+        var match = Regex.Match(
+            statement,
+            @"\bSET\s+(?<set>.*?)(?:\s+FROM\b|\s+WHERE\b|\s+OUTPUT\b|$)",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            return [];
+        }
+
+        return SplitTopLevelCommas(match.Groups["set"].Value)
+            .Select(item => item.Split('=', 2)[0])
+            .Select(NormalizeColumnToken)
+            .Where(column => !string.IsNullOrWhiteSpace(column))
+            .Select(column => column!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string[] ParseColumnList(string text)
+    {
+        return SplitTopLevelCommas(text)
+            .Select(NormalizeColumnToken)
+            .Where(column => !string.IsNullOrWhiteSpace(column))
+            .Select(column => column!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string? ExtractProjectionColumnName(string expression)
+    {
+        var item = expression.Trim();
+        if (item.Length == 0 || item == "*")
+        {
+            return null;
+        }
+
+        var asMatch = Regex.Match(item, @"\bAS\s+(?<name>\[?[A-Za-z_][A-Za-z0-9_]*\]?)$", RegexOptions.IgnoreCase);
+        if (asMatch.Success)
+        {
+            return NormalizeColumnToken(asMatch.Groups["name"].Value);
+        }
+
+        var trailingAlias = Regex.Match(item, @"\s+(?<name>\[?[A-Za-z_][A-Za-z0-9_]*\]?)$");
+        if (trailingAlias.Success
+            && !item.EndsWith(")", StringComparison.Ordinal)
+            && !item.Contains("=", StringComparison.Ordinal))
+        {
+            return NormalizeColumnToken(trailingAlias.Groups["name"].Value);
+        }
+
+        var lastIdentifier = Regex.Match(item, @"(?:\.|\b)(?<name>\[?[A-Za-z_][A-Za-z0-9_]*\]?)$");
+        return lastIdentifier.Success
+            ? NormalizeColumnToken(lastIdentifier.Groups["name"].Value)
+            : null;
+    }
+
+    private static string? NormalizeColumnToken(string token)
+    {
+        var normalized = token.Trim().TrimEnd(',');
+        if (normalized.Length == 0)
+        {
+            return null;
+        }
+
+        if (normalized.Contains('.', StringComparison.Ordinal))
+        {
+            normalized = normalized[(normalized.LastIndexOf('.') + 1)..];
+        }
+
+        normalized = normalized.Trim().Trim('[', ']');
+        return Regex.IsMatch(normalized, @"^[A-Za-z_][A-Za-z0-9_]*$")
+            ? normalized
+            : null;
+    }
+
+    private static string[] SplitTopLevelCommas(string text)
+    {
+        var result = new List<string>();
+        var start = 0;
+        var depth = 0;
+        var bracketDepth = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '[')
+            {
+                bracketDepth++;
+            }
+            else if (ch == ']' && bracketDepth > 0)
+            {
+                bracketDepth--;
+            }
+            else if (bracketDepth == 0 && ch == '(')
+            {
+                depth++;
+            }
+            else if (bracketDepth == 0 && ch == ')' && depth > 0)
+            {
+                depth--;
+            }
+            else if (bracketDepth == 0 && depth == 0 && ch == ',')
+            {
+                result.Add(text[start..i]);
+                start = i + 1;
+            }
+        }
+
+        result.Add(text[start..]);
+        return result
+            .Select(part => part.Trim())
+            .Where(part => part.Length > 0)
+            .ToArray();
     }
 
     private static IReadOnlyList<TempTableColumn> ExtractTempTableColumns(string[] lines, int createLineIndex)
@@ -3608,13 +3857,37 @@ public sealed class SqlMetadataService
         TempTableCreation[] Creations,
         TempTableColumn[] Columns,
         TempTableReference[] References,
-        IReadOnlyDictionary<string, int> OperationCounts);
+        IReadOnlyDictionary<string, int> OperationCounts,
+        TempTableColumnFlow[] ColumnFlow);
 
-    internal sealed record TempTableCreation(int LineNumber, string Operation, string Text);
+    internal sealed record TempTableCreation(
+        int LineNumber,
+        string Operation,
+        string Text,
+        int EndLine,
+        string[] Columns);
 
     internal sealed record TempTableColumn(int LineNumber, string Name, string Definition);
 
-    internal sealed record TempTableReference(int LineNumber, string Operation, string Text);
+    internal sealed record TempTableReference(
+        int LineNumber,
+        string Operation,
+        string Text,
+        int EndLine,
+        string[] Columns);
+
+    internal sealed record TempTableColumnFlow(
+        string Column,
+        IReadOnlyDictionary<string, int> OperationCounts,
+        int[] Lines);
+
+    private sealed record TempTableColumnFlowEvent(string Column, string Operation, int LineNumber);
+
+    private sealed record TempTableStatement(
+        int StartLine,
+        int EndLine,
+        string Text,
+        string CompactText);
 
     private sealed class TempTableBuilder
     {
@@ -3632,6 +3905,8 @@ public sealed class SqlMetadataService
         public List<TempTableColumn> Columns { get; } = [];
 
         public List<TempTableReference> References { get; } = [];
+
+        public List<TempTableColumnFlowEvent> ColumnFlowEvents { get; } = [];
 
         public void SetFirstLine(int lineNumber)
         {

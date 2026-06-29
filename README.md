@@ -107,7 +107,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `search_sql_modules` | Search SQL module definitions |
 | `get_module_definition` | Read a module definition, optionally by keyword or line range |
 | `compare_module_to_file` | Compare a database module definition with a local file |
-| `analyze_module_temp_tables` | Analyze local temp table creation and usage inside a module |
+| `analyze_module_temp_tables` | Analyze local temp table creation, usage, multiline statements, and column flow inside a module |
 | `get_dependencies` | Find incoming and outgoing dependencies |
 | `find_usage` | Find object, column, or token usage |
 | `search_config_text` | Search configured application/configuration text columns with locator and audit metadata |

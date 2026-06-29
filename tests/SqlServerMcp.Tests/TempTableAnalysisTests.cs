@@ -58,4 +58,67 @@ public sealed class TempTableAnalysisTests
         Assert.Contains(result.Creations, creation => creation.Operation == "select_into");
         Assert.Contains(result.References, reference => reference.Operation == "update");
     }
+
+    [Fact]
+    public void AnalyzeTempTables_TracksColumnsAcrossMultilineStatements()
+    {
+        const string definition = """
+                                  CREATE PROC dbo.Sample
+                                  AS
+                                  BEGIN
+                                      CREATE TABLE #Plan
+                                      (
+                                          Id int NOT NULL,
+                                          Code nvarchar(50) NULL
+                                      );
+
+                                      INSERT INTO
+                                          #Plan
+                                          (
+                                              Id,
+                                              Code
+                                          )
+                                      SELECT S.Id, S.Code
+                                      FROM dbo.Source S;
+
+                                      SELECT
+                                          S.Id AS Id,
+                                          S.Code AS Code,
+                                          S.Name AS Name
+                                      INTO #Selected
+                                      FROM dbo.Source S;
+
+                                      UPDATE p
+                                      SET
+                                          p.Code = s.Code
+                                      FROM #Plan p
+                                      JOIN #Selected s ON s.Id = p.Id;
+                                  END
+                                  """;
+
+        var analysis = SqlMetadataService.AnalyzeTempTables(definition);
+
+        var plan = analysis.TempTables.Single(table => table.Name == "#Plan");
+        Assert.Contains(plan.References, reference =>
+            reference.Operation == "insert"
+            && reference.Columns.Contains("Id")
+            && reference.Columns.Contains("Code"));
+        Assert.Contains(plan.References, reference =>
+            reference.Operation == "update"
+            && reference.Columns.Contains("Code"));
+        Assert.Contains(plan.ColumnFlow, flow =>
+            flow.Column == "Code"
+            && flow.OperationCounts.ContainsKey("insert")
+            && flow.OperationCounts.ContainsKey("update"));
+
+        var selected = analysis.TempTables.Single(table => table.Name == "#Selected");
+        Assert.Contains(selected.Creations, creation =>
+            creation.Operation == "select_into"
+            && creation.Columns.Contains("Id")
+            && creation.Columns.Contains("Code")
+            && creation.Columns.Contains("Name"));
+        Assert.Contains(selected.ColumnFlow, flow =>
+            flow.Column == "Name"
+            && flow.OperationCounts.ContainsKey("select_into"));
+    }
 }
