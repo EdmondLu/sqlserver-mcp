@@ -143,8 +143,37 @@ public sealed class ModuleFileDiffTests
 
         var databaseNormalized = SqlMetadataService.NormalizeSqlModuleTextForComparison(databaseDefinition);
         var fileNormalized = SqlMetadataService.NormalizeSqlModuleTextForComparison(fileText);
+        var firstBodyDifference = SqlMetadataService.FindFirstBodyDifference(databaseDefinition, fileText);
 
         Assert.Equal(databaseNormalized, fileNormalized);
+        Assert.Null(firstBodyDifference);
+    }
+
+    [Fact]
+    public void FindFirstBodyDifference_ReturnsOriginalLineNumbersAfterWrapperNormalization()
+    {
+        const string databaseDefinition = """
+                                          CREATE   PROCEDURE dbo.Sample
+                                          AS
+                                          SELECT 1
+                                          """;
+        const string fileText = """
+                                SET ANSI_NULLS ON
+                                GO
+                                SET QUOTED_IDENTIFIER ON
+                                GO
+                                CREATE OR ALTER PROCEDURE dbo.Sample
+                                AS
+                                SELECT 2
+                                GO
+                                """;
+
+        var firstBodyDifference = SqlMetadataService.FindFirstBodyDifference(databaseDefinition, fileText);
+
+        Assert.NotNull(firstBodyDifference);
+        Assert.Equal(3, firstBodyDifference.BodyLine);
+        Assert.Equal(3, firstBodyDifference.DatabaseLine);
+        Assert.Equal(7, firstBodyDifference.FileLine);
     }
 
     [Fact]

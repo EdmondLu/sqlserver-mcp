@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## 1.14.0 - 2026-06-29
+
+- Added `firstBodyDifference` to module/file comparison results, mapping the first SQL-normalized body difference back to database and file line numbers.
+- Included first body-difference location in compare summaries so callers can quickly jump past script wrapper noise to the real changed line.
+
 ## 1.13.0 - 2026-06-29
 
 - Added readable comparison summaries, `differenceKind`, `ignoredWrapperDifferences`, and `diff.mode` to module/file comparison results.

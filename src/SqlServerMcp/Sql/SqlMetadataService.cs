@@ -1,5 +1,6 @@
 using System.Data;
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -819,6 +820,7 @@ public sealed class SqlMetadataService
             normalizedMatch = comparison.NormalizedMatch,
             sqlNormalizedMatch = comparison.SqlNormalizedMatch,
             differenceKind = comparison.DifferenceKind,
+            firstBodyDifference = comparison.FirstBodyDifference,
             nextActions = ModuleCompareNextActions
         };
     }
@@ -2461,7 +2463,15 @@ public sealed class SqlMetadataService
         var sqlNormalizedMatch = string.Equals(dbSqlNormalized, fileSqlNormalized, StringComparison.Ordinal);
         var differenceKind = ClassifyModuleFileDifference(exactMatch, normalizedMatch, sqlNormalizedMatch);
         var ignoredWrapperDifferences = DetectIgnoredWrapperDifferences(module.Definition, fileText);
-        var summary = BuildModuleFileComparisonSummary(file, diff, exactMatch, normalizedMatch, sqlNormalizedMatch, differenceKind);
+        var firstBodyDifference = FindFirstBodyDifference(module.Definition, fileText);
+        var summary = BuildModuleFileComparisonSummary(
+            file,
+            diff,
+            exactMatch,
+            normalizedMatch,
+            sqlNormalizedMatch,
+            differenceKind,
+            firstBodyDifference);
 
         return new ModuleFileComparisonResult(
             module.Schema,
@@ -2490,6 +2500,7 @@ public sealed class SqlMetadataService
             sqlNormalizedMatch,
             differenceKind,
             ignoredWrapperDifferences,
+            firstBodyDifference,
             summary,
             diff,
             ModuleCompareNextActions);
@@ -2692,16 +2703,25 @@ public sealed class SqlMetadataService
         bool exactMatch,
         bool normalizedMatch,
         bool sqlNormalizedMatch,
-        string differenceKind)
+        string differenceKind,
+        ModuleBodyDifference? firstBodyDifference)
     {
         var returnedDiffLineCount = diff.Hunks.Sum(hunk => hunk.DatabaseLines.Length + hunk.FileLines.Length);
         var truncatedText = diff.Truncated ? "truncated" : "not truncated";
-        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; sqlNormalizedMatch={FormatBool(sqlNormalizedMatch)}; {diff.Hunks.Length} hunks; changedLines=db:{diff.DatabaseChangedLineCount},file:{diff.FileChangedLineCount}; returnedDiffLines={returnedDiffLineCount}; {truncatedText}";
+        var firstBodyText = firstBodyDifference is null
+            ? "firstBodyDifference=none"
+            : $"firstBodyDifference=body:{firstBodyDifference.BodyLine},db:{FormatNullableInt(firstBodyDifference.DatabaseLine)},file:{FormatNullableInt(firstBodyDifference.FileLine)}";
+        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; sqlNormalizedMatch={FormatBool(sqlNormalizedMatch)}; {diff.Hunks.Length} hunks; changedLines=db:{diff.DatabaseChangedLineCount},file:{diff.FileChangedLineCount}; returnedDiffLines={returnedDiffLineCount}; {firstBodyText}; {truncatedText}";
     }
 
     private static string FormatBool(bool value)
     {
         return value ? "true" : "false";
+    }
+
+    private static string FormatNullableInt(int? value)
+    {
+        return value?.ToString(CultureInfo.InvariantCulture) ?? "none";
     }
 
     private static IEnumerable<FileInfo> EnumerateSqlFiles(DirectoryInfo root)
@@ -3388,51 +3408,82 @@ public sealed class SqlMetadataService
 
     internal static string NormalizeSqlModuleTextForComparison(string text)
     {
+        return string.Join(
+                "\n",
+                BuildSqlModuleComparableLines(text).Select(line => line.Text))
+            .Trim();
+    }
+
+    internal static ModuleBodyDifference? FindFirstBodyDifference(string databaseDefinition, string fileText)
+    {
+        var databaseLines = BuildSqlModuleComparableLines(databaseDefinition);
+        var fileLines = BuildSqlModuleComparableLines(fileText);
+        var maxLineCount = Math.Max(databaseLines.Length, fileLines.Length);
+        for (var i = 0; i < maxLineCount; i++)
+        {
+            var databaseLine = i < databaseLines.Length ? databaseLines[i] : null;
+            var fileLine = i < fileLines.Length ? fileLines[i] : null;
+            if (string.Equals(databaseLine?.Text, fileLine?.Text, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            return new ModuleBodyDifference(i + 1, databaseLine?.OriginalLineNumber, fileLine?.OriginalLineNumber);
+        }
+
+        return null;
+    }
+
+    private static SqlModuleComparableLine[] BuildSqlModuleComparableLines(string text)
+    {
         var lines = SplitDefinitionLines(text.Trim('\uFEFF'))
-            .Select(line => line.TrimEnd())
+            .Select((line, index) => new SqlModuleComparableLine(index + 1, line.TrimEnd()))
             .ToList();
 
-        while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[0]))
+        while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[0].Text))
         {
             lines.RemoveAt(0);
         }
 
-        while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[^1]))
+        while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[^1].Text))
         {
             lines.RemoveAt(lines.Count - 1);
         }
 
         while (lines.Count > 0
-               && (SqlBatchSeparatorRegex.IsMatch(lines[0])
-                   || SqlSessionSetRegex.IsMatch(lines[0])
-                   || string.IsNullOrWhiteSpace(lines[0])))
+               && (SqlBatchSeparatorRegex.IsMatch(lines[0].Text)
+                   || SqlSessionSetRegex.IsMatch(lines[0].Text)
+                   || string.IsNullOrWhiteSpace(lines[0].Text)))
         {
             lines.RemoveAt(0);
         }
 
         while (lines.Count > 0
-               && (SqlBatchSeparatorRegex.IsMatch(lines[^1])
-                   || string.IsNullOrWhiteSpace(lines[^1])))
+               && (SqlBatchSeparatorRegex.IsMatch(lines[^1].Text)
+                   || string.IsNullOrWhiteSpace(lines[^1].Text)))
         {
             lines.RemoveAt(lines.Count - 1);
         }
 
         for (var i = 0; i < lines.Count; i++)
         {
-            if (string.IsNullOrWhiteSpace(lines[i]))
+            if (string.IsNullOrWhiteSpace(lines[i].Text))
             {
                 continue;
             }
 
-            lines[i] = SqlModuleCreateRegex.Replace(lines[i], match =>
+            lines[i] = lines[i] with
             {
-                var objectType = Regex.Replace(match.Groups[1].Value.ToUpperInvariant(), @"\s+", " ");
-                return $"CREATE {objectType}";
-            });
+                Text = SqlModuleCreateRegex.Replace(lines[i].Text, match =>
+                {
+                    var objectType = Regex.Replace(match.Groups[1].Value.ToUpperInvariant(), @"\s+", " ");
+                    return $"CREATE {objectType}";
+                })
+            };
             break;
         }
 
-        return string.Join("\n", lines).Trim();
+        return lines.ToArray();
     }
 
     internal static TempTableAnalysis AnalyzeTempTables(string definition)
@@ -5288,9 +5339,15 @@ public sealed class SqlMetadataService
         bool SqlNormalizedMatch,
         string DifferenceKind,
         string[] IgnoredWrapperDifferences,
+        ModuleBodyDifference? FirstBodyDifference,
         string Summary,
         ModuleFileDiff Diff,
         string[] NextActions);
+
+    internal sealed record ModuleBodyDifference(
+        int BodyLine,
+        int? DatabaseLine,
+        int? FileLine);
 
     internal sealed record ModuleSqlFileDiscovery(
         string Root,
@@ -5331,6 +5388,8 @@ public sealed class SqlMetadataService
         int MaxHunks,
         int MaxDiffLinesPerSide,
         bool IncludeLines);
+
+    private sealed record SqlModuleComparableLine(int OriginalLineNumber, string Text);
 
     internal sealed record ModuleFileDiffHunk(
         int DatabaseStartLine,
