@@ -37,6 +37,12 @@
       }
     ]
   },
+  "compare": {
+    "repoExcludePatterns": [
+      "**/backup/**",
+      "**/domain2/**"
+    ]
+  },
   "logging": {
     "logSql": false,
     "maxFileSizeMb": 10,

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 1.15.0 - 2026-06-29
+
+- Added `changedLineSummary` to module/file comparison results so callers do not need to parse summary text for changed and returned line counts.
+- Added first-body-difference next actions that point directly to the database and local file lines to inspect.
+- Added `compare.repoExcludePatterns` config defaults, merged with per-call `excludePatterns`, for routinely ignoring historical or backup SQL folders during repository module discovery.
+
 ## 1.14.0 - 2026-06-29
 
 - Added `firstBodyDifference` to module/file comparison results, mapping the first SQL-normalized body difference back to database and file line numbers.

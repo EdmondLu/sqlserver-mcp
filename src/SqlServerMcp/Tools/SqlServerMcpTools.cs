@@ -164,7 +164,7 @@ public static class SqlServerMcpTools
         [Description("Module name.")] string name,
         [Description("Optional repository/folder root. Defaults to the MCP process current directory.")] string? root = null,
         [Description("Optional path glob patterns such as **/*.sql, procedures/*.sql, or *proc*.sql. Defaults to **/*.sql.")] string[]? patterns = null,
-        [Description("Optional path glob patterns to exclude from candidate discovery, such as backup/** or domain2/**.")] string[]? excludePatterns = null,
+        [Description("Optional path glob patterns to exclude from candidate discovery, such as backup/** or domain2/**. Merged with compare.repoExcludePatterns from config.")] string[]? excludePatterns = null,
         [Description("Maximum ranked candidates to return when discovery is empty or ambiguous. Defaults to 10 and is capped.")] int? maxCandidates = null,
         [Description("Context lines around the changed block after a file is selected. Defaults to 5 and is capped.")] int? contextLines = null,
         [Description("Diff output mode: summary, compact, or full. Defaults to compact.")] string? diffMode = null,

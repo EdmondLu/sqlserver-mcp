@@ -18,6 +18,8 @@ public sealed class SqlServerMcpOptions
 
     public TextSearchOptions TextSearch { get; init; } = new();
 
+    public CompareOptions Compare { get; init; } = new();
+
     public LoggingOptions Logging { get; init; } = new();
 
     public ConnectionOptions Connection { get; init; } = new();
@@ -85,6 +87,7 @@ public sealed class SqlServerMcpOptions
 
         Limits.Normalize();
         TextSearch.Normalize();
+        Compare.Normalize();
         Logging.Normalize();
     }
 }
@@ -208,6 +211,21 @@ public sealed class TextSearchTargetOptions
         ContentKind = string.IsNullOrWhiteSpace(ContentKind)
             ? null
             : ContentKind.Trim();
+    }
+}
+
+public sealed class CompareOptions
+{
+    public string[] RepoExcludePatterns { get; set; } = [];
+
+    public void Normalize()
+    {
+        RepoExcludePatterns = RepoExcludePatterns
+            .Where(pattern => !string.IsNullOrWhiteSpace(pattern))
+            .Select(pattern => pattern.Trim().Replace('\\', '/'))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(100)
+            .ToArray();
     }
 }
 

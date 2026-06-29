@@ -83,6 +83,7 @@ See [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json) for a c
 | `security.allowSystemDatabases` | `false` | Allow system databases |
 | `textSearch.targets` | `[]` | Allow-listed text columns for `search_config_text` |
 | `textSearch.snippetLength` | `240` | Snippet length for configured text searches |
+| `compare.repoExcludePatterns` | `[]` | Default repository glob patterns to exclude in `compare_module_to_repo` |
 | `logging.logSql` | `false` | Include submitted SQL text in file logs |
 | `connection.encrypt` | `true` | Encrypt SQL connections |
 | `connection.trustServerCertificate` | `false` | Skip certificate-chain validation |
@@ -120,7 +121,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 
 Search, definition-slice, configuration-text, usage, and read-only query tools expose `resultInfo` for consistent returned-count, limit, truncation, reason, and hint metadata.
 
-Module/file comparison returns a readable top-level summary, `differenceKind`, `firstBodyDifference`, ignored wrapper-difference labels, and multi-hunk diffs with truncation metadata. Use `diffMode=summary` for ranges only, `compact` for the default focused diff, or `full` with larger `maxHunks` / `maxDiffLinesPerSide` caps. Repository comparison also accepts `excludePatterns` such as `backup/**` and returns `suggestedPatterns` for ambiguous candidates. It reports `sqlNormalizedMatch` and SQL-normalized hashes to ignore common deployment-script wrapper differences such as `CREATE OR ALTER`, leading `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`, and trailing `GO`, while `firstBodyDifference` maps the first SQL-normalized body change back to database and file line numbers.
+Module/file comparison returns a readable top-level summary, `changedLineSummary`, `differenceKind`, `firstBodyDifference`, ignored wrapper-difference labels, and multi-hunk diffs with truncation metadata. Use `diffMode=summary` for ranges only, `compact` for the default focused diff, or `full` with larger `maxHunks` / `maxDiffLinesPerSide` caps. Repository comparison accepts per-call `excludePatterns`, merges them with `compare.repoExcludePatterns` defaults such as `backup/**`, and returns `suggestedPatterns` for ambiguous candidates. It reports `sqlNormalizedMatch` and SQL-normalized hashes to ignore common deployment-script wrapper differences such as `CREATE OR ALTER`, leading `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`, and trailing `GO`, while `firstBodyDifference` maps the first SQL-normalized body change back to database and file line numbers. When a body difference exists, `nextActions` points directly to the database and local file lines to inspect.
 
 `describe_query_result` accepts optional `templateValues` for UI SQL placeholders, for example `{ "0": "1=1" }` replaces `{0}` before describing columns. Replacements are raw SQL fragments, and the final SQL is still parsed by the read-only guard.
 

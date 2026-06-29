@@ -85,6 +85,7 @@ public sealed class ModuleFileDiffTests
         Assert.Equal(5, hunk.DatabaseEndLine);
         Assert.Empty(hunk.DatabaseLines);
         Assert.Empty(hunk.FileLines);
+        Assert.Equal(new(1, 1, 0), SqlMetadataService.BuildChangedLineSummary(diff));
     }
 
     [Fact]
@@ -174,6 +175,19 @@ public sealed class ModuleFileDiffTests
         Assert.Equal(3, firstBodyDifference.BodyLine);
         Assert.Equal(3, firstBodyDifference.DatabaseLine);
         Assert.Equal(7, firstBodyDifference.FileLine);
+
+        var diff = SqlMetadataService.BuildLineDiff(
+            databaseDefinition,
+            fileText,
+            contextLines: 1,
+            diffMode: "summary",
+            maxHunks: null,
+            maxDiffLinesPerSide: null);
+        var nextActions = SqlMetadataService.BuildModuleCompareNextActions(firstBodyDifference, diff);
+
+        Assert.Contains(nextActions, action => action.Contains("database line 3", StringComparison.Ordinal)
+                                               && action.Contains("local file line 7", StringComparison.Ordinal));
+        Assert.Contains(nextActions, action => action.Contains("diffMode=compact", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -253,6 +267,16 @@ public sealed class ModuleFileDiffTests
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    [Fact]
+    public void MergeRepoCompareExcludePatterns_CombinesConfiguredAndRequestedPatterns()
+    {
+        var patterns = SqlMetadataService.MergeRepoCompareExcludePatterns(
+            ["backup/**", "domain2/**"],
+            ["domain2/**", "archive/**"]);
+
+        Assert.Equal(["backup/**", "domain2/**", "archive/**"], patterns);
     }
 
     [Fact]

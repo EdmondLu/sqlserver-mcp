@@ -30,4 +30,17 @@ public sealed class OptionsDefaultsTests
         Assert.Empty(options.Targets);
         Assert.Equal(240, options.SnippetLength);
     }
+
+    [Fact]
+    public void CompareOptions_NormalizeRepoExcludePatterns()
+    {
+        var options = new CompareOptions
+        {
+            RepoExcludePatterns = [" backup\\** ", "backup/**", "", "domain2/**"]
+        };
+
+        options.Normalize();
+
+        Assert.Equal(["backup/**", "domain2/**"], options.RepoExcludePatterns);
+    }
 }

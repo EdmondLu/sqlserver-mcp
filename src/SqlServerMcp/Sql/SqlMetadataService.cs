@@ -236,6 +236,10 @@ public sealed class SqlMetadataService
             },
             limits = _options.Limits,
             security = _options.Security,
+            compare = new
+            {
+                repoExcludePatterns = _options.Compare.RepoExcludePatterns
+            },
             textSearch = new
             {
                 snippetLength = _options.TextSearch.SnippetLength,
@@ -778,7 +782,8 @@ public sealed class SqlMetadataService
         CancellationToken cancellationToken)
     {
         var module = await GetModuleDefinitionCoreAsync(schema, name, cancellationToken);
-        var discovery = FindModuleSqlFileDiscovery(root, module.Schema, module.Name, patterns, excludePatterns, maxCandidates);
+        var effectiveExcludePatterns = MergeRepoCompareExcludePatterns(_options.Compare.RepoExcludePatterns, excludePatterns);
+        var discovery = FindModuleSqlFileDiscovery(root, module.Schema, module.Name, patterns, effectiveExcludePatterns, maxCandidates);
         if (discovery.SelectedCandidate is null)
         {
             return new
@@ -821,7 +826,8 @@ public sealed class SqlMetadataService
             sqlNormalizedMatch = comparison.SqlNormalizedMatch,
             differenceKind = comparison.DifferenceKind,
             firstBodyDifference = comparison.FirstBodyDifference,
-            nextActions = ModuleCompareNextActions
+            changedLineSummary = comparison.ChangedLineSummary,
+            nextActions = comparison.NextActions
         };
     }
 
@@ -2464,14 +2470,17 @@ public sealed class SqlMetadataService
         var differenceKind = ClassifyModuleFileDifference(exactMatch, normalizedMatch, sqlNormalizedMatch);
         var ignoredWrapperDifferences = DetectIgnoredWrapperDifferences(module.Definition, fileText);
         var firstBodyDifference = FindFirstBodyDifference(module.Definition, fileText);
+        var changedLineSummary = BuildChangedLineSummary(diff);
         var summary = BuildModuleFileComparisonSummary(
             file,
             diff,
+            changedLineSummary,
             exactMatch,
             normalizedMatch,
             sqlNormalizedMatch,
             differenceKind,
             firstBodyDifference);
+        var nextActions = BuildModuleCompareNextActions(firstBodyDifference, diff);
 
         return new ModuleFileComparisonResult(
             module.Schema,
@@ -2501,9 +2510,10 @@ public sealed class SqlMetadataService
             differenceKind,
             ignoredWrapperDifferences,
             firstBodyDifference,
+            changedLineSummary,
             summary,
             diff,
-            ModuleCompareNextActions);
+            nextActions);
     }
 
     internal static ModuleSqlFileDiscovery FindModuleSqlFileDiscovery(
@@ -2581,6 +2591,13 @@ public sealed class SqlMetadataService
             hint);
     }
 
+    internal static string[] MergeRepoCompareExcludePatterns(string[] configuredPatterns, string[]? requestedPatterns)
+    {
+        return NormalizeRepoComparePatterns(
+            configuredPatterns.Concat(requestedPatterns ?? []).ToArray(),
+            []);
+    }
+
     private static string[] NormalizeRepoComparePatterns(string[]? patterns)
     {
         return NormalizeRepoComparePatterns(patterns, DefaultRepoComparePatterns);
@@ -2643,6 +2660,32 @@ public sealed class SqlMetadataService
             .ToArray();
     }
 
+    internal static ModuleChangedLineSummary BuildChangedLineSummary(ModuleFileDiff diff)
+    {
+        return new ModuleChangedLineSummary(
+            diff.DatabaseChangedLineCount,
+            diff.FileChangedLineCount,
+            diff.Hunks.Sum(hunk => hunk.DatabaseLines.Length + hunk.FileLines.Length));
+    }
+
+    internal static string[] BuildModuleCompareNextActions(ModuleBodyDifference? firstBodyDifference, ModuleFileDiff diff)
+    {
+        var nextActions = new List<string>();
+        if (firstBodyDifference is not null)
+        {
+            nextActions.Add(
+                $"Inspect first SQL body difference at database line {FormatNullableInt(firstBodyDifference.DatabaseLine)} and local file line {FormatNullableInt(firstBodyDifference.FileLine)}.");
+        }
+
+        nextActions.AddRange(ModuleCompareNextActions);
+        if (!diff.Equal && diff.Mode == "summary")
+        {
+            nextActions.Add("Use diffMode=compact to include surrounding line text for changed hunks.");
+        }
+
+        return nextActions.ToArray();
+    }
+
     private static string ClassifyModuleFileDifference(bool exactMatch, bool normalizedMatch, bool sqlNormalizedMatch)
     {
         if (exactMatch)
@@ -2700,18 +2743,18 @@ public sealed class SqlMetadataService
     private static string BuildModuleFileComparisonSummary(
         FileInfo file,
         ModuleFileDiff diff,
+        ModuleChangedLineSummary changedLineSummary,
         bool exactMatch,
         bool normalizedMatch,
         bool sqlNormalizedMatch,
         string differenceKind,
         ModuleBodyDifference? firstBodyDifference)
     {
-        var returnedDiffLineCount = diff.Hunks.Sum(hunk => hunk.DatabaseLines.Length + hunk.FileLines.Length);
         var truncatedText = diff.Truncated ? "truncated" : "not truncated";
         var firstBodyText = firstBodyDifference is null
             ? "firstBodyDifference=none"
             : $"firstBodyDifference=body:{firstBodyDifference.BodyLine},db:{FormatNullableInt(firstBodyDifference.DatabaseLine)},file:{FormatNullableInt(firstBodyDifference.FileLine)}";
-        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; sqlNormalizedMatch={FormatBool(sqlNormalizedMatch)}; {diff.Hunks.Length} hunks; changedLines=db:{diff.DatabaseChangedLineCount},file:{diff.FileChangedLineCount}; returnedDiffLines={returnedDiffLineCount}; {firstBodyText}; {truncatedText}";
+        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; sqlNormalizedMatch={FormatBool(sqlNormalizedMatch)}; {diff.Hunks.Length} hunks; changedLines=db:{changedLineSummary.Database},file:{changedLineSummary.File}; returnedDiffLines={changedLineSummary.Returned}; {firstBodyText}; {truncatedText}";
     }
 
     private static string FormatBool(bool value)
@@ -5340,9 +5383,15 @@ public sealed class SqlMetadataService
         string DifferenceKind,
         string[] IgnoredWrapperDifferences,
         ModuleBodyDifference? FirstBodyDifference,
+        ModuleChangedLineSummary ChangedLineSummary,
         string Summary,
         ModuleFileDiff Diff,
         string[] NextActions);
+
+    internal sealed record ModuleChangedLineSummary(
+        int Database,
+        int File,
+        int Returned);
 
     internal sealed record ModuleBodyDifference(
         int BodyLine,
