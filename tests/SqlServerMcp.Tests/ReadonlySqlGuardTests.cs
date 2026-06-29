@@ -11,6 +11,7 @@ public sealed class ReadonlySqlGuardTests
     [InlineData("WITH x AS (SELECT TOP 100 A.id FROM dbo.TableA A) SELECT A.id FROM x A;")]
     [InlineData("SELECT N'UPDATE dbo.TableA SET name = N''x''' AS sample_text;")]
     [InlineData("SELECT * FROM sys.dm_db_partition_stats;")]
+    [InlineData("SELECT * FROM sys.dm_exec_describe_first_result_set(N'SELECT 1 AS id', NULL, 0);")]
     public void ValidateReadonlyQuery_AllowsExpectedSelects(string sql)
     {
         var guard = new ReadonlySqlGuard(CreateOptions());

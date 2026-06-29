@@ -11,6 +11,11 @@ public sealed class ReadonlySqlGuard
         "sys.dm_db_partition_stats"
     };
 
+    private static readonly HashSet<string> AllowedReadOnlyMetadataFunctions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "sys.dm_exec_describe_first_result_set"
+    };
+
     private readonly SqlServerMcpOptions _options;
 
     public ReadonlySqlGuard(SqlServerMcpOptions options)
@@ -194,6 +199,11 @@ public sealed class ReadonlySqlGuard
             }
 
             if (AllowedDatabaseScopedDmvs.Contains(twoPartName))
+            {
+                return;
+            }
+
+            if (AllowedReadOnlyMetadataFunctions.Contains(twoPartName))
             {
                 return;
             }

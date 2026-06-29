@@ -323,15 +323,18 @@ public sealed class SqlMetadataService
             })
             .ToArray();
 
+        var hint = truncated
+            ? "Narrow keyword terms, pass objectTypes, or increase limit within the configured server cap."
+            : null;
+
         return new
         {
             items,
             count = items.Length,
             limit = effectiveLimit,
             truncated,
-            hint = truncated
-                ? "Narrow keyword terms, pass objectTypes, or increase limit within the configured server cap."
-                : null
+            resultInfo = BuildResultInfo(items.Length, effectiveLimit, truncated, hint, truncated ? "limit" : null),
+            hint
         };
     }
 
@@ -482,15 +485,20 @@ public sealed class SqlMetadataService
             },
             cancellationToken);
 
+        var items = rows.Take(effectiveLimit).ToArray();
+        var truncated = rows.Count > effectiveLimit;
+        var hint = truncated
+            ? "Use exact=true for a specific column, add a narrower column search text, or increase limit within the configured cap."
+            : null;
+
         return new
         {
-            items = rows.Take(effectiveLimit).ToArray(),
-            count = Math.Min(rows.Count, effectiveLimit),
+            items,
+            count = items.Length,
             limit = effectiveLimit,
-            truncated = rows.Count > effectiveLimit,
-            hint = rows.Count > effectiveLimit
-                ? "Use exact=true for a specific column, add a narrower column search text, or increase limit within the configured cap."
-                : null
+            truncated,
+            resultInfo = BuildResultInfo(items.Length, effectiveLimit, truncated, hint, truncated ? "limit" : null),
+            hint
         };
     }
 
@@ -599,15 +607,18 @@ public sealed class SqlMetadataService
         var items = rows.Take(effectiveLimit).ToArray();
         var truncated = rows.Count > effectiveLimit;
 
+        var hint = truncated
+            ? "Use objectTypes or get_module_definition with keyword/startLine to inspect a narrower module slice."
+            : null;
+
         return new
         {
             items,
             count = items.Length,
             limit = effectiveLimit,
             truncated,
-            hint = truncated
-                ? "Use objectTypes or get_module_definition with keyword/startLine to inspect a narrower module slice."
-                : null
+            resultInfo = BuildResultInfo(items.Length, effectiveLimit, truncated, hint, truncated ? "limit" : null),
+            hint
         };
     }
 
@@ -630,6 +641,10 @@ public sealed class SqlMetadataService
             endLine,
             contextLines,
             _options.Limits.MaxRows);
+
+        var hint = slice.Truncated
+            ? "Use a narrower keyword, smaller line range, or lower contextLines."
+            : null;
 
         return new
         {
@@ -655,6 +670,21 @@ public sealed class SqlMetadataService
                 slice.Truncated,
                 slice.MatchedLines
             },
+            resultInfo = BuildResultInfo(
+                slice.SelectedLineCount,
+                _options.Limits.MaxRows,
+                slice.Truncated,
+                hint,
+                slice.Reason,
+                new
+                {
+                    totalLines = slice.TotalLines,
+                    slice.IsPartial,
+                    slice.StartLine,
+                    slice.EndLine,
+                    matchedLineCount = slice.MatchedLines.Length
+                }),
+            hint,
             lines = includeLineNumbers || slice.IsPartial
                 ? slice.Lines
                 : null
@@ -788,6 +818,26 @@ public sealed class SqlMetadataService
         var columnMatchesTruncated = columnMatchesRaw.Length > effectiveLimit;
         var moduleMatchesTruncated = moduleMatchesRaw.Length > effectiveLimit;
 
+        var truncated = columnMatchesTruncated || moduleMatchesTruncated;
+        var sections = new
+        {
+            columnMatches = new
+            {
+                count = columnMatches.Length,
+                limit = effectiveLimit,
+                truncated = columnMatchesTruncated
+            },
+            moduleMatches = new
+            {
+                count = moduleMatches.Length,
+                limit = effectiveLimit,
+                truncated = moduleMatchesTruncated
+            }
+        };
+        var hint = truncated
+            ? "Pass schema/objectTypes, use a more specific token, or inspect modules with get_module_definition keyword slices."
+            : null;
+
         return new
         {
             name,
@@ -797,23 +847,16 @@ public sealed class SqlMetadataService
             columnMatchCount = columnMatches.Length,
             moduleMatchCount = moduleMatches.Length,
             limit = effectiveLimit,
-            truncated = columnMatchesTruncated || moduleMatchesTruncated,
-            sections = new
-            {
-                columnMatches = new
-                {
-                    count = columnMatches.Length,
-                    truncated = columnMatchesTruncated
-                },
-                moduleMatches = new
-                {
-                    count = moduleMatches.Length,
-                    truncated = moduleMatchesTruncated
-                }
-            },
-            hint = columnMatchesTruncated || moduleMatchesTruncated
-                ? "Pass schema/objectTypes, use a more specific token, or inspect modules with get_module_definition keyword slices."
-                : null
+            truncated,
+            sections,
+            resultInfo = BuildResultInfo(
+                columnMatches.Length + moduleMatches.Length,
+                effectiveLimit * 2,
+                truncated,
+                hint,
+                truncated ? "limit" : null,
+                sections),
+            hint
         };
     }
 
@@ -869,6 +912,10 @@ public sealed class SqlMetadataService
             items.AddRange(targetRows);
         }
 
+        var hint = truncated
+            ? "Use profile, a narrower keyword, or increase limit within the configured server cap."
+            : null;
+
         return new
         {
             keyword,
@@ -893,9 +940,8 @@ public sealed class SqlMetadataService
             count = items.Count,
             truncated,
             limit = effectiveLimit,
-            hint = truncated
-                ? "Use profile, a narrower keyword, or increase limit within the configured server cap."
-                : null
+            resultInfo = BuildResultInfo(items.Count, effectiveLimit, truncated, hint, truncated ? "limit" : null),
+            hint
         };
     }
 
@@ -1093,31 +1139,58 @@ public sealed class SqlMetadataService
         }
 
         stopwatch.Stop();
+        var queryTruncated = rowLimitTruncated || truncation.TextValuesTruncated > 0;
+        var truncationReasons = new List<string>();
+        if (rowLimitTruncated)
+        {
+            truncationReasons.Add("maxRows");
+        }
+
+        if (truncation.TextValuesTruncated > 0)
+        {
+            truncationReasons.Add("maxTextLength");
+        }
+
+        var hint = rowLimitTruncated
+            ? "Add WHERE filters, select fewer rows, or raise maxRows within the configured server cap."
+            : truncation.TextValuesTruncated > 0
+                ? "Select shorter expressions, use SUBSTRING in SQL, or raise limits.maxTextLength in config."
+                : null;
+
+        var columnsWithTruncatedText = truncation.ColumnsWithTruncatedText.OrderBy(column => column).ToArray();
+
         return new
         {
             columns,
             rows,
             rowCount = rows.Count,
             truncated = rowLimitTruncated,
+            resultInfo = BuildResultInfo(
+                rows.Count,
+                effectiveMaxRows,
+                queryTruncated,
+                hint,
+                truncationReasons.Count == 0 ? null : string.Join(",", truncationReasons),
+                new
+                {
+                    rowLimitTruncated,
+                    textValuesTruncated = truncation.TextValuesTruncated,
+                    columnsWithTruncatedText,
+                    maxTextLength = _options.Limits.MaxTextLength,
+                    maxResultMb = _options.Limits.MaxResultMb,
+                    estimatedBytes
+                }),
             truncation = new
             {
                 rowLimitTruncated,
                 textValuesTruncated = truncation.TextValuesTruncated,
-                columnsWithTruncatedText = truncation.ColumnsWithTruncatedText.OrderBy(column => column).ToArray(),
+                columnsWithTruncatedText,
                 maxRows = effectiveMaxRows,
                 maxTextLength = _options.Limits.MaxTextLength,
                 maxResultMb = _options.Limits.MaxResultMb,
                 estimatedBytes,
-                reason = rowLimitTruncated
-                    ? "maxRows"
-                    : truncation.TextValuesTruncated > 0
-                        ? "maxTextLength"
-                        : null,
-                hint = rowLimitTruncated
-                    ? "Add WHERE filters, select fewer rows, or raise maxRows within the configured server cap."
-                    : truncation.TextValuesTruncated > 0
-                        ? "Select shorter expressions, use SUBSTRING in SQL, or raise limits.maxTextLength in config."
-                        : null
+                reason = truncationReasons.Count == 0 ? null : string.Join(",", truncationReasons),
+                hint
             },
             parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
             elapsedMs = stopwatch.ElapsedMilliseconds
@@ -1245,6 +1318,25 @@ public sealed class SqlMetadataService
             resolvedName = resolution.Object.Name,
             resolvedFromPrefix = resolution.ResolvedFromPrefix,
             usedFallback = resolution.UsedFallback
+        };
+    }
+
+    private static object BuildResultInfo(
+        int returned,
+        int? limit,
+        bool truncated,
+        string? hint,
+        string? reason = null,
+        object? sections = null)
+    {
+        return new
+        {
+            returned,
+            limit,
+            truncated,
+            reason,
+            hint,
+            sections
         };
     }
 

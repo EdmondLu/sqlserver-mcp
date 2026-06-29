@@ -13,8 +13,9 @@ A Windows-first, read-only [Model Context Protocol](https://modelcontextprotocol
 - 20 focused tools for connection checks, object discovery, schema inspection, dependency analysis, SQL module search, read-only queries, and estimated query plans.
 - Lazy database connections: startup registers tools but does not connect to SQL Server or scan the database.
 - Credentials are read from Windows Credential Manager and are never stored in the JSON config.
-- A ScriptDom-based guard accepts one `SELECT` or `WITH` query and rejects writes, DDL, execution, cross-database references, server-level DMVs, linked-server access, and bulk/external rowsets.
+- A ScriptDom-based guard accepts one `SELECT` or `WITH` query and rejects writes, DDL, execution, cross-database references, server-level DMVs, linked-server access, and bulk/external rowsets, while allowing selected read-only metadata functions.
 - Result row, payload, text-length, lock-wait, command, and connection limits are configurable.
+- Bounded tools include a `resultInfo` block that summarizes returned rows/items, limits, truncation reasons, and narrowing hints.
 - MCP protocol output stays on stdout; application logs are written to files.
 
 The SQL guard is defense in depth, not a replacement for SQL Server permissions. Always use a dedicated least-privilege login with read-only database access.
@@ -115,6 +116,8 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `describe_query_result` | Describe guarded query result columns without executing the query |
 | `explain_query_plan` | Return estimated SHOWPLAN XML plus statement, memory, warning, and risk summaries without executing the query |
 | `reload_connection` | Clear cached credentials and SQL connection pools |
+
+Search, definition-slice, configuration-text, usage, and read-only query tools expose `resultInfo` for consistent returned-count, limit, truncation, reason, and hint metadata.
 
 Structure tools recognize the legacy view prefixes `vwp_`, `vwpr_`, `vwt_`, and `vwtr_`, and try the corresponding unprefixed physical table first.
 

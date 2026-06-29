@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## 1.8.0 - 2026-06-29
+
+- Added a unified `resultInfo` block to bounded or truncation-prone tool responses while preserving existing `count`, `limit`, `truncated`, and `hint` fields.
+- Allowed the read-only metadata function `sys.dm_exec_describe_first_result_set` through the SQL guard without allowing broader server-level DMVs.
+
 ## 1.7.0 - 2026-06-29
 
 - Enhanced `explain_query_plan` summaries with statement cards, memory grant aggregation, warning counters, spill/no-join/optimizer-early-abort risks, and large-memory-grant hints.
