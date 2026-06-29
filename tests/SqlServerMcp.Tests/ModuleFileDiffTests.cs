@@ -46,4 +46,87 @@ public sealed class ModuleFileDiffTests
         Assert.Contains(hunk.DatabaseLines, line => line.LineNumber == 3 && !line.Changed);
         Assert.Contains(hunk.FileLines, line => line.LineNumber == 5 && !line.Changed);
     }
+
+    [Fact]
+    public void FindModuleSqlFileDiscovery_SelectsSchemaQualifiedFile()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var procedures = Directory.CreateDirectory(Path.Combine(root, "procedures"));
+            File.WriteAllText(Path.Combine(procedures.FullName, "dbo.SampleProc.sql"), "CREATE PROC dbo.SampleProc AS SELECT 1");
+            File.WriteAllText(Path.Combine(procedures.FullName, "SampleProc_old.sql"), "CREATE PROC dbo.SampleProc AS SELECT 2");
+
+            var discovery = SqlMetadataService.FindModuleSqlFileDiscovery(root, "dbo", "SampleProc", null, null);
+
+            Assert.False(discovery.Ambiguous);
+            Assert.NotNull(discovery.SelectedCandidate);
+            Assert.EndsWith("dbo.SampleProc.sql", discovery.SelectedCandidate.Path);
+            Assert.Contains("schema-qualified file name", discovery.SelectedCandidate.Reasons);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FindModuleSqlFileDiscovery_ReturnsAmbiguousForTiedTopCandidates()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "a"));
+            Directory.CreateDirectory(Path.Combine(root, "b"));
+            File.WriteAllText(Path.Combine(root, "a", "SampleProc.sql"), "SELECT 1");
+            File.WriteAllText(Path.Combine(root, "b", "SampleProc.sql"), "SELECT 2");
+
+            var discovery = SqlMetadataService.FindModuleSqlFileDiscovery(root, "dbo", "SampleProc", null, null);
+
+            Assert.True(discovery.Ambiguous);
+            Assert.Null(discovery.SelectedCandidate);
+            Assert.Equal(2, discovery.CandidateCount);
+            Assert.Equal(discovery.Candidates[0].Score, discovery.Candidates[1].Score);
+            Assert.All(discovery.Candidates, candidate => Assert.Contains("exact object file name", candidate.Reasons));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FindModuleSqlFileDiscovery_AppliesPathPatterns()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "procedures"));
+            Directory.CreateDirectory(Path.Combine(root, "archive"));
+            File.WriteAllText(Path.Combine(root, "procedures", "SampleProc.sql"), "SELECT 1");
+            File.WriteAllText(Path.Combine(root, "archive", "SampleProc.sql"), "SELECT 2");
+
+            var discovery = SqlMetadataService.FindModuleSqlFileDiscovery(
+                root,
+                "dbo",
+                "SampleProc",
+                ["procedures/*.sql"],
+                null);
+
+            var candidate = Assert.Single(discovery.Candidates);
+            Assert.Equal("procedures/SampleProc.sql", candidate.RelativePath);
+            Assert.Same(candidate, discovery.SelectedCandidate);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static string CreateTempRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "SqlServerMcpTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        return root;
+    }
 }

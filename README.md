@@ -105,9 +105,10 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `get_indexes` | Inspect index metadata |
 | `get_constraints` | Inspect key, unique, default, and check constraints |
 | `get_foreign_keys` | Inspect incoming and outgoing foreign keys |
-| `search_sql_modules` | Search SQL module definitions |
+| `search_sql_modules` | Search SQL module definitions with next-step compare hints |
 | `get_module_definition` | Read a module definition, optionally by keyword or line range |
-| `compare_module_to_file` | Compare a database module definition with a local file |
+| `compare_module_to_file` | Compare a database module definition with a known local file |
+| `compare_module_to_repo` | Auto-discover matching repository `.sql` files and compare the best unambiguous candidate with the database module |
 | `analyze_module_temp_tables` | Analyze local temp table creation, usage, multiline statements, and column flow inside a module |
 | `get_dependencies` | Find incoming and outgoing dependencies |
 | `find_usage` | Find object, column, or token usage |

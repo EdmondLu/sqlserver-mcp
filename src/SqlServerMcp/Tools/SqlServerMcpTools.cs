@@ -100,7 +100,7 @@ public static class SqlServerMcpTools
         return service.GetForeignKeysAsync(schema, name, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Search SQL module definitions by keyword and return snippets. Use get_module_definition with keyword/startLine for deeper inspection of a selected module.")]
+    [McpServerTool(ReadOnly = true), Description("Search SQL module definitions by keyword and return snippets. Use get_module_definition with keyword/startLine for deeper inspection, or compare_module_to_file/compare_module_to_repo to confirm whether a local SQL file matches the database object.")]
     public static Task<string> SearchSqlModules(
         SqlServerToolService service,
         [Description("Keyword text to search in sys.sql_modules.definition.")] string keyword,
@@ -111,7 +111,7 @@ public static class SqlServerMcpTools
         return service.SearchSqlModulesAsync(keyword, objectTypes, limit, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Return a view, procedure, function, or trigger definition. Optionally return a line range or keyword-centered slices with line numbers.")]
+    [McpServerTool(ReadOnly = true), Description("Return a view, procedure, function, or trigger definition. Optionally return a line range or keyword-centered slices with line numbers. Response includes compare hints for local SQL file vs database object checks.")]
     public static Task<string> GetModuleDefinition(
         SqlServerToolService service,
         [Description("Schema name, usually dbo.")] string schema,
@@ -134,7 +134,7 @@ public static class SqlServerMcpTools
             cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Compare a SQL Server module definition with a local file path, returning hashes, modify times, match flags, and compact line diff context.")]
+    [McpServerTool(ReadOnly = true), Description("Compare a SQL Server module definition with a known local .sql file path. Use to confirm whether a repository SQL file has been executed to the database, whether the database procedure/function/view/trigger matches the local file, and what local-vs-target diff remains.")]
     public static Task<string> CompareModuleToFile(
         SqlServerToolService service,
         [Description("Schema name, usually dbo.")] string schema,
@@ -144,6 +144,20 @@ public static class SqlServerMcpTools
         CancellationToken cancellationToken = default)
     {
         return service.CompareModuleToFileAsync(schema, name, filePath, contextLines, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Auto-discover matching .sql files under a local repository/folder, then compare the best unambiguous candidate with a SQL Server module definition. Use when checking whether a repo SQL script has already been deployed to the target database.")]
+    public static Task<string> CompareModuleToRepo(
+        SqlServerToolService service,
+        [Description("Schema name, usually dbo.")] string schema,
+        [Description("Module name.")] string name,
+        [Description("Optional repository/folder root. Defaults to the MCP process current directory.")] string? root = null,
+        [Description("Optional path glob patterns such as **/*.sql, procedures/*.sql, or *proc*.sql. Defaults to **/*.sql.")] string[]? patterns = null,
+        [Description("Maximum ranked candidates to return when discovery is empty or ambiguous. Defaults to 10 and is capped.")] int? maxCandidates = null,
+        [Description("Context lines around the changed block after a file is selected. Defaults to 5 and is capped.")] int? contextLines = null,
+        CancellationToken cancellationToken = default)
+    {
+        return service.CompareModuleToRepoAsync(schema, name, root, patterns, maxCandidates, contextLines, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Analyze local temp table usage inside a stored procedure, function, trigger, or view definition, including CREATE TABLE, SELECT INTO, writes, reads, joins, and line numbers.")]

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 1.11.0 - 2026-06-29
+
+- Added `compare_module_to_repo` to auto-discover matching local repository `.sql` files and compare the best unambiguous candidate with a database module definition.
+- Strengthened `compare_module_to_file`, `search_sql_modules`, and `get_module_definition` discoverability for local SQL file vs target database deployment checks.
+- Added module compare next-action hints and candidate discovery metadata for ambiguous repository matches.
+
 ## 1.10.0 - 2026-06-29
 
 - Added `search_config_text.usableOnly` for filtering to usable/enabled/active rows when a target table has a matching status column.

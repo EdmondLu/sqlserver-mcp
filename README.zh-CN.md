@@ -73,13 +73,15 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 - `find_objects`、`find_column`、`find_usage`
 - `describe_table`、`get_object_overview`
 - `get_indexes`、`get_constraints`、`get_foreign_keys`
-- `search_sql_modules`、`get_module_definition`、`compare_module_to_file`、`analyze_module_temp_tables`、`get_dependencies`
+- `search_sql_modules`、`get_module_definition`、`compare_module_to_file`、`compare_module_to_repo`、`analyze_module_temp_tables`、`get_dependencies`
 - `search_config_text`、`run_readonly_query`、`describe_query_result`、`explain_query_plan`
 - `reload_connection`
 
 `explain_query_plan` 返回原始 SHOWPLAN XML，同时附带语句、内存授予、warning、扫描、缺失索引、隐式转换、排序、hash、lookup、并行等结构化摘要。
 
 `analyze_module_temp_tables` 会分析模块内本地临时表的创建、读写、JOIN、跨行 INSERT/SELECT INTO/UPDATE 和字段流转摘要。
+
+`compare_module_to_file` 适合已知道本地 SQL 文件路径时确认“仓库 SQL 是否已执行到数据库”；`compare_module_to_repo` 可按对象名在本地仓库/目录下自动发现 `.sql` 候选文件，唯一高分候选会直接比较，并列候选会返回列表让调用方收窄路径。
 
 搜索、模块定义切片、配置文本搜索、用法搜索和只读查询工具都会返回 `resultInfo`，用于统一判断结果是否被限制、为什么被截断以及下一步该如何缩小范围。
 

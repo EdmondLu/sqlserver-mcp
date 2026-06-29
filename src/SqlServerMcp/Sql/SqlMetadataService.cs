@@ -16,7 +16,38 @@ public sealed class SqlMetadataService
     private const int DefaultModuleContextLines = 3;
     private const int MaxModuleContextLines = 50;
     private const long MaxCompareFileBytes = 10 * 1024 * 1024;
+    private const int DefaultRepoCompareCandidateLimit = 10;
+    private const int MaxRepoCompareCandidateLimit = 50;
+    private const int MaxRepoCompareFilesScanned = 20_000;
     private static readonly Regex TempTableNameRegex = new(@"(?<![#\w])#[A-Za-z_][A-Za-z0-9_]*", RegexOptions.Compiled);
+    private static readonly string[] DefaultRepoComparePatterns = ["**/*.sql"];
+    private static readonly string[] ModuleSearchNextActions =
+    [
+        "Use get_module_definition with keyword/startLine for line-numbered slices.",
+        "Use compare_module_to_file when you already know the local SQL file path.",
+        "Use compare_module_to_repo to auto-discover a matching repository .sql file and compare it with the database module."
+    ];
+    private static readonly string[] ModuleDefinitionNextActions =
+    [
+        "Use compare_module_to_file to confirm whether a known local SQL file has been executed to the database.",
+        "Use compare_module_to_repo to auto-discover a matching repository .sql file and compare it with this database module."
+    ];
+    private static readonly string[] ModuleCompareNextActions =
+    [
+        "If the result differs, deploy the local SQL file to the target database or inspect the diff before changing the database.",
+        "If the file path was guessed, use compare_module_to_repo with a narrower root or patterns to confirm the intended source file."
+    ];
+    private static readonly HashSet<string> RepoCompareSkippedDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".git",
+        ".svn",
+        ".hg",
+        ".vs",
+        "bin",
+        "obj",
+        "node_modules",
+        "packages"
+    };
     private static readonly string[] UsableColumnCandidates =
     [
         "usable",
@@ -629,7 +660,8 @@ public sealed class SqlMetadataService
             limit = effectiveLimit,
             truncated,
             resultInfo = BuildResultInfo(items.Length, effectiveLimit, truncated, hint, truncated ? "limit" : null),
-            hint
+            hint,
+            nextActions = ModuleSearchNextActions
         };
     }
 
@@ -696,6 +728,7 @@ public sealed class SqlMetadataService
                     matchedLineCount = slice.MatchedLines.Length
                 }),
             hint,
+            nextActions = ModuleDefinitionNextActions,
             lines = includeLineNumbers || slice.IsPartial
                 ? slice.Lines
                 : null
@@ -711,11 +744,40 @@ public sealed class SqlMetadataService
     {
         var module = await GetModuleDefinitionCoreAsync(schema, name, cancellationToken);
         var file = GetReadableCompareFile(filePath);
-        var fileText = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
-        var effectiveContextLines = Math.Clamp(contextLines ?? 5, 0, MaxModuleContextLines);
-        var dbNormalized = NormalizeTextForComparison(module.Definition);
-        var fileNormalized = NormalizeTextForComparison(fileText);
-        var diff = BuildLineDiff(module.Definition, fileText, effectiveContextLines);
+        return await BuildModuleFileComparisonAsync(module, file, contextLines, cancellationToken);
+    }
+
+    public async Task<object> CompareModuleToRepoAsync(
+        string schema,
+        string name,
+        string? root,
+        string[]? patterns,
+        int? maxCandidates,
+        int? contextLines,
+        CancellationToken cancellationToken)
+    {
+        var module = await GetModuleDefinitionCoreAsync(schema, name, cancellationToken);
+        var discovery = FindModuleSqlFileDiscovery(root, module.Schema, module.Name, patterns, maxCandidates);
+        if (discovery.SelectedCandidate is null)
+        {
+            return new
+            {
+                schema = module.Schema,
+                name = module.Name,
+                type = module.Type,
+                typeDesc = module.TypeDesc,
+                compared = false,
+                discovery,
+                nextActions = new[]
+                {
+                    "Pass filePath to compare_module_to_file when you know the exact SQL file.",
+                    "Pass root or patterns to compare_module_to_repo to narrow repository file discovery."
+                }
+            };
+        }
+
+        var selectedFile = GetReadableCompareFile(discovery.SelectedCandidate.Path);
+        var comparison = await BuildModuleFileComparisonAsync(module, selectedFile, contextLines, cancellationToken);
 
         return new
         {
@@ -723,28 +785,13 @@ public sealed class SqlMetadataService
             name = module.Name,
             type = module.Type,
             typeDesc = module.TypeDesc,
-            database = new
-            {
-                module.CreateDate,
-                module.ModifyDate,
-                definitionLength = module.Definition.Length,
-                lineCount = SplitDefinitionLines(module.Definition).Length,
-                sha256 = ComputeSha256Hex(module.Definition),
-                normalizedSha256 = ComputeSha256Hex(dbNormalized)
-            },
-            file = new
-            {
-                path = file.FullName,
-                lengthBytes = file.Length,
-                lastWriteTime = file.LastWriteTime,
-                textLength = fileText.Length,
-                lineCount = SplitDefinitionLines(fileText).Length,
-                sha256 = ComputeSha256Hex(fileText),
-                normalizedSha256 = ComputeSha256Hex(fileNormalized)
-            },
-            exactMatch = string.Equals(module.Definition, fileText, StringComparison.Ordinal),
-            normalizedMatch = string.Equals(dbNormalized, fileNormalized, StringComparison.Ordinal),
-            diff
+            compared = true,
+            discovery,
+            selectedFile = discovery.SelectedCandidate,
+            comparison,
+            exactMatch = comparison.ExactMatch,
+            normalizedMatch = comparison.NormalizedMatch,
+            nextActions = ModuleCompareNextActions
         };
     }
 
@@ -2348,6 +2395,327 @@ public sealed class SqlMetadataService
         }
 
         return file;
+    }
+
+    private static DirectoryInfo GetReadableCompareRoot(string? root)
+    {
+        var effectiveRoot = string.IsNullOrWhiteSpace(root)
+            ? Directory.GetCurrentDirectory()
+            : root.Trim();
+        var fullPath = Path.GetFullPath(effectiveRoot);
+        var directory = new DirectoryInfo(fullPath);
+        if (!directory.Exists)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Repository root was not found.",
+                fullPath,
+                "Pass an existing local repository or folder path in root.");
+        }
+
+        return directory;
+    }
+
+    private async Task<ModuleFileComparisonResult> BuildModuleFileComparisonAsync(
+        ModuleDefinitionInfo module,
+        FileInfo file,
+        int? contextLines,
+        CancellationToken cancellationToken)
+    {
+        var fileText = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
+        var effectiveContextLines = Math.Clamp(contextLines ?? 5, 0, MaxModuleContextLines);
+        var dbNormalized = NormalizeTextForComparison(module.Definition);
+        var fileNormalized = NormalizeTextForComparison(fileText);
+        var diff = BuildLineDiff(module.Definition, fileText, effectiveContextLines);
+
+        return new ModuleFileComparisonResult(
+            module.Schema,
+            module.Name,
+            module.Type,
+            module.TypeDesc,
+            new ModuleCompareDatabaseInfo(
+                module.CreateDate,
+                module.ModifyDate,
+                module.Definition.Length,
+                SplitDefinitionLines(module.Definition).Length,
+                ComputeSha256Hex(module.Definition),
+                ComputeSha256Hex(dbNormalized)),
+            new ModuleCompareFileInfo(
+                file.FullName,
+                file.Length,
+                file.LastWriteTime,
+                fileText.Length,
+                SplitDefinitionLines(fileText).Length,
+                ComputeSha256Hex(fileText),
+                ComputeSha256Hex(fileNormalized)),
+            string.Equals(module.Definition, fileText, StringComparison.Ordinal),
+            string.Equals(dbNormalized, fileNormalized, StringComparison.Ordinal),
+            diff,
+            ModuleCompareNextActions);
+    }
+
+    internal static ModuleSqlFileDiscovery FindModuleSqlFileDiscovery(
+        string? root,
+        string schema,
+        string name,
+        string[]? patterns,
+        int? maxCandidates)
+    {
+        var directory = GetReadableCompareRoot(root);
+        var effectivePatterns = NormalizeRepoComparePatterns(patterns);
+        var effectiveMaxCandidates = Math.Clamp(maxCandidates ?? DefaultRepoCompareCandidateLimit, 1, MaxRepoCompareCandidateLimit);
+        var candidates = new List<ModuleSqlFileCandidate>();
+        var scannedFileCount = 0;
+        var searchTruncated = false;
+
+        foreach (var file in EnumerateSqlFiles(directory))
+        {
+            if (scannedFileCount >= MaxRepoCompareFilesScanned)
+            {
+                searchTruncated = true;
+                break;
+            }
+
+            scannedFileCount++;
+            var relativePath = Path.GetRelativePath(directory.FullName, file.FullName).Replace('\\', '/');
+            if (!MatchesRepoComparePatterns(relativePath, file.Name, effectivePatterns))
+            {
+                continue;
+            }
+
+            var candidate = BuildModuleSqlFileCandidate(directory, file, relativePath, schema, name);
+            if (candidate.Score > 0)
+            {
+                candidates.Add(candidate);
+            }
+        }
+
+        var orderedCandidates = candidates
+            .OrderByDescending(candidate => candidate.Score)
+            .ThenBy(candidate => candidate.RelativePath.Length)
+            .ThenBy(candidate => candidate.RelativePath, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var visibleCandidates = orderedCandidates.Take(effectiveMaxCandidates).ToArray();
+        var topScore = orderedCandidates.FirstOrDefault()?.Score;
+        var topScoreCount = topScore is null
+            ? 0
+            : orderedCandidates.Count(candidate => candidate.Score == topScore.Value);
+        var selectedCandidate = topScoreCount == 1
+            ? orderedCandidates[0]
+            : null;
+        var ambiguous = orderedCandidates.Length > 0 && selectedCandidate is null;
+        var hint = BuildRepoCompareDiscoveryHint(orderedCandidates.Length, ambiguous, searchTruncated);
+
+        return new ModuleSqlFileDiscovery(
+            directory.FullName,
+            effectivePatterns,
+            scannedFileCount,
+            searchTruncated,
+            orderedCandidates.Length,
+            orderedCandidates.Length > effectiveMaxCandidates,
+            visibleCandidates,
+            selectedCandidate,
+            ambiguous,
+            hint);
+    }
+
+    private static string[] NormalizeRepoComparePatterns(string[]? patterns)
+    {
+        var normalized = patterns?
+            .Select(pattern => pattern?.Trim().Replace('\\', '/'))
+            .Where(pattern => !string.IsNullOrWhiteSpace(pattern))
+            .Select(pattern => pattern!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return normalized is { Length: > 0 }
+            ? normalized
+            : DefaultRepoComparePatterns;
+    }
+
+    private static IEnumerable<FileInfo> EnumerateSqlFiles(DirectoryInfo root)
+    {
+        var pending = new Stack<DirectoryInfo>();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            var directory = pending.Pop();
+            foreach (var child in SafeEnumerateDirectories(directory))
+            {
+                if (!RepoCompareSkippedDirectoryNames.Contains(child.Name))
+                {
+                    pending.Push(child);
+                }
+            }
+
+            foreach (var file in SafeEnumerateFiles(directory))
+            {
+                yield return file;
+            }
+        }
+    }
+
+    private static DirectoryInfo[] SafeEnumerateDirectories(DirectoryInfo directory)
+    {
+        try
+        {
+            return directory.EnumerateDirectories().ToArray();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+    }
+
+    private static FileInfo[] SafeEnumerateFiles(DirectoryInfo directory)
+    {
+        try
+        {
+            return directory.EnumerateFiles("*.sql").ToArray();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+    }
+
+    private static bool MatchesRepoComparePatterns(string relativePath, string fileName, string[] patterns)
+    {
+        return patterns.Any(pattern =>
+            GlobMatches(relativePath, pattern)
+            || (!pattern.Contains('/', StringComparison.Ordinal) && GlobMatches(fileName, pattern)));
+    }
+
+    private static bool GlobMatches(string value, string pattern)
+    {
+        var normalizedPattern = pattern.Replace('\\', '/');
+        return Regex.IsMatch(value, GlobToRegex(normalizedPattern), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+               || (normalizedPattern.StartsWith("**/", StringComparison.Ordinal)
+                   && Regex.IsMatch(value, GlobToRegex(normalizedPattern[3..]), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant));
+    }
+
+    private static string GlobToRegex(string pattern)
+    {
+        var builder = new StringBuilder("^");
+        for (var i = 0; i < pattern.Length; i++)
+        {
+            var current = pattern[i];
+            if (current == '*')
+            {
+                if (i + 1 < pattern.Length && pattern[i + 1] == '*')
+                {
+                    builder.Append(".*");
+                    i++;
+                }
+                else
+                {
+                    builder.Append("[^/]*");
+                }
+            }
+            else if (current == '?')
+            {
+                builder.Append("[^/]");
+            }
+            else
+            {
+                builder.Append(Regex.Escape(current.ToString()));
+            }
+        }
+
+        builder.Append('$');
+        return builder.ToString();
+    }
+
+    private static ModuleSqlFileCandidate BuildModuleSqlFileCandidate(
+        DirectoryInfo root,
+        FileInfo file,
+        string relativePath,
+        string schema,
+        string name)
+    {
+        var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(file.Name);
+        var schemaDotName = $"{schema}.{name}";
+        var schemaUnderscoreName = $"{schema}_{name}";
+        var reasons = new List<string>();
+        var score = 0;
+
+        if (fileNameWithoutExtension.Equals(schemaDotName, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 160;
+            reasons.Add("schema-qualified file name");
+        }
+
+        if (fileNameWithoutExtension.Equals(schemaUnderscoreName, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 150;
+            reasons.Add("schema-qualified underscore file name");
+        }
+
+        if (fileNameWithoutExtension.Equals(name, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 140;
+            reasons.Add("exact object file name");
+        }
+
+        if (fileNameWithoutExtension.EndsWith($".{name}", StringComparison.OrdinalIgnoreCase)
+            || fileNameWithoutExtension.EndsWith($"_{name}", StringComparison.OrdinalIgnoreCase))
+        {
+            score += 90;
+            reasons.Add("file name suffix matches object name");
+        }
+
+        if (fileNameWithoutExtension.Contains(name, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 60;
+            reasons.Add("file name contains object name");
+        }
+
+        if (relativePath.Contains(schemaDotName, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 40;
+            reasons.Add("relative path contains schema.object");
+        }
+
+        var pathParts = relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (pathParts.Any(part => part.Equals(schema, StringComparison.OrdinalIgnoreCase)))
+        {
+            score += 20;
+            reasons.Add("path contains schema folder");
+        }
+
+        if (pathParts.Any(part => part.Equals(name, StringComparison.OrdinalIgnoreCase)))
+        {
+            score += 20;
+            reasons.Add("path contains object folder");
+        }
+
+        return new ModuleSqlFileCandidate(
+            file.FullName,
+            relativePath,
+            file.Name,
+            file.Length,
+            file.LastWriteTime,
+            score,
+            reasons.ToArray());
+    }
+
+    private static string? BuildRepoCompareDiscoveryHint(int candidateCount, bool ambiguous, bool searchTruncated)
+    {
+        if (candidateCount == 0)
+        {
+            return searchTruncated
+                ? "No matching .sql file was found before the scan cap. Pass a narrower root or patterns."
+                : "No matching .sql file was found. Pass filePath to compare_module_to_file, or pass root/patterns to narrow repository discovery.";
+        }
+
+        if (ambiguous)
+        {
+            return "Multiple top-ranked .sql candidates were found. Pass filePath to compare_module_to_file, or narrow root/patterns.";
+        }
+
+        return searchTruncated
+            ? "A matching file was selected before the scan cap. Narrow root/patterns if this repository is very large."
+            : null;
     }
 
     private object? ReadValue(SqlDataReader reader, int ordinal, QueryValueTruncationInfo truncation)
@@ -4494,6 +4862,56 @@ public sealed class SqlMetadataService
         DateTime CreateDate,
         DateTime ModifyDate,
         string Definition);
+
+    private sealed record ModuleCompareDatabaseInfo(
+        DateTime CreateDate,
+        DateTime ModifyDate,
+        int DefinitionLength,
+        int LineCount,
+        string Sha256,
+        string NormalizedSha256);
+
+    private sealed record ModuleCompareFileInfo(
+        string Path,
+        long LengthBytes,
+        DateTime LastWriteTime,
+        int TextLength,
+        int LineCount,
+        string Sha256,
+        string NormalizedSha256);
+
+    private sealed record ModuleFileComparisonResult(
+        string Schema,
+        string Name,
+        string Type,
+        string TypeDesc,
+        ModuleCompareDatabaseInfo Database,
+        ModuleCompareFileInfo File,
+        bool ExactMatch,
+        bool NormalizedMatch,
+        ModuleFileDiff Diff,
+        string[] NextActions);
+
+    internal sealed record ModuleSqlFileDiscovery(
+        string Root,
+        string[] Patterns,
+        int ScannedFileCount,
+        bool SearchTruncated,
+        int CandidateCount,
+        bool CandidateListTruncated,
+        ModuleSqlFileCandidate[] Candidates,
+        ModuleSqlFileCandidate? SelectedCandidate,
+        bool Ambiguous,
+        string? Hint);
+
+    internal sealed record ModuleSqlFileCandidate(
+        string Path,
+        string RelativePath,
+        string FileName,
+        long LengthBytes,
+        DateTime LastWriteTime,
+        int Score,
+        string[] Reasons);
 
     internal sealed record ModuleFileDiff(
         bool Equal,

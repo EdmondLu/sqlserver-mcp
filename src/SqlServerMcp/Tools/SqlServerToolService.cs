@@ -147,6 +147,22 @@ public sealed class SqlServerToolService
             name);
     }
 
+    public Task<string> CompareModuleToRepoAsync(
+        string schema,
+        string name,
+        string? root,
+        string[]? patterns,
+        int? maxCandidates,
+        int? contextLines,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "compare_module_to_repo",
+            () => _metadataService.CompareModuleToRepoAsync(schema, name, root, patterns, maxCandidates, contextLines, cancellationToken),
+            schema,
+            name);
+    }
+
     public Task<string> AnalyzeModuleTempTablesAsync(
         string schema,
         string name,
