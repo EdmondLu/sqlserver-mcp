@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 1.9.0 - 2026-06-29
+
+- Enhanced `search_config_text` to search configured metadata columns such as key, name, and labels in addition to the text column, and to return match column, match kind, matched term, and 1-based match position.
+- Made full `search_config_text` target metadata optional through `includeTargets=false` by default for shorter day-to-day responses.
+- Added explicit `templateValues` support to `describe_query_result` for UI SQL placeholders such as `{0}`, with final SQL still validated by the read-only guard.
+
 ## 1.8.0 - 2026-06-29
 
 - Added a unified `resultInfo` block to bounded or truncation-prone tool responses while preserving existing `count`, `limit`, `truncated`, and `hint` fields.

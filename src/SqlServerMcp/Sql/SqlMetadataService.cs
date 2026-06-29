@@ -864,6 +864,7 @@ public sealed class SqlMetadataService
         string keyword,
         string? profile,
         int? limit,
+        bool includeTargets,
         CancellationToken cancellationToken)
     {
         var terms = SplitKeyword(keyword);
@@ -920,22 +921,11 @@ public sealed class SqlMetadataService
         {
             keyword,
             profile,
-            searchedTargets = targets.Select(target => new
-            {
-                target.Profile,
-                target.Schema,
-                target.Table,
-                target.TextColumn,
-                target.KeyColumn,
-                target.NameColumn,
-                target.LabelColumns,
-                target.CreatedAtColumn,
-                target.UpdatedAtColumn,
-                target.CreatedByColumn,
-                target.UpdatedByColumn,
-                target.ContentKind,
-                target.ContentKindColumn
-            }).ToArray(),
+            includeTargets,
+            searchedTargetCount = targets.Length,
+            searchedTargets = includeTargets
+                ? targets.Select(BuildTextSearchTargetSummary).ToArray()
+                : null,
             items,
             count = items.Count,
             truncated,
@@ -986,9 +976,11 @@ public sealed class SqlMetadataService
     public async Task<object> DescribeQueryResultAsync(
         string sql,
         IReadOnlyDictionary<string, object?>? parameters,
+        IReadOnlyDictionary<string, object?>? templateValues,
         CancellationToken cancellationToken)
     {
-        _sqlGuard.ValidateReadonlyQuery(sql);
+        var template = ApplySqlTemplateValues(sql, templateValues);
+        _sqlGuard.ValidateReadonlyQuery(template.Sql);
 
         var parameterSpecs = BuildUserSqlParameters(parameters);
         const string metadataSql = """
@@ -1013,7 +1005,7 @@ public sealed class SqlMetadataService
         var rows = await QueryAsync(
             metadataSql,
             [
-                new("@tsql", SqlDbType.NVarChar, -1) { Value = sql },
+                new("@tsql", SqlDbType.NVarChar, -1) { Value = template.Sql },
                 new("@params", SqlDbType.NVarChar, -1)
                 {
                     Value = parameterSpecs.Count == 0
@@ -1043,6 +1035,19 @@ public sealed class SqlMetadataService
         {
             ok = error is null,
             parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
+            template = template.Replacements.Length == 0
+                ? null
+                : new
+                {
+                    applied = template.Replacements.Any(replacement => replacement.Applied),
+                    replacements = template.Replacements.Select(replacement => new
+                    {
+                        replacement.Placeholder,
+                        replacement.Applied,
+                        replacement.Occurrences,
+                        replacement.ValueLength
+                    }).ToArray()
+                },
             columns = rows
                 .Where(row => row.ColumnOrdinal is not null)
                 .Select(row => new
@@ -2000,13 +2005,12 @@ public sealed class SqlMetadataService
         var labelSelects = target.LabelColumns
             .Select((column, index) => $"label_{index}={BuildNullableTextColumnExpression(column)}")
             .ToArray();
+        var searchableColumns = BuildTextSearchQueryColumns(target, textExpression, keyExpression, nameExpression);
 
         var parameters = new List<SqlParameter>
         {
             new("@limit", SqlDbType.Int) { Value = limit },
-            new("@snippetTerm", SqlDbType.NVarChar, 4000) { Value = terms[0] },
-            new("@snippetLength", SqlDbType.Int) { Value = _options.TextSearch.SnippetLength },
-            new("@snippetBefore", SqlDbType.Int) { Value = _options.TextSearch.SnippetLength / 3 }
+            new("@snippetLength", SqlDbType.Int) { Value = _options.TextSearch.SnippetLength }
         };
 
         var predicates = new List<string>();
@@ -2014,7 +2018,7 @@ public sealed class SqlMetadataService
         {
             var parameterName = $"@term{i}";
             parameters.Add(new SqlParameter(parameterName, SqlDbType.NVarChar, 4000) { Value = $"%{terms[i]}%" });
-            predicates.Add($"{textExpression} LIKE {parameterName}");
+            predicates.Add($"({string.Join(" OR ", searchableColumns.Select(column => $"{column.Expression} LIKE {parameterName}"))})");
         }
 
         var qualifiedTable = $"{QuoteIdentifier(target.Schema)}.{QuoteIdentifier(target.Table)}";
@@ -2034,8 +2038,7 @@ public sealed class SqlMetadataService
                            {BuildOptionalSelectList(labelSelects)}
                            text_value={textExpression}
                        FROM {qualifiedTable}
-                       WHERE {QuoteIdentifier(target.TextColumn)} IS NOT NULL
-                           AND ({string.Join(" OR ", predicates)})
+                       WHERE {string.Join(" OR ", predicates)}
                        ORDER BY {BuildTextSearchOrderBy(target)}
                    )
                    SELECT
@@ -2049,19 +2052,7 @@ public sealed class SqlMetadataService
                        {BuildOptionalSelectList(target.LabelColumns.Select((_, index) => $"label_{index}").ToArray())}
                        text_length=LEN(text_value),
                        text_sample=LEFT(text_value, 4000),
-                       matched_snippet=
-                           CASE
-                               WHEN CHARINDEX(@snippetTerm, text_value) > 0 THEN
-                                   SUBSTRING(
-                                       text_value,
-                                       CASE
-                                           WHEN CHARINDEX(@snippetTerm, text_value) > @snippetBefore
-                                               THEN CHARINDEX(@snippetTerm, text_value) - @snippetBefore
-                                           ELSE 1
-                                       END,
-                                       @snippetLength)
-                               ELSE LEFT(text_value, @snippetLength)
-                           END
+                       text_preview=LEFT(text_value, @snippetLength)
                    FROM matches;
                    """;
 
@@ -2070,41 +2061,76 @@ public sealed class SqlMetadataService
             parameters,
             reader => new
             {
-                source = $"{target.Schema}.{target.Table}.{target.TextColumn}",
-                profile = target.Profile,
-                schema = target.Schema,
-                table = target.Table,
-                textColumn = target.TextColumn,
-                locator = new
-                {
-                    keyColumn = NullIfWhiteSpace(target.KeyColumn),
-                    keyValue = reader.GetNullableString("key_value"),
-                    nameColumn = NullIfWhiteSpace(target.NameColumn),
-                    nameValue = reader.GetNullableString("name_value"),
-                    labels = BuildTextSearchLabels(reader, target.LabelColumns)
-                },
-                audit = new
-                {
-                    createdAtColumn = NullIfWhiteSpace(target.CreatedAtColumn),
-                    createdAt = reader.GetNullableString("created_at_value"),
-                    updatedAtColumn = NullIfWhiteSpace(target.UpdatedAtColumn),
-                    updatedAt = reader.GetNullableString("updated_at_value"),
-                    createdByColumn = NullIfWhiteSpace(target.CreatedByColumn),
-                    createdBy = reader.GetNullableString("created_by_value"),
-                    updatedByColumn = NullIfWhiteSpace(target.UpdatedByColumn),
-                    updatedBy = reader.GetNullableString("updated_by_value")
-                },
-                contentKind = BuildContentKindInfo(
-                    target.ContentKind,
-                    target.ContentKindColumn,
-                    reader.GetNullableString("content_kind_value"),
-                    reader.GetNullableString("text_sample") ?? string.Empty),
-                textLength = reader.GetNullableInt32("text_length"),
-                matchedSnippet = NormalizeSnippet(reader.GetNullableString("matched_snippet") ?? string.Empty)
+                KeyValue = reader.GetNullableString("key_value"),
+                NameValue = reader.GetNullableString("name_value"),
+                CreatedAt = reader.GetNullableString("created_at_value"),
+                UpdatedAt = reader.GetNullableString("updated_at_value"),
+                CreatedBy = reader.GetNullableString("created_by_value"),
+                UpdatedBy = reader.GetNullableString("updated_by_value"),
+                ContentKindValue = reader.GetNullableString("content_kind_value"),
+                LabelValues = BuildTextSearchLabelValues(reader, target.LabelColumns),
+                TextLength = reader.GetNullableInt32("text_length"),
+                TextSample = reader.GetNullableString("text_sample") ?? string.Empty,
+                TextPreview = reader.GetNullableString("text_preview") ?? string.Empty
             },
             cancellationToken);
 
-        return rows.Cast<object>().ToList();
+        return rows
+            .Select(row =>
+            {
+                var match = FindTextSearchMatch(
+                    terms,
+                    BuildTextSearchMatchInputs(target, row.KeyValue, row.NameValue, row.LabelValues, row.TextSample));
+                var matchedSnippet = match is null
+                    ? NormalizeSnippet(row.TextPreview)
+                    : BuildTextSearchSnippet(match.Value, match.Start, match.Length, _options.TextSearch.SnippetLength);
+                var textSnippet = match is null || string.Equals(match.Column, target.TextColumn, StringComparison.OrdinalIgnoreCase)
+                    ? null
+                    : NormalizeSnippet(row.TextPreview);
+
+                return new
+                {
+                    source = $"{target.Schema}.{target.Table}.{target.TextColumn}",
+                    profile = target.Profile,
+                    schema = target.Schema,
+                    table = target.Table,
+                    textColumn = target.TextColumn,
+                    locator = new
+                    {
+                        keyColumn = NullIfWhiteSpace(target.KeyColumn),
+                        keyValue = row.KeyValue,
+                        nameColumn = NullIfWhiteSpace(target.NameColumn),
+                        nameValue = row.NameValue,
+                        labels = BuildTextSearchLabels(row.LabelValues)
+                    },
+                    audit = new
+                    {
+                        createdAtColumn = NullIfWhiteSpace(target.CreatedAtColumn),
+                        createdAt = row.CreatedAt,
+                        updatedAtColumn = NullIfWhiteSpace(target.UpdatedAtColumn),
+                        updatedAt = row.UpdatedAt,
+                        createdByColumn = NullIfWhiteSpace(target.CreatedByColumn),
+                        createdBy = row.CreatedBy,
+                        updatedByColumn = NullIfWhiteSpace(target.UpdatedByColumn),
+                        updatedBy = row.UpdatedBy
+                    },
+                    contentKind = BuildContentKindInfo(
+                        target.ContentKind,
+                        target.ContentKindColumn,
+                        row.ContentKindValue,
+                        row.TextSample),
+                    textLength = row.TextLength,
+                    matchColumn = match?.Column,
+                    matchKind = match?.Kind,
+                    matchedTerm = match?.Term,
+                    matchStart = match?.Start,
+                    matchLength = match?.Length,
+                    matchedSnippet,
+                    textSnippet
+                };
+            })
+            .Cast<object>()
+            .ToList();
     }
 
     private async Task<List<T>> QueryAsync<T>(
@@ -3023,6 +3049,123 @@ public sealed class SqlMetadataService
             : null;
     }
 
+    internal static SqlTemplateApplication ApplySqlTemplateValues(
+        string sql,
+        IReadOnlyDictionary<string, object?>? templateValues)
+    {
+        if (templateValues is null || templateValues.Count == 0)
+        {
+            return new SqlTemplateApplication(sql, []);
+        }
+
+        if (templateValues.Count > 50)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Too many SQL template values.",
+                templateValues.Count.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                "Pass at most 50 template placeholder replacements.");
+        }
+
+        var result = sql;
+        var replacements = new List<SqlTemplateReplacement>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var (rawKey, rawValue) in templateValues)
+        {
+            var placeholder = NormalizeSqlTemplatePlaceholder(rawKey);
+            if (!seen.Add(placeholder))
+            {
+                throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "Duplicate SQL template placeholder.",
+                    placeholder,
+                    "Use unique placeholder keys such as 0 or {0}.");
+            }
+
+            var value = ConvertSqlTemplateValue(rawValue);
+            var occurrences = CountOccurrences(result, placeholder);
+            if (occurrences > 0)
+            {
+                result = result.Replace(placeholder, value, StringComparison.Ordinal);
+            }
+
+            replacements.Add(new SqlTemplateReplacement(
+                placeholder,
+                occurrences > 0,
+                occurrences,
+                value.Length));
+        }
+
+        return new SqlTemplateApplication(result, replacements.ToArray());
+    }
+
+    private static string NormalizeSqlTemplatePlaceholder(string rawKey)
+    {
+        var key = rawKey.Trim();
+        var match = Regex.Match(key, @"^(?:\{(?<index>\d{1,3})\}|(?<index>\d{1,3}))$");
+        if (!match.Success)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Invalid SQL template placeholder.",
+                rawKey,
+                "Use numeric UI placeholders such as 0 or {0}.");
+        }
+
+        return $"{{{match.Groups["index"].Value}}}";
+    }
+
+    private static string ConvertSqlTemplateValue(object? rawValue)
+    {
+        var value = NormalizeParameterValue(rawValue);
+        var text = value switch
+        {
+            null => "NULL",
+            bool boolean => boolean ? "1" : "0",
+            int integer => integer.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            long integer => integer.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            decimal number => number.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            double number => number.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            string sqlFragment => sqlFragment,
+            _ => throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Unsupported SQL template value type.",
+                value.GetType().Name,
+                "Use JSON string, number, boolean, or null values.")
+        };
+
+        if (text.Length > 8000)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "SQL template value is too long.",
+                text.Length.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                "Use a shorter SQL fragment.");
+        }
+
+        return text;
+    }
+
+    private static int CountOccurrences(string text, string token)
+    {
+        var count = 0;
+        var start = 0;
+        while (start < text.Length)
+        {
+            var index = text.IndexOf(token, start, StringComparison.Ordinal);
+            if (index < 0)
+            {
+                break;
+            }
+
+            count++;
+            start = index + token.Length;
+        }
+
+        return count;
+    }
+
     internal static IReadOnlyList<UserSqlParameterSpec> BuildUserSqlParameters(
         IReadOnlyDictionary<string, object?>? parameters)
     {
@@ -3391,17 +3534,163 @@ public sealed class SqlMetadataService
         return "(SELECT NULL)";
     }
 
-    private static object[] BuildTextSearchLabels(SqlDataReader reader, IReadOnlyList<string> labelColumns)
+    private static object BuildTextSearchTargetSummary(TextSearchTargetOptions target)
+    {
+        return new
+        {
+            target.Profile,
+            target.Schema,
+            target.Table,
+            target.TextColumn,
+            target.KeyColumn,
+            target.NameColumn,
+            target.LabelColumns,
+            target.CreatedAtColumn,
+            target.UpdatedAtColumn,
+            target.CreatedByColumn,
+            target.UpdatedByColumn,
+            target.ContentKind,
+            target.ContentKindColumn,
+            searchableColumns = BuildTextSearchMatchColumnNames(target)
+        };
+    }
+
+    private static TextSearchQueryColumn[] BuildTextSearchQueryColumns(
+        TextSearchTargetOptions target,
+        string textExpression,
+        string keyExpression,
+        string nameExpression)
+    {
+        var columns = new List<TextSearchQueryColumn>
+        {
+            new(target.TextColumn, "text", textExpression)
+        };
+
+        if (!string.IsNullOrWhiteSpace(target.NameColumn))
+        {
+            columns.Add(new(target.NameColumn!, "name", nameExpression));
+        }
+
+        foreach (var column in target.LabelColumns)
+        {
+            columns.Add(new(column, "label", BuildNullableTextColumnExpression(column)));
+        }
+
+        if (!string.IsNullOrWhiteSpace(target.KeyColumn))
+        {
+            columns.Add(new(target.KeyColumn!, "key", keyExpression));
+        }
+
+        return columns
+            .GroupBy(column => column.Column, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+    }
+
+    private static string[] BuildTextSearchMatchColumnNames(TextSearchTargetOptions target)
+    {
+        return BuildTextSearchQueryColumns(
+                target,
+                QuoteIdentifier(target.TextColumn),
+                string.IsNullOrWhiteSpace(target.KeyColumn) ? string.Empty : QuoteIdentifier(target.KeyColumn!),
+                string.IsNullOrWhiteSpace(target.NameColumn) ? string.Empty : QuoteIdentifier(target.NameColumn!))
+            .Select(column => column.Column)
+            .ToArray();
+    }
+
+    private static TextSearchLabelValue[] BuildTextSearchLabelValues(
+        SqlDataReader reader,
+        IReadOnlyList<string> labelColumns)
     {
         return labelColumns
-            .Select((column, index) => new
+            .Select((column, index) => new TextSearchLabelValue(column, reader.GetNullableString($"label_{index}")))
+            .ToArray();
+    }
+
+    private static object[] BuildTextSearchLabels(IReadOnlyList<TextSearchLabelValue> labels)
+    {
+        return labels
+            .Where(label => !string.IsNullOrWhiteSpace(label.Value))
+            .Select(label => new
             {
-                column,
-                value = reader.GetNullableString($"label_{index}")
+                column = label.Column,
+                value = label.Value
             })
-            .Where(label => !string.IsNullOrWhiteSpace(label.value))
             .Cast<object>()
             .ToArray();
+    }
+
+    private static TextSearchMatchInput[] BuildTextSearchMatchInputs(
+        TextSearchTargetOptions target,
+        string? keyValue,
+        string? nameValue,
+        IReadOnlyList<TextSearchLabelValue> labels,
+        string textValue)
+    {
+        var inputs = new List<TextSearchMatchInput>
+        {
+            new(target.TextColumn, "text", textValue)
+        };
+
+        if (!string.IsNullOrWhiteSpace(target.NameColumn))
+        {
+            inputs.Add(new(target.NameColumn!, "name", nameValue));
+        }
+
+        inputs.AddRange(labels.Select(label => new TextSearchMatchInput(label.Column, "label", label.Value)));
+
+        if (!string.IsNullOrWhiteSpace(target.KeyColumn))
+        {
+            inputs.Add(new(target.KeyColumn!, "key", keyValue));
+        }
+
+        return inputs.ToArray();
+    }
+
+    internal static TextSearchMatch? FindTextSearchMatch(
+        IReadOnlyList<string> terms,
+        IReadOnlyList<TextSearchMatchInput> inputs)
+    {
+        foreach (var term in terms.Where(term => !string.IsNullOrWhiteSpace(term)))
+        {
+            foreach (var input in inputs)
+            {
+                if (string.IsNullOrEmpty(input.Value))
+                {
+                    continue;
+                }
+
+                var index = input.Value.IndexOf(term, StringComparison.OrdinalIgnoreCase);
+                if (index >= 0)
+                {
+                    return new TextSearchMatch(
+                        input.Column,
+                        input.Kind,
+                        term,
+                        index + 1,
+                        term.Length,
+                        input.Value);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    internal static string BuildTextSearchSnippet(string text, int matchStart, int matchLength, int maxLength)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return string.Empty;
+        }
+
+        var normalizedMaxLength = Math.Clamp(maxLength, 20, 4000);
+        var zeroBasedStart = Math.Clamp(matchStart - 1, 0, text.Length - 1);
+        var before = normalizedMaxLength / 3;
+        var start = Math.Max(0, zeroBasedStart - before);
+        var length = Math.Min(normalizedMaxLength, text.Length - start);
+        var snippet = text.Substring(start, length);
+        return NormalizeSnippet(snippet);
     }
 
     internal static object BuildContentKindInfo(
@@ -4207,6 +4496,16 @@ public sealed class SqlMetadataService
         int? Size,
         string Definition);
 
+    internal sealed record SqlTemplateApplication(
+        string Sql,
+        SqlTemplateReplacement[] Replacements);
+
+    internal sealed record SqlTemplateReplacement(
+        string Placeholder,
+        bool Applied,
+        int Occurrences,
+        int ValueLength);
+
     private sealed class QueryValueTruncationInfo
     {
         public int TextValuesTruncated { get; set; }
@@ -4228,6 +4527,20 @@ public sealed class SqlMetadataService
         int? ErrorSeverity,
         int? ErrorState,
         string? ErrorMessage);
+
+    private sealed record TextSearchQueryColumn(string Column, string Kind, string Expression);
+
+    private sealed record TextSearchLabelValue(string Column, string? Value);
+
+    internal sealed record TextSearchMatchInput(string Column, string Kind, string? Value);
+
+    internal sealed record TextSearchMatch(
+        string Column,
+        string Kind,
+        string Term,
+        int Start,
+        int Length,
+        string Value);
 
     private sealed record ObjectMatchRow(
         int ObjectId,

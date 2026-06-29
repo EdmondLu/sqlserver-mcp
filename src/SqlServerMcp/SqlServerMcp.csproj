@@ -7,10 +7,10 @@
     <RootNamespace>SqlServerMcp</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>1.8.0</Version>
-    <AssemblyVersion>1.8.0.0</AssemblyVersion>
-    <FileVersion>1.8.0.0</FileVersion>
-    <InformationalVersion>1.8.0</InformationalVersion>
+    <Version>1.9.0</Version>
+    <AssemblyVersion>1.9.0.0</AssemblyVersion>
+    <FileVersion>1.9.0.0</FileVersion>
+    <InformationalVersion>1.9.0</InformationalVersion>
     <Description>A read-only Model Context Protocol server for exploring and querying SQL Server.</Description>
     <RepositoryUrl>https://github.com/EdmondLu/sqlserver-mcp</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

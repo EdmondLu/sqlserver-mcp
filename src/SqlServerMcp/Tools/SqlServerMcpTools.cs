@@ -179,15 +179,16 @@ public static class SqlServerMcpTools
         return service.FindUsageAsync(name, schema, objectTypes, limit, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Search configured application/configuration text columns by keyword. Targets are allow-listed in sqlserver_mcp.json textSearch.targets.")]
+    [McpServerTool(ReadOnly = true), Description("Search configured application/configuration text plus key/name/label metadata by keyword. Targets are allow-listed in sqlserver_mcp.json textSearch.targets.")]
     public static Task<string> SearchConfigText(
         SqlServerToolService service,
         [Description("Keyword text. Space-separated terms are matched independently.")] string keyword,
         [Description("Optional configured text search profile name. When omitted, all enabled profiles are searched.")] string? profile = null,
         [Description("Maximum matches to return; capped by server config.")] int? limit = null,
+        [Description("Include full configured search target metadata in the response. Defaults to false to keep results compact.")] bool includeTargets = false,
         CancellationToken cancellationToken = default)
     {
-        return service.SearchConfigTextAsync(keyword, profile, limit, cancellationToken);
+        return service.SearchConfigTextAsync(keyword, profile, limit, includeTargets, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Run one guarded read-only SELECT or WITH CTE query with optional named parameters. Use describe_query_result first when only result shape is needed.")]
@@ -201,14 +202,15 @@ public static class SqlServerMcpTools
         return service.RunReadonlyQueryAsync(sql, parameters, maxRows, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Describe the result columns for one guarded read-only SELECT or WITH CTE query without executing it.")]
+    [McpServerTool(ReadOnly = true), Description("Describe the result columns for one guarded read-only SELECT or WITH CTE query without executing it, optionally applying explicit UI SQL template replacements first.")]
     public static Task<string> DescribeQueryResult(
         SqlServerToolService service,
         [Description("Single read-only SELECT or WITH CTE query to describe.")] string sql,
         [Description("Optional named SQL parameters used to infer parameter definitions.")] Dictionary<string, object?>? parameters = null,
+        [Description("Optional UI SQL template replacements such as { \"0\": \"1=1\" } for placeholders like {0}. Values are raw SQL fragments and the final SQL is still validated as read-only.")] Dictionary<string, object?>? templateValues = null,
         CancellationToken cancellationToken = default)
     {
-        return service.DescribeQueryResultAsync(sql, parameters, cancellationToken);
+        return service.DescribeQueryResultAsync(sql, parameters, templateValues, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Return SQL Server SHOWPLAN XML for one guarded read-only SELECT or WITH CTE query without executing the target query.")]

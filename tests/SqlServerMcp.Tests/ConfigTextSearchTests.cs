@@ -39,4 +39,33 @@ public sealed class ConfigTextSearchTests
         Assert.Equal(["page_name", "control_name"], target.LabelColumns);
         Assert.Equal("sql", target.ContentKind);
     }
+
+    [Fact]
+    public void FindTextSearchMatch_PrefersTextThenMetadataColumns()
+    {
+        var match = SqlMetadataService.FindTextSearchMatch(
+            ["reserve"],
+            [
+                new SqlMetadataService.TextSearchMatchInput("sql_text", "text", "SELECT 1"),
+                new SqlMetadataService.TextSearchMatchInput("sql_name", "name", "reserve 保存句柄")
+            ]);
+
+        Assert.NotNull(match);
+        Assert.Equal("sql_name", match.Column);
+        Assert.Equal("name", match.Kind);
+        Assert.Equal("reserve", match.Term);
+        Assert.Equal(1, match.Start);
+    }
+
+    [Fact]
+    public void BuildTextSearchSnippet_UsesOneBasedMatchPosition()
+    {
+        var snippet = SqlMetadataService.BuildTextSearchSnippet(
+            "before before reserve after after",
+            matchStart: 15,
+            matchLength: 7,
+            maxLength: 18);
+
+        Assert.Contains("reserve", snippet);
+    }
 }

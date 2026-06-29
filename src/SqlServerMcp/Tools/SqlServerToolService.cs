@@ -190,11 +190,12 @@ public sealed class SqlServerToolService
         string keyword,
         string? profile,
         int? limit,
+        bool includeTargets,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "search_config_text",
-            () => _metadataService.SearchConfigTextAsync(keyword, profile, limit, cancellationToken));
+            () => _metadataService.SearchConfigTextAsync(keyword, profile, limit, includeTargets, cancellationToken));
     }
 
     public Task<string> RunReadonlyQueryAsync(
@@ -212,11 +213,12 @@ public sealed class SqlServerToolService
     public Task<string> DescribeQueryResultAsync(
         string sql,
         IReadOnlyDictionary<string, object?>? parameters,
+        IReadOnlyDictionary<string, object?>? templateValues,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "describe_query_result",
-            () => _metadataService.DescribeQueryResultAsync(sql, parameters, cancellationToken),
+            () => _metadataService.DescribeQueryResultAsync(sql, parameters, templateValues, cancellationToken),
             sql: _options.Logging.LogSql ? sql : null);
     }
 

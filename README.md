@@ -88,7 +88,7 @@ See [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json) for a c
 | `connection.trustServerCertificate` | `false` | Skip certificate-chain validation |
 | `connection.applicationIntent` | `ReadOnly` | Set SQL client application intent |
 
-`textSearch.targets` can include optional locator fields such as `keyColumn`, `nameColumn`, `labelColumns`, `createdAtColumn`, `updatedAtColumn`, `createdByColumn`, `updatedByColumn`, and `contentKind`. These fields make `search_config_text` results point back to the page, control, menu, owner, and script type instead of returning only a raw snippet.
+`textSearch.targets` can include optional locator fields such as `keyColumn`, `nameColumn`, `labelColumns`, `createdAtColumn`, `updatedAtColumn`, `createdByColumn`, `updatedByColumn`, and `contentKind`. `search_config_text` searches the configured text column plus key/name/label metadata, returns `matchColumn`, `matchedTerm`, and 1-based `matchStart`, and omits full target metadata unless `includeTargets=true`.
 
 Relative `logs`, `cache`, and `tmp` directories are created beside the config file. SQL text may contain sensitive data, so enable `logging.logSql` only when appropriate.
 
@@ -111,13 +111,15 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `analyze_module_temp_tables` | Analyze local temp table creation, usage, multiline statements, and column flow inside a module |
 | `get_dependencies` | Find incoming and outgoing dependencies |
 | `find_usage` | Find object, column, or token usage |
-| `search_config_text` | Search configured application/configuration text columns with locator and audit metadata |
+| `search_config_text` | Search configured application/configuration text and locator metadata with match-column and audit metadata |
 | `run_readonly_query` | Run one guarded read-only query with optional named parameters |
-| `describe_query_result` | Describe guarded query result columns without executing the query |
+| `describe_query_result` | Describe guarded query result columns without executing the query, optionally applying explicit UI placeholder replacements |
 | `explain_query_plan` | Return estimated SHOWPLAN XML plus statement, memory, warning, and risk summaries without executing the query |
 | `reload_connection` | Clear cached credentials and SQL connection pools |
 
 Search, definition-slice, configuration-text, usage, and read-only query tools expose `resultInfo` for consistent returned-count, limit, truncation, reason, and hint metadata.
+
+`describe_query_result` accepts optional `templateValues` for UI SQL placeholders, for example `{ "0": "1=1" }` replaces `{0}` before describing columns. Replacements are raw SQL fragments, and the final SQL is still parsed by the read-only guard.
 
 Structure tools recognize the legacy view prefixes `vwp_`, `vwpr_`, `vwt_`, and `vwtr_`, and try the corresponding unprefixed physical table first.
 
