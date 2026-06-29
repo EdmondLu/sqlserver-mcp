@@ -88,7 +88,7 @@ See [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json) for a c
 | `connection.trustServerCertificate` | `false` | Skip certificate-chain validation |
 | `connection.applicationIntent` | `ReadOnly` | Set SQL client application intent |
 
-`textSearch.targets` can include optional locator fields such as `keyColumn`, `nameColumn`, `labelColumns`, `createdAtColumn`, `updatedAtColumn`, `createdByColumn`, `updatedByColumn`, and `contentKind`. `search_config_text` searches the configured text column plus key/name/label metadata, returns `matchColumn`, `matchedTerm`, and 1-based `matchStart`, and omits full target metadata unless `includeTargets=true`.
+`textSearch.targets` can include optional locator fields such as `keyColumn`, `nameColumn`, `labelColumns`, `createdAtColumn`, `updatedAtColumn`, `createdByColumn`, `updatedByColumn`, and `contentKind`. `search_config_text` searches the configured text column plus key/name/label metadata, returns `matchColumn`, `matchedTerm`, and 1-based `matchStart`, and omits full target metadata unless `includeTargets=true`. If a target has a `usable`, `enabled`, or `active` style column, usable rows are sorted first by default and `usableOnly=true` filters to usable rows.
 
 Relative `logs`, `cache`, and `tmp` directories are created beside the config file. SQL text may contain sensitive data, so enable `logging.logSql` only when appropriate.
 

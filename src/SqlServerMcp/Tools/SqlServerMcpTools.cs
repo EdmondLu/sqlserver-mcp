@@ -179,16 +179,17 @@ public static class SqlServerMcpTools
         return service.FindUsageAsync(name, schema, objectTypes, limit, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Search configured application/configuration text plus key/name/label metadata by keyword. Targets are allow-listed in sqlserver_mcp.json textSearch.targets.")]
+    [McpServerTool(ReadOnly = true), Description("Search configured application/configuration text plus key/name/label metadata by keyword, prioritizing usable/enabled rows when available. Targets are allow-listed in sqlserver_mcp.json textSearch.targets.")]
     public static Task<string> SearchConfigText(
         SqlServerToolService service,
         [Description("Keyword text. Space-separated terms are matched independently.")] string keyword,
         [Description("Optional configured text search profile name. When omitted, all enabled profiles are searched.")] string? profile = null,
         [Description("Maximum matches to return; capped by server config.")] int? limit = null,
         [Description("Include full configured search target metadata in the response. Defaults to false to keep results compact.")] bool includeTargets = false,
+        [Description("When true, only return rows whose usable/enabled/active-style column is true. Targets without such a column ignore this filter.")] bool usableOnly = false,
         CancellationToken cancellationToken = default)
     {
-        return service.SearchConfigTextAsync(keyword, profile, limit, includeTargets, cancellationToken);
+        return service.SearchConfigTextAsync(keyword, profile, limit, includeTargets, usableOnly, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Run one guarded read-only SELECT or WITH CTE query with optional named parameters. Use describe_query_result first when only result shape is needed.")]

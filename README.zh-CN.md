@@ -63,7 +63,7 @@ GRANT SHOWPLAN TO [readonly_user];
 
 安全默认值为：禁止跨库和系统库，禁止服务器级 DMV，连接加密开启，不默认信任服务器证书，SQL 日志关闭。相对路径的 `logs`、`cache`、`tmp` 目录会创建在配置文件旁边。
 
-`search_config_text` 只搜索 `textSearch.targets` 中显式配置的文本列和定位元数据列；默认不扫描全库文本列。目标配置可选 `keyColumn`、`nameColumn`、`labelColumns`、`createdAtColumn`、`updatedAtColumn`、`createdByColumn`、`updatedByColumn`、`contentKind` 等定位字段，用于返回页面、控件、菜单、维护人、时间和脚本类型。搜索结果会返回 `matchColumn`、`matchedTerm` 和 1-based `matchStart`；完整目标配置默认不返回，需要时传 `includeTargets=true`。
+`search_config_text` 只搜索 `textSearch.targets` 中显式配置的文本列和定位元数据列；默认不扫描全库文本列。目标配置可选 `keyColumn`、`nameColumn`、`labelColumns`、`createdAtColumn`、`updatedAtColumn`、`createdByColumn`、`updatedByColumn`、`contentKind` 等定位字段，用于返回页面、控件、菜单、维护人、时间和脚本类型。搜索结果会返回 `matchColumn`、`matchedTerm` 和 1-based `matchStart`；完整目标配置默认不返回，需要时传 `includeTargets=true`。如果目标表存在 `usable`、`enabled`、`active` 这类状态列，默认排序会让可用配置优先；传 `usableOnly=true` 时只返回可用配置，没有状态列的目标会自动忽略该过滤。
 
 SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql`。
 

@@ -68,4 +68,38 @@ public sealed class ConfigTextSearchTests
 
         Assert.Contains("reserve", snippet);
     }
+
+    [Fact]
+    public void FindUsableColumn_UsesExistingCandidateColumn()
+    {
+        var target = new TextSearchTargetOptions
+        {
+            Schema = "dbo",
+            Table = "Config",
+            TextColumn = "script"
+        };
+        var lookup = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["dbo.Config"] = ["id", "script", "usable"]
+        };
+
+        Assert.Equal("usable", SqlMetadataService.FindUsableColumn(target, lookup));
+    }
+
+    [Fact]
+    public void FindUsableColumn_ReturnsNullWhenNoCandidateExists()
+    {
+        var target = new TextSearchTargetOptions
+        {
+            Schema = "dbo",
+            Table = "Config",
+            TextColumn = "script"
+        };
+        var lookup = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["dbo.Config"] = ["id", "script"]
+        };
+
+        Assert.Null(SqlMetadataService.FindUsableColumn(target, lookup));
+    }
 }

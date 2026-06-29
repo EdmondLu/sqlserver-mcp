@@ -191,11 +191,12 @@ public sealed class SqlServerToolService
         string? profile,
         int? limit,
         bool includeTargets,
+        bool usableOnly,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "search_config_text",
-            () => _metadataService.SearchConfigTextAsync(keyword, profile, limit, includeTargets, cancellationToken));
+            () => _metadataService.SearchConfigTextAsync(keyword, profile, limit, includeTargets, usableOnly, cancellationToken));
     }
 
     public Task<string> RunReadonlyQueryAsync(

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 1.10.0 - 2026-06-29
+
+- Added `search_config_text.usableOnly` for filtering to usable/enabled/active rows when a target table has a matching status column.
+- Prioritized usable/enabled/active rows in `search_config_text` ordering while preserving disabled rows by default.
+- Added per-result `usable` metadata and target `usableColumn` summaries when a status column is detected.
+
 ## 1.9.0 - 2026-06-29
 
 - Enhanced `search_config_text` to search configured metadata columns such as key, name, and labels in addition to the text column, and to return match column, match kind, matched term, and 1-based match position.

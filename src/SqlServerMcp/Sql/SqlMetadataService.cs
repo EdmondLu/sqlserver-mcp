@@ -17,6 +17,17 @@ public sealed class SqlMetadataService
     private const int MaxModuleContextLines = 50;
     private const long MaxCompareFileBytes = 10 * 1024 * 1024;
     private static readonly Regex TempTableNameRegex = new(@"(?<![#\w])#[A-Za-z_][A-Za-z0-9_]*", RegexOptions.Compiled);
+    private static readonly string[] UsableColumnCandidates =
+    [
+        "usable",
+        "is_usable",
+        "enabled",
+        "is_enabled",
+        "enable",
+        "is_enable",
+        "active",
+        "is_active"
+    ];
 
     private readonly SqlServerMcpOptions _options;
     private readonly SqlConnectionFactory _connectionFactory;
@@ -865,6 +876,7 @@ public sealed class SqlMetadataService
         string? profile,
         int? limit,
         bool includeTargets,
+        bool usableOnly,
         CancellationToken cancellationToken)
     {
         var terms = SplitKeyword(keyword);
@@ -890,6 +902,7 @@ public sealed class SqlMetadataService
         }
 
         var effectiveLimit = _options.Limits.ClampRows(limit);
+        var columnLookup = await LoadTextSearchTargetColumnsAsync(targets, cancellationToken);
         var items = new List<object>();
         var truncated = false;
 
@@ -902,7 +915,14 @@ public sealed class SqlMetadataService
                 break;
             }
 
-            var targetRows = await SearchConfigTextTargetAsync(target, terms, remaining + 1, cancellationToken);
+            var usableColumn = FindUsableColumn(target, columnLookup);
+            var targetRows = await SearchConfigTextTargetAsync(
+                target,
+                terms,
+                remaining + 1,
+                usableColumn,
+                usableOnly,
+                cancellationToken);
             if (targetRows.Count > remaining)
             {
                 truncated = true;
@@ -922,9 +942,11 @@ public sealed class SqlMetadataService
             keyword,
             profile,
             includeTargets,
+            usableOnly,
             searchedTargetCount = targets.Length,
+            usableAwareTargetCount = targets.Count(target => FindUsableColumn(target, columnLookup) is not null),
             searchedTargets = includeTargets
-                ? targets.Select(BuildTextSearchTargetSummary).ToArray()
+                ? targets.Select(target => BuildTextSearchTargetSummary(target, FindUsableColumn(target, columnLookup))).ToArray()
                 : null,
             items,
             count = items.Count,
@@ -1992,6 +2014,8 @@ public sealed class SqlMetadataService
         TextSearchTargetOptions target,
         IReadOnlyList<string> terms,
         int limit,
+        string? usableColumn,
+        bool usableOnly,
         CancellationToken cancellationToken)
     {
         var textExpression = $"CONVERT(NVARCHAR(MAX), {QuoteIdentifier(target.TextColumn)})";
@@ -2006,6 +2030,8 @@ public sealed class SqlMetadataService
             .Select((column, index) => $"label_{index}={BuildNullableTextColumnExpression(column)}")
             .ToArray();
         var searchableColumns = BuildTextSearchQueryColumns(target, textExpression, keyExpression, nameExpression);
+        var usableValueExpression = BuildNullableTextColumnExpression(usableColumn);
+        var usableStateExpression = BuildUsableStateExpression(usableColumn);
 
         var parameters = new List<SqlParameter>
         {
@@ -2019,6 +2045,12 @@ public sealed class SqlMetadataService
             var parameterName = $"@term{i}";
             parameters.Add(new SqlParameter(parameterName, SqlDbType.NVarChar, 4000) { Value = $"%{terms[i]}%" });
             predicates.Add($"({string.Join(" OR ", searchableColumns.Select(column => $"{column.Expression} LIKE {parameterName}"))})");
+        }
+
+        var wherePredicate = string.Join(" OR ", predicates);
+        if (usableOnly && !string.IsNullOrWhiteSpace(usableColumn))
+        {
+            wherePredicate = $"({wherePredicate}) AND {usableStateExpression} = 1";
         }
 
         var qualifiedTable = $"{QuoteIdentifier(target.Schema)}.{QuoteIdentifier(target.Table)}";
@@ -2035,11 +2067,13 @@ public sealed class SqlMetadataService
                            created_by_value={createdByExpression},
                            updated_by_value={updatedByExpression},
                            content_kind_value={contentKindExpression},
+                           usable_value={usableValueExpression},
+                           usable_state={usableStateExpression},
                            {BuildOptionalSelectList(labelSelects)}
                            text_value={textExpression}
                        FROM {qualifiedTable}
-                       WHERE {string.Join(" OR ", predicates)}
-                       ORDER BY {BuildTextSearchOrderBy(target)}
+                       WHERE {wherePredicate}
+                       ORDER BY {BuildTextSearchOrderBy(target, usableColumn)}
                    )
                    SELECT
                        key_value,
@@ -2049,6 +2083,8 @@ public sealed class SqlMetadataService
                        created_by_value,
                        updated_by_value,
                        content_kind_value,
+                       usable_value,
+                       usable_state,
                        {BuildOptionalSelectList(target.LabelColumns.Select((_, index) => $"label_{index}").ToArray())}
                        text_length=LEN(text_value),
                        text_sample=LEFT(text_value, 4000),
@@ -2068,6 +2104,8 @@ public sealed class SqlMetadataService
                 CreatedBy = reader.GetNullableString("created_by_value"),
                 UpdatedBy = reader.GetNullableString("updated_by_value"),
                 ContentKindValue = reader.GetNullableString("content_kind_value"),
+                UsableValue = reader.GetNullableString("usable_value"),
+                UsableState = reader.GetNullableInt32("usable_state"),
                 LabelValues = BuildTextSearchLabelValues(reader, target.LabelColumns),
                 TextLength = reader.GetNullableInt32("text_length"),
                 TextSample = reader.GetNullableString("text_sample") ?? string.Empty,
@@ -2119,6 +2157,16 @@ public sealed class SqlMetadataService
                         target.ContentKindColumn,
                         row.ContentKindValue,
                         row.TextSample),
+                    usable = usableColumn is null
+                        ? null
+                        : new
+                        {
+                            column = usableColumn,
+                            value = row.UsableValue,
+                            isUsable = row.UsableState is null
+                                ? (bool?)null
+                                : row.UsableState == 1
+                        },
                     textLength = row.TextLength,
                     matchColumn = match?.Column,
                     matchKind = match?.Kind,
@@ -3514,27 +3562,69 @@ public sealed class SqlMetadataService
                 selectItems.Select(item => $"                           {item},"));
     }
 
-    private static string BuildTextSearchOrderBy(TextSearchTargetOptions target)
+    internal static string? FindUsableColumn(
+        TextSearchTargetOptions target,
+        IReadOnlyDictionary<string, HashSet<string>> columnLookup)
     {
+        if (!columnLookup.TryGetValue(BuildTargetKey(target.Schema, target.Table), out var columns))
+        {
+            return null;
+        }
+
+        return UsableColumnCandidates.FirstOrDefault(columns.Contains);
+    }
+
+    private static string BuildUsableStateExpression(string? usableColumn)
+    {
+        if (string.IsNullOrWhiteSpace(usableColumn))
+        {
+            return "CONVERT(INT, NULL)";
+        }
+
+        var value = BuildNullableTextColumnExpression(usableColumn);
+        var normalized = $"UPPER(LTRIM(RTRIM({value})))";
+        return $"""
+               CASE
+                   WHEN TRY_CONVERT(INT, {value}) = 1 THEN 1
+                   WHEN {normalized} IN (N'TRUE', N'Y', N'YES', N'ON', N'ENABLE', N'ENABLED', N'ACTIVE', N'是', N'启用', N'有效') THEN 1
+                   WHEN TRY_CONVERT(INT, {value}) = 0 THEN 0
+                   WHEN {normalized} IN (N'FALSE', N'N', N'NO', N'OFF', N'DISABLE', N'DISABLED', N'INACTIVE', N'否', N'停用', N'无效') THEN 0
+                   ELSE NULL
+               END
+               """;
+    }
+
+    private static string BuildTextSearchOrderBy(TextSearchTargetOptions target, string? usableColumn)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(usableColumn))
+        {
+            parts.Add("usable_state DESC");
+        }
+
         if (!string.IsNullOrWhiteSpace(target.NameColumn))
         {
-            return QuoteIdentifier(target.NameColumn!);
+            parts.Add(QuoteIdentifier(target.NameColumn!));
+            return string.Join(", ", parts);
         }
 
         if (!string.IsNullOrWhiteSpace(target.KeyColumn))
         {
-            return QuoteIdentifier(target.KeyColumn!);
+            parts.Add(QuoteIdentifier(target.KeyColumn!));
+            return string.Join(", ", parts);
         }
 
         if (!string.IsNullOrWhiteSpace(target.UpdatedAtColumn))
         {
-            return $"{QuoteIdentifier(target.UpdatedAtColumn!)} DESC";
+            parts.Add($"{QuoteIdentifier(target.UpdatedAtColumn!)} DESC");
+            return string.Join(", ", parts);
         }
 
-        return "(SELECT NULL)";
+        parts.Add("(SELECT NULL)");
+        return string.Join(", ", parts);
     }
 
-    private static object BuildTextSearchTargetSummary(TextSearchTargetOptions target)
+    private static object BuildTextSearchTargetSummary(TextSearchTargetOptions target, string? usableColumn)
     {
         return new
         {
@@ -3551,6 +3641,7 @@ public sealed class SqlMetadataService
             target.UpdatedByColumn,
             target.ContentKind,
             target.ContentKindColumn,
+            usableColumn,
             searchableColumns = BuildTextSearchMatchColumnNames(target)
         };
     }
