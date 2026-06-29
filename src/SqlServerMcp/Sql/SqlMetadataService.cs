@@ -65,6 +65,7 @@ public sealed class SqlMetadataService
         var stopwatch = Stopwatch.StartNew();
         object? connection = null;
         object? permissions = null;
+        object? textSearchValidation = null;
         object? error = null;
 
         try
@@ -121,6 +122,21 @@ public sealed class SqlMetadataService
                     row.hasShowplan ? null : $"GRANT SHOWPLAN TO {row.userName};"
                 }.OfType<string>().ToArray()
             };
+
+            try
+            {
+                textSearchValidation = await ValidateTextSearchTargetsAsync(cancellationToken);
+            }
+            catch (SqlMcpException ex)
+            {
+                textSearchValidation = new
+                {
+                    ok = false,
+                    errorCode = ex.ErrorCode,
+                    message = ex.Message,
+                    detail = ex.Detail
+                };
+            }
         }
         catch (SqlMcpException ex)
         {
@@ -176,7 +192,8 @@ public sealed class SqlMetadataService
                     .Where(profile => !string.IsNullOrWhiteSpace(profile))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .OrderBy(profile => profile)
-                    .ToArray()
+                    .ToArray(),
+                validation = textSearchValidation
             },
             connection,
             permissions,
@@ -863,7 +880,14 @@ public sealed class SqlMetadataService
                 target.Table,
                 target.TextColumn,
                 target.KeyColumn,
-                target.NameColumn
+                target.NameColumn,
+                target.LabelColumns,
+                target.CreatedAtColumn,
+                target.UpdatedAtColumn,
+                target.CreatedByColumn,
+                target.UpdatedByColumn,
+                target.ContentKind,
+                target.ContentKindColumn
             }).ToArray(),
             items,
             count = items.Count,
@@ -1874,12 +1898,16 @@ public sealed class SqlMetadataService
         CancellationToken cancellationToken)
     {
         var textExpression = $"CONVERT(NVARCHAR(MAX), {QuoteIdentifier(target.TextColumn)})";
-        var keyExpression = string.IsNullOrWhiteSpace(target.KeyColumn)
-            ? "CONVERT(NVARCHAR(4000), NULL)"
-            : $"CONVERT(NVARCHAR(4000), {QuoteIdentifier(target.KeyColumn!)})";
-        var nameExpression = string.IsNullOrWhiteSpace(target.NameColumn)
-            ? "CONVERT(NVARCHAR(4000), NULL)"
-            : $"CONVERT(NVARCHAR(4000), {QuoteIdentifier(target.NameColumn!)})";
+        var keyExpression = BuildNullableTextColumnExpression(target.KeyColumn);
+        var nameExpression = BuildNullableTextColumnExpression(target.NameColumn);
+        var createdAtExpression = BuildNullableTextColumnExpression(target.CreatedAtColumn);
+        var updatedAtExpression = BuildNullableTextColumnExpression(target.UpdatedAtColumn);
+        var createdByExpression = BuildNullableTextColumnExpression(target.CreatedByColumn);
+        var updatedByExpression = BuildNullableTextColumnExpression(target.UpdatedByColumn);
+        var contentKindExpression = BuildNullableTextColumnExpression(target.ContentKindColumn);
+        var labelSelects = target.LabelColumns
+            .Select((column, index) => $"label_{index}={BuildNullableTextColumnExpression(column)}")
+            .ToArray();
 
         var parameters = new List<SqlParameter>
         {
@@ -1906,6 +1934,12 @@ public sealed class SqlMetadataService
                        SELECT TOP (@limit)
                            key_value={keyExpression},
                            name_value={nameExpression},
+                           created_at_value={createdAtExpression},
+                           updated_at_value={updatedAtExpression},
+                           created_by_value={createdByExpression},
+                           updated_by_value={updatedByExpression},
+                           content_kind_value={contentKindExpression},
+                           {BuildOptionalSelectList(labelSelects)}
                            text_value={textExpression}
                        FROM {qualifiedTable}
                        WHERE {QuoteIdentifier(target.TextColumn)} IS NOT NULL
@@ -1915,7 +1949,14 @@ public sealed class SqlMetadataService
                    SELECT
                        key_value,
                        name_value,
+                       created_at_value,
+                       updated_at_value,
+                       created_by_value,
+                       updated_by_value,
+                       content_kind_value,
+                       {BuildOptionalSelectList(target.LabelColumns.Select((_, index) => $"label_{index}").ToArray())}
                        text_length=LEN(text_value),
+                       text_sample=LEFT(text_value, 4000),
                        matched_snippet=
                            CASE
                                WHEN CHARINDEX(@snippetTerm, text_value) > 0 THEN
@@ -1937,14 +1978,35 @@ public sealed class SqlMetadataService
             parameters,
             reader => new
             {
+                source = $"{target.Schema}.{target.Table}.{target.TextColumn}",
                 profile = target.Profile,
                 schema = target.Schema,
                 table = target.Table,
                 textColumn = target.TextColumn,
-                keyColumn = string.IsNullOrWhiteSpace(target.KeyColumn) ? null : target.KeyColumn,
-                keyValue = reader.GetNullableString("key_value"),
-                nameColumn = string.IsNullOrWhiteSpace(target.NameColumn) ? null : target.NameColumn,
-                nameValue = reader.GetNullableString("name_value"),
+                locator = new
+                {
+                    keyColumn = NullIfWhiteSpace(target.KeyColumn),
+                    keyValue = reader.GetNullableString("key_value"),
+                    nameColumn = NullIfWhiteSpace(target.NameColumn),
+                    nameValue = reader.GetNullableString("name_value"),
+                    labels = BuildTextSearchLabels(reader, target.LabelColumns)
+                },
+                audit = new
+                {
+                    createdAtColumn = NullIfWhiteSpace(target.CreatedAtColumn),
+                    createdAt = reader.GetNullableString("created_at_value"),
+                    updatedAtColumn = NullIfWhiteSpace(target.UpdatedAtColumn),
+                    updatedAt = reader.GetNullableString("updated_at_value"),
+                    createdByColumn = NullIfWhiteSpace(target.CreatedByColumn),
+                    createdBy = reader.GetNullableString("created_by_value"),
+                    updatedByColumn = NullIfWhiteSpace(target.UpdatedByColumn),
+                    updatedBy = reader.GetNullableString("updated_by_value")
+                },
+                contentKind = BuildContentKindInfo(
+                    target.ContentKind,
+                    target.ContentKindColumn,
+                    reader.GetNullableString("content_kind_value"),
+                    reader.GetNullableString("text_sample") ?? string.Empty),
                 textLength = reader.GetNullableInt32("text_length"),
                 matchedSnippet = NormalizeSnippet(reader.GetNullableString("matched_snippet") ?? string.Empty)
             },
@@ -2770,6 +2832,145 @@ public sealed class SqlMetadataService
         return $"{expression} IN ({string.Join(", ", parameterNames)})";
     }
 
+    private async Task<object> ValidateTextSearchTargetsAsync(CancellationToken cancellationToken)
+    {
+        var enabledTargets = _options.TextSearch.Targets
+            .Where(target => target.Enabled)
+            .ToArray();
+
+        if (enabledTargets.Length == 0)
+        {
+            return new
+            {
+                ok = true,
+                checkedTargetCount = 0,
+                invalidTargetCount = 0,
+                targets = Array.Empty<object>()
+            };
+        }
+
+        var validNameTargets = enabledTargets
+            .Where(target => IsValidTextSearchTarget(target))
+            .ToArray();
+        var columnLookup = await LoadTextSearchTargetColumnsAsync(validNameTargets, cancellationToken);
+
+        var targetResults = enabledTargets
+            .Select(target => BuildTextSearchTargetValidation(target, columnLookup))
+            .ToArray();
+
+        return new
+        {
+            ok = targetResults.All(target => target.Ok),
+            checkedTargetCount = targetResults.Length,
+            invalidTargetCount = targetResults.Count(target => !target.Ok),
+            targets = targetResults.Select(target => new
+            {
+                target.Profile,
+                target.Schema,
+                target.Table,
+                target.TextColumn,
+                target.Ok,
+                target.TableExists,
+                target.IdentifierConfigOk,
+                target.ConfiguredColumns,
+                target.MissingColumns,
+                target.Hint
+            }).ToArray()
+        };
+    }
+
+    private async Task<Dictionary<string, HashSet<string>>> LoadTextSearchTargetColumnsAsync(
+        IReadOnlyList<TextSearchTargetOptions> targets,
+        CancellationToken cancellationToken)
+    {
+        if (targets.Count == 0)
+        {
+            return new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var parameters = new List<SqlParameter>();
+        var predicates = new List<string>();
+        for (var i = 0; i < targets.Count; i++)
+        {
+            var schemaParameter = $"@schema{i}";
+            var tableParameter = $"@table{i}";
+            parameters.Add(new SqlParameter(schemaParameter, SqlDbType.NVarChar, 128) { Value = targets[i].Schema });
+            parameters.Add(new SqlParameter(tableParameter, SqlDbType.NVarChar, 128) { Value = targets[i].Table });
+            predicates.Add($"(S.name={schemaParameter} AND O.name={tableParameter})");
+        }
+
+        var sql = $"""
+                   SELECT
+                       schema_name=S.name,
+                       object_name=O.name,
+                       column_name=C.name
+                   FROM sys.objects O
+                   INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
+                   INNER JOIN sys.columns C ON C.object_id=O.object_id
+                   WHERE O.type IN (N'U', N'V')
+                       AND ({string.Join(" OR ", predicates)})
+                   ORDER BY S.name, O.name, C.column_id;
+                   """;
+
+        var rows = await QueryAsync(
+            sql,
+            parameters,
+            reader => new
+            {
+                Schema = reader.GetString("schema_name"),
+                Name = reader.GetString("object_name"),
+                Column = reader.GetString("column_name")
+            },
+            cancellationToken);
+
+        var lookup = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in rows.GroupBy(row => BuildTargetKey(row.Schema, row.Name), StringComparer.OrdinalIgnoreCase))
+        {
+            lookup[group.Key] = group
+                .Select(row => row.Column)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+
+        return lookup;
+    }
+
+    private static TextSearchTargetValidation BuildTextSearchTargetValidation(
+        TextSearchTargetOptions target,
+        IReadOnlyDictionary<string, HashSet<string>> columnLookup)
+    {
+        var identifierConfigOk = IsValidTextSearchTarget(target);
+        var configuredColumns = GetConfiguredTextSearchColumns(target).ToArray();
+        var targetKey = BuildTargetKey(target.Schema, target.Table);
+        var tableExists = columnLookup.TryGetValue(targetKey, out var existingColumns);
+        var missingColumns = identifierConfigOk && tableExists
+            ? configuredColumns
+                .Where(column => !existingColumns!.Contains(column))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray()
+            : configuredColumns;
+        var ok = identifierConfigOk && tableExists && missingColumns.Length == 0;
+
+        var hint = ok
+            ? null
+            : !identifierConfigOk
+                ? "Check textSearch target identifiers; only simple schema, table, and column names are allowed."
+                : !tableExists
+                    ? "Check that the configured table or view exists in the target database."
+                    : "Check configured textSearch column names against the target table or view.";
+
+        return new TextSearchTargetValidation(
+            target.Profile,
+            target.Schema,
+            target.Table,
+            target.TextColumn,
+            ok,
+            tableExists,
+            identifierConfigOk,
+            configuredColumns,
+            missingColumns,
+            hint);
+    }
+
     private static int? NormalizeMaxLength(short maxLength, string dataType)
     {
         if (maxLength < 0)
@@ -2793,7 +2994,13 @@ public sealed class SqlMetadataService
                && IsSafeIdentifier(target.Table)
                && IsSafeIdentifier(target.TextColumn)
                && (string.IsNullOrWhiteSpace(target.KeyColumn) || IsSafeIdentifier(target.KeyColumn))
-               && (string.IsNullOrWhiteSpace(target.NameColumn) || IsSafeIdentifier(target.NameColumn));
+               && (string.IsNullOrWhiteSpace(target.NameColumn) || IsSafeIdentifier(target.NameColumn))
+               && target.LabelColumns.All(IsSafeIdentifier)
+               && (string.IsNullOrWhiteSpace(target.CreatedAtColumn) || IsSafeIdentifier(target.CreatedAtColumn))
+               && (string.IsNullOrWhiteSpace(target.UpdatedAtColumn) || IsSafeIdentifier(target.UpdatedAtColumn))
+               && (string.IsNullOrWhiteSpace(target.CreatedByColumn) || IsSafeIdentifier(target.CreatedByColumn))
+               && (string.IsNullOrWhiteSpace(target.UpdatedByColumn) || IsSafeIdentifier(target.UpdatedByColumn))
+               && (string.IsNullOrWhiteSpace(target.ContentKindColumn) || IsSafeIdentifier(target.ContentKindColumn));
     }
 
     private static bool IsSafeIdentifier(string value)
@@ -2805,6 +3012,22 @@ public sealed class SqlMetadataService
     private static string QuoteIdentifier(string identifier)
     {
         return $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
+    }
+
+    private static string BuildNullableTextColumnExpression(string? column)
+    {
+        return string.IsNullOrWhiteSpace(column)
+            ? "CONVERT(NVARCHAR(4000), NULL)"
+            : $"CONVERT(NVARCHAR(4000), {QuoteIdentifier(column!)})";
+    }
+
+    private static string BuildOptionalSelectList(IReadOnlyList<string> selectItems)
+    {
+        return selectItems.Count == 0
+            ? string.Empty
+            : string.Join(
+                Environment.NewLine,
+                selectItems.Select(item => $"                           {item},"));
     }
 
     private static string BuildTextSearchOrderBy(TextSearchTargetOptions target)
@@ -2819,7 +3042,114 @@ public sealed class SqlMetadataService
             return QuoteIdentifier(target.KeyColumn!);
         }
 
+        if (!string.IsNullOrWhiteSpace(target.UpdatedAtColumn))
+        {
+            return $"{QuoteIdentifier(target.UpdatedAtColumn!)} DESC";
+        }
+
         return "(SELECT NULL)";
+    }
+
+    private static object[] BuildTextSearchLabels(SqlDataReader reader, IReadOnlyList<string> labelColumns)
+    {
+        return labelColumns
+            .Select((column, index) => new
+            {
+                column,
+                value = reader.GetNullableString($"label_{index}")
+            })
+            .Where(label => !string.IsNullOrWhiteSpace(label.value))
+            .Cast<object>()
+            .ToArray();
+    }
+
+    internal static object BuildContentKindInfo(
+        string? configuredKind,
+        string? contentKindColumn,
+        string? contentKindValue,
+        string textSample)
+    {
+        var configured = NullIfWhiteSpace(configuredKind);
+        var columnValue = NullIfWhiteSpace(contentKindValue);
+        var detected = DetectContentKind(textSample);
+        return new
+        {
+            effective = configured ?? columnValue ?? detected,
+            configured,
+            column = NullIfWhiteSpace(contentKindColumn),
+            columnValue,
+            detected
+        };
+    }
+
+    internal static string DetectContentKind(string text)
+    {
+        var sample = text.Trim();
+        if (sample.Length == 0)
+        {
+            return "text";
+        }
+
+        if ((sample.StartsWith('{') && sample.EndsWith('}'))
+            || (sample.StartsWith('[') && sample.EndsWith(']')))
+        {
+            return "json";
+        }
+
+        if (sample.StartsWith('<'))
+        {
+            return sample.Contains("<html", StringComparison.OrdinalIgnoreCase)
+                ? "html"
+                : "xml";
+        }
+
+        if (Regex.IsMatch(sample, @"\b(SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|EXEC|FROM|JOIN|WHERE)\b", RegexOptions.IgnoreCase))
+        {
+            return "sql";
+        }
+
+        if (Regex.IsMatch(sample, @"\b(function|const|let|var|return|async|await)\b|=>|\$\(", RegexOptions.IgnoreCase))
+        {
+            return "javascript";
+        }
+
+        return "text";
+    }
+
+    private static string? NullIfWhiteSpace(string? text)
+    {
+        return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private static IEnumerable<string> GetConfiguredTextSearchColumns(TextSearchTargetOptions target)
+    {
+        yield return target.TextColumn;
+        foreach (var column in new[]
+                 {
+                     target.KeyColumn,
+                     target.NameColumn,
+                     target.CreatedAtColumn,
+                     target.UpdatedAtColumn,
+                     target.CreatedByColumn,
+                     target.UpdatedByColumn,
+                     target.ContentKindColumn
+                 })
+        {
+            if (!string.IsNullOrWhiteSpace(column))
+            {
+                yield return column!;
+            }
+        }
+
+        foreach (var column in target.LabelColumns)
+        {
+            yield return column;
+        }
+    }
+
+    private static string BuildTargetKey(string schema, string table)
+    {
+        return $"{schema}.{table}";
     }
 
     private static string NormalizeSnippet(string text)
@@ -3198,6 +3528,18 @@ public sealed class SqlMetadataService
         int? NodeId,
         string? PhysicalOp,
         string[] Details);
+
+    private sealed record TextSearchTargetValidation(
+        string Profile,
+        string Schema,
+        string Table,
+        string TextColumn,
+        bool Ok,
+        bool TableExists,
+        bool IdentifierConfigOk,
+        string[] ConfiguredColumns,
+        string[] MissingColumns,
+        string? Hint);
 
     private sealed record DbObjectInfo(
         int ObjectId,

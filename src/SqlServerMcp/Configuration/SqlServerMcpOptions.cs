@@ -157,6 +157,11 @@ public sealed class TextSearchOptions
         SnippetLength = Math.Clamp(SnippetLength, 80, 1000);
         Targets = Targets
             .Where(target => target is not null)
+            .Select(target =>
+            {
+                target.Normalize();
+                return target;
+            })
             .ToArray();
     }
 }
@@ -175,7 +180,35 @@ public sealed class TextSearchTargetOptions
 
     public string? NameColumn { get; set; }
 
+    public string[] LabelColumns { get; set; } = [];
+
+    public string? CreatedAtColumn { get; set; }
+
+    public string? UpdatedAtColumn { get; set; }
+
+    public string? CreatedByColumn { get; set; }
+
+    public string? UpdatedByColumn { get; set; }
+
+    public string? ContentKind { get; set; }
+
+    public string? ContentKindColumn { get; set; }
+
     public bool Enabled { get; set; } = true;
+
+    public void Normalize()
+    {
+        LabelColumns = LabelColumns
+            .Where(column => !string.IsNullOrWhiteSpace(column))
+            .Select(column => column.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(20)
+            .ToArray();
+
+        ContentKind = string.IsNullOrWhiteSpace(ContentKind)
+            ? null
+            : ContentKind.Trim();
+    }
 }
 
 public sealed class LoggingOptions

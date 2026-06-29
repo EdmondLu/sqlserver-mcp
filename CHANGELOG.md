@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## 1.5.0 - 2026-06-29
+
+- Enhanced `search_config_text` with locator labels, audit fields, configured/detected content kind, and richer target metadata.
+- Added `health_check` validation for configured `textSearch.targets`, including table existence and missing configured columns.
+
 ## 1.4.0 - 2026-06-29
 
 - Added structured `explain_query_plan` summaries for SHOWPLAN XML, including scan, lookup, sort, hash, parallelism, missing-index, implicit-conversion, warning, and expensive-operator signals.

@@ -62,7 +62,7 @@ GRANT SHOWPLAN TO [readonly_user];
 
 安全默认值为：禁止跨库和系统库，禁止服务器级 DMV，连接加密开启，不默认信任服务器证书，SQL 日志关闭。相对路径的 `logs`、`cache`、`tmp` 目录会创建在配置文件旁边。
 
-`search_config_text` 只搜索 `textSearch.targets` 中显式配置的文本列；默认不扫描全库文本列。
+`search_config_text` 只搜索 `textSearch.targets` 中显式配置的文本列；默认不扫描全库文本列。目标配置可选 `keyColumn`、`nameColumn`、`labelColumns`、`createdAtColumn`、`updatedAtColumn`、`createdByColumn`、`updatedByColumn`、`contentKind` 等定位字段，用于返回页面、控件、菜单、维护人、时间和脚本类型。
 
 SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql`。
 

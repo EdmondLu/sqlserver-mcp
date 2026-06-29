@@ -87,6 +87,8 @@ See [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json) for a c
 | `connection.trustServerCertificate` | `false` | Skip certificate-chain validation |
 | `connection.applicationIntent` | `ReadOnly` | Set SQL client application intent |
 
+`textSearch.targets` can include optional locator fields such as `keyColumn`, `nameColumn`, `labelColumns`, `createdAtColumn`, `updatedAtColumn`, `createdByColumn`, `updatedByColumn`, and `contentKind`. These fields make `search_config_text` results point back to the page, control, menu, owner, and script type instead of returning only a raw snippet.
+
 Relative `logs`, `cache`, and `tmp` directories are created beside the config file. SQL text may contain sensitive data, so enable `logging.logSql` only when appropriate.
 
 ## Tools
@@ -108,7 +110,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `analyze_module_temp_tables` | Analyze local temp table creation and usage inside a module |
 | `get_dependencies` | Find incoming and outgoing dependencies |
 | `find_usage` | Find object, column, or token usage |
-| `search_config_text` | Search configured application/configuration text columns |
+| `search_config_text` | Search configured application/configuration text columns with locator and audit metadata |
 | `run_readonly_query` | Run one guarded read-only query with optional named parameters |
 | `describe_query_result` | Describe guarded query result columns without executing the query |
 | `explain_query_plan` | Return estimated SHOWPLAN XML plus a compact risk summary without executing the query |

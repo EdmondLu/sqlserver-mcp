@@ -27,6 +27,12 @@
         "textColumn": "script_text",
         "keyColumn": "id",
         "nameColumn": "name",
+        "labelColumns": ["page_name", "control_name"],
+        "createdAtColumn": "created_at",
+        "updatedAtColumn": "updated_at",
+        "createdByColumn": "created_by",
+        "updatedByColumn": "updated_by",
+        "contentKind": "javascript",
         "enabled": false
       }
     ]
