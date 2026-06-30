@@ -98,7 +98,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | Tool | Purpose |
 | --- | --- |
 | `test_connection` | Validate the connection and current SQL identity |
-| `health_check` | Check config, runtime paths, connection, and permissions |
+| `health_check` | Check serverVersion, config, runtime paths, connection, and permissions |
 | `find_objects` | Search tables, views, procedures, and functions |
 | `describe_table` | Inspect columns, indexes, constraints, and foreign keys |
 | `get_object_overview` | Return compact metadata and dependency context |

@@ -1,6 +1,7 @@
 using System.Data;
 using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -218,6 +219,7 @@ public sealed class SqlMetadataService
         return new
         {
             ok = error is null,
+            serverVersion = GetServerVersion(),
             config = new
             {
                 configPath = _options.ConfigPath,
@@ -259,6 +261,13 @@ public sealed class SqlMetadataService
             error,
             elapsedMs = stopwatch.ElapsedMilliseconds
         };
+    }
+
+    internal static string GetServerVersion()
+    {
+        return typeof(SqlMetadataService).Assembly.GetName().Version?.ToString()
+            ?? typeof(SqlMetadataService).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+            ?? "unknown";
     }
 
     public async Task<object> FindObjectsAsync(

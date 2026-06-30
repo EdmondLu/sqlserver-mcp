@@ -14,7 +14,7 @@ public static class SqlServerMcpTools
         return service.TestConnectionAsync(cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Return config, connection, runtime directory, and SQL permission health for this MCP server.")]
+    [McpServerTool(ReadOnly = true), Description("Return serverVersion, config, connection, runtime directory, and SQL permission health for this MCP server.")]
     public static Task<string> HealthCheck(
         SqlServerToolService service,
         CancellationToken cancellationToken)

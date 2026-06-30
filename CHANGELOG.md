@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 1.15.1 - 2026-06-30
+
+- Added top-level `serverVersion` to `health_check` so operators can confirm the published service version without a separate `initialize` probe.
+
 ## 1.15.0 - 2026-06-29
 
 - Added `changedLineSummary` to module/file comparison results so callers do not need to parse summary text for changed and returned line counts.
