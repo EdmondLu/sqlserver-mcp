@@ -19,6 +19,7 @@ internal static class TsqlScriptAnalyzer
         var fragment = parser.Parse(new StringReader(script), out var parseErrors);
         var visitor = new ValidationVisitor();
         fragment?.Accept(visitor);
+        var columnReferences = visitor.ResolveColumnReferences();
 
         var diagnostics = parseErrors
             .Select(error => new TsqlValidationDiagnostic(
@@ -33,7 +34,8 @@ internal static class TsqlScriptAnalyzer
 
         diagnostics.AddRange(FindUndeclaredVariables(visitor));
         diagnostics.AddRange(FindInsertShapeMismatches(visitor));
-        diagnostics.AddRange(FindTempTableColumnErrors(visitor));
+        diagnostics.AddRange(FindLocalTableColumnErrors(columnReferences));
+        diagnostics.AddRange(FindInconclusiveColumnWarnings(columnReferences));
 
         var hasCreateOrAlter = CreateOrAlterModuleRegex.IsMatch(script);
         var hasCreateModule = CreateModuleRegex.IsMatch(script);
@@ -76,7 +78,7 @@ internal static class TsqlScriptAnalyzer
                 })
                 .Select(group => group.First())
                 .ToArray(),
-            visitor.ColumnReferences.ToArray(),
+            columnReferences,
             visitor.UserTypes
                 .GroupBy(type => new { type.Schema, type.Name, type.Line, type.Column })
                 .Select(group => group.First())
@@ -85,7 +87,9 @@ internal static class TsqlScriptAnalyzer
             visitor.TempTables.Values
                 .OrderBy(table => table.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
-            visitor.TableBindings,
+            visitor.TableVariables.Values
+                .OrderBy(table => table.Name, StringComparer.OrdinalIgnoreCase)
+                .ToArray(),
             visitor.CteNames.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray(),
             diagnostics
                 .OrderBy(diagnostic => diagnostic.Line ?? int.MaxValue)
@@ -98,6 +102,8 @@ internal static class TsqlScriptAnalyzer
     {
         return visitor.VariableReferences
             .Where(reference => !reference.Name.StartsWith("@@", StringComparison.Ordinal))
+            .Where(reference => !visitor.ExecuteParameterLabels.Contains(
+                new TsqlVariableIdentity(reference.Name, reference.StartOffset)))
             .Where(reference => !visitor.DeclaredVariables.Contains(reference.Name))
             .GroupBy(reference => new { reference.Name, reference.Line, reference.Column })
             .Select(group => new TsqlValidationDiagnostic(
@@ -143,36 +149,58 @@ internal static class TsqlScriptAnalyzer
         }
     }
 
-    private static IEnumerable<TsqlValidationDiagnostic> FindTempTableColumnErrors(ValidationVisitor visitor)
+    private static IEnumerable<TsqlValidationDiagnostic> FindLocalTableColumnErrors(
+        IEnumerable<TsqlColumnReference> columnReferences)
     {
-        foreach (var reference in visitor.ColumnReferences.Where(reference => reference.Identifiers.Length >= 2))
+        foreach (var reference in columnReferences.Where(reference => reference.Identifiers.Length >= 2))
         {
-            var qualifier = reference.Identifiers[^2];
-            if (visitor.TableAliases.TryGetValue(qualifier, out var tableName))
-            {
-                qualifier = tableName;
-            }
-
-            if (!qualifier.StartsWith('#')
-                || !visitor.TempTables.TryGetValue(qualifier, out var tempTable)
-                || tempTable.Columns.Count == 0)
+            if (reference.Binding is not
+                {
+                    Kind: "temporary_table" or "table_variable",
+                    Columns.Count: > 0
+                } binding)
             {
                 continue;
             }
 
             var column = reference.Identifiers[^1];
-            if (!tempTable.Columns.Contains(column))
+            if (!binding.Columns.Contains(column))
             {
                 yield return new TsqlValidationDiagnostic(
                     "unresolved_column",
                     "error",
-                    $"Temporary table '{qualifier}' has no column '{column}'.",
+                    $"{(binding.Kind == "temporary_table" ? "Temporary table" : "Table variable")} '{binding.Name}' has no column '{column}'.",
                     reference.Line,
                     reference.Column,
                     column,
-                    $"Available columns: {string.Join(", ", tempTable.Columns.OrderBy(value => value))}");
+                    $"Available columns: {string.Join(", ", binding.Columns.OrderBy(value => value))}");
             }
         }
+    }
+
+    private static IEnumerable<TsqlValidationDiagnostic> FindInconclusiveColumnWarnings(
+        IEnumerable<TsqlColumnReference> columnReferences)
+    {
+        return columnReferences
+            .Where(reference => !string.IsNullOrWhiteSpace(reference.InconclusiveReason))
+            .GroupBy(reference => new
+            {
+                Qualifier = reference.Identifiers.Length >= 2 ? reference.Identifiers[^2] : string.Empty,
+                reference.ScopeStartOffset,
+                reference.InconclusiveReason
+            })
+            .Select(group =>
+            {
+                var first = group.OrderBy(reference => reference.Line).ThenBy(reference => reference.Column).First();
+                return new TsqlValidationDiagnostic(
+                    "analysis_inconclusive",
+                    "warning",
+                    first.InconclusiveReason!,
+                    first.Line,
+                    first.Column,
+                    group.Key.Qualifier,
+                    "The column was not treated as unresolved because its source could not be determined uniquely.");
+            });
     }
 
     private sealed class ValidationVisitor : TSqlFragmentVisitor
@@ -181,9 +209,11 @@ internal static class TsqlScriptAnalyzer
 
         public List<TsqlVariableReference> VariableReferences { get; } = [];
 
+        public HashSet<TsqlVariableIdentity> ExecuteParameterLabels { get; } = [];
+
         public List<TsqlObjectReference> ObjectReferences { get; } = [];
 
-        public List<TsqlColumnReference> ColumnReferences { get; } = [];
+        private List<TsqlRawColumnReference> ColumnReferences { get; } = [];
 
         public List<TsqlUserTypeReference> UserTypes { get; } = [];
 
@@ -191,13 +221,17 @@ internal static class TsqlScriptAnalyzer
 
         public Dictionary<string, TsqlTempTable> TempTables { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-        public Dictionary<string, string> TableAliases { get; } = new(StringComparer.OrdinalIgnoreCase);
-
-        public Dictionary<string, TsqlObjectReference> TableBindings { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, TsqlTableVariable> TableVariables { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public HashSet<string> CteNames { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public List<TsqlInsertShape> Inserts { get; } = [];
+
+        private List<TsqlQueryScope> QueryScopes { get; } = [];
+
+        private List<TsqlTableSource> TableSources { get; } = [];
+
+        private HashSet<int> AliasOnlyModificationTargetOffsets { get; } = [];
 
         public TsqlModuleTarget? Module { get; private set; }
 
@@ -226,9 +260,40 @@ internal static class TsqlScriptAnalyzer
             base.ExplicitVisit(node);
         }
 
+        public override void ExplicitVisit(DeclareTableVariableStatement node)
+        {
+            var name = node.Body.VariableName.Value;
+            DeclaredVariables.Add(name);
+            var columns = node.Body.Definition.ColumnDefinitions
+                .Select(column => column.ColumnIdentifier.Value)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            TableVariables[name] = new TsqlTableVariable(
+                name,
+                node.StartLine,
+                node.StartColumn,
+                columns);
+            base.ExplicitVisit(node);
+        }
+
         public override void ExplicitVisit(VariableReference node)
         {
-            VariableReferences.Add(new TsqlVariableReference(node.Name, node.StartLine, node.StartColumn));
+            VariableReferences.Add(new TsqlVariableReference(
+                node.Name,
+                node.StartLine,
+                node.StartColumn,
+                node.StartOffset));
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(ExecuteParameter node)
+        {
+            if (node.Variable is not null)
+            {
+                ExecuteParameterLabels.Add(new TsqlVariableIdentity(
+                    node.Variable.Name,
+                    node.Variable.StartOffset));
+            }
+
             base.ExplicitVisit(node);
         }
 
@@ -240,24 +305,80 @@ internal static class TsqlScriptAnalyzer
 
         public override void ExplicitVisit(NamedTableReference node)
         {
+            if (AliasOnlyModificationTargetOffsets.Contains(node.StartOffset))
+            {
+                base.ExplicitVisit(node);
+                return;
+            }
+
             var objectName = ReadObjectName(node.SchemaObject);
             if (objectName.Name.Length > 0)
             {
-                var reference = new TsqlObjectReference(
-                    objectName.Schema,
-                    objectName.Name,
-                    "table_or_view",
-                    node.StartLine,
-                    node.StartColumn,
-                    objectName.Database,
-                    objectName.Server);
-                ObjectReferences.Add(reference);
-                TableBindings[objectName.Name] = reference;
-                if (node.Alias is not null)
+                TsqlObjectReference? reference = null;
+                if (!objectName.Name.StartsWith('@') && !objectName.Name.StartsWith('#'))
                 {
-                    TableAliases[node.Alias.Value] = objectName.Name;
-                    TableBindings[node.Alias.Value] = reference;
+                    reference = new TsqlObjectReference(
+                        objectName.Schema,
+                        objectName.Name,
+                        "table_or_view",
+                        node.StartLine,
+                        node.StartColumn,
+                        objectName.Database,
+                        objectName.Server);
+                    ObjectReferences.Add(reference);
                 }
+
+                TableSources.Add(new TsqlTableSource(
+                    node.Alias?.Value ?? objectName.Name,
+                    objectName.Name,
+                    reference,
+                    node.StartOffset));
+            }
+
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(VariableTableReference node)
+        {
+            var name = node.Variable.Name;
+            TableSources.Add(new TsqlTableSource(
+                node.Alias?.Value ?? name,
+                name,
+                null,
+                node.StartOffset));
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(QueryDerivedTable node)
+        {
+            AddInconclusiveTableSource(node.Alias, node.StartOffset);
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(InlineDerivedTable node)
+        {
+            AddInconclusiveTableSource(node.Alias, node.StartOffset);
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(QuerySpecification node)
+        {
+            QueryScopes.Add(new TsqlQueryScope(
+                node.StartOffset,
+                node.StartOffset + node.FragmentLength));
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(UpdateSpecification node)
+        {
+            QueryScopes.Add(new TsqlQueryScope(
+                node.StartOffset,
+                node.StartOffset + node.FragmentLength));
+            if (node.FromClause is not null
+                && node.Target is NamedTableReference target
+                && target.SchemaObject.Identifiers.Count == 1)
+            {
+                AliasOnlyModificationTargetOffsets.Add(target.StartOffset);
             }
 
             base.ExplicitVisit(node);
@@ -270,10 +391,11 @@ internal static class TsqlScriptAnalyzer
                 .ToArray() ?? [];
             if (identifiers.Length > 0 && identifiers[^1] != "*")
             {
-                ColumnReferences.Add(new TsqlColumnReference(
+                ColumnReferences.Add(new TsqlRawColumnReference(
                     identifiers,
                     node.StartLine,
-                    node.StartColumn));
+                    node.StartColumn,
+                    node.StartOffset));
             }
 
             base.ExplicitVisit(node);
@@ -396,6 +518,155 @@ internal static class TsqlScriptAnalyzer
             base.ExplicitVisit(node);
         }
 
+        public TsqlColumnReference[] ResolveColumnReferences()
+        {
+            var sourcesByScope = TableSources
+                .Select(source => new
+                {
+                    Source = source,
+                    Scope = FindInnermostScope(source.StartOffset)
+                })
+                .Where(item => item.Scope is not null)
+                .GroupBy(item => item.Scope!.StartOffset)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.Select(item => item.Source).ToArray());
+
+            return ColumnReferences
+                .Select(reference => ResolveColumnReference(reference, sourcesByScope))
+                .ToArray();
+        }
+
+        private TsqlColumnReference ResolveColumnReference(
+            TsqlRawColumnReference reference,
+            IReadOnlyDictionary<int, TsqlTableSource[]> sourcesByScope)
+        {
+            if (reference.Identifiers.Length < 2)
+            {
+                return new TsqlColumnReference(
+                    reference.Identifiers,
+                    reference.Line,
+                    reference.Column,
+                    null,
+                    null,
+                    null);
+            }
+
+            var qualifier = reference.Identifiers[^2];
+            var containingScopes = QueryScopes
+                .Where(scope => scope.Contains(reference.StartOffset))
+                .OrderBy(scope => scope.Length)
+                .ToArray();
+            foreach (var scope in containingScopes)
+            {
+                if (!sourcesByScope.TryGetValue(scope.StartOffset, out var sources))
+                {
+                    continue;
+                }
+
+                var matches = sources
+                    .Where(source => source.Qualifier.Equals(qualifier, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (matches.Length == 0)
+                {
+                    continue;
+                }
+
+                if (matches.Length > 1)
+                {
+                    return new TsqlColumnReference(
+                        reference.Identifiers,
+                        reference.Line,
+                        reference.Column,
+                        null,
+                        $"Alias '{qualifier}' has multiple possible sources in the same query scope.",
+                        scope.StartOffset);
+                }
+
+                var source = matches[0];
+                var binding = BuildColumnBinding(source);
+                return binding is not null
+                    ? new TsqlColumnReference(
+                        reference.Identifiers,
+                        reference.Line,
+                        reference.Column,
+                        binding,
+                        null,
+                        scope.StartOffset)
+                    : new TsqlColumnReference(
+                        reference.Identifiers,
+                        reference.Line,
+                        reference.Column,
+                        null,
+                        $"Alias '{qualifier}' refers to a derived, CTE, or otherwise statically unresolved row source.",
+                        scope.StartOffset);
+            }
+
+            return new TsqlColumnReference(
+                reference.Identifiers,
+                reference.Line,
+                reference.Column,
+                null,
+                null,
+                containingScopes.FirstOrDefault()?.StartOffset);
+        }
+
+        private TsqlColumnBinding? BuildColumnBinding(TsqlTableSource source)
+        {
+            if (source.ObjectName.StartsWith('#')
+                && TempTables.TryGetValue(source.ObjectName, out var tempTable))
+            {
+                return new TsqlColumnBinding(
+                    "temporary_table",
+                    null,
+                    tempTable.Name,
+                    tempTable.Columns);
+            }
+
+            if (source.ObjectName.StartsWith('@')
+                && TableVariables.TryGetValue(source.ObjectName, out var tableVariable))
+            {
+                return new TsqlColumnBinding(
+                    "table_variable",
+                    null,
+                    tableVariable.Name,
+                    tableVariable.Columns);
+            }
+
+            if (CteNames.Contains(source.ObjectName) || source.Reference is null)
+            {
+                return null;
+            }
+
+            return new TsqlColumnBinding(
+                "database_object",
+                source.Reference.Schema,
+                source.Reference.Name,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        }
+
+        private TsqlQueryScope? FindInnermostScope(int offset)
+        {
+            return QueryScopes
+                .Where(scope => scope.Contains(offset))
+                .OrderBy(scope => scope.Length)
+                .FirstOrDefault();
+        }
+
+        private void AddInconclusiveTableSource(Identifier? alias, int startOffset)
+        {
+            if (alias is null || string.IsNullOrWhiteSpace(alias.Value))
+            {
+                return;
+            }
+
+            TableSources.Add(new TsqlTableSource(
+                alias.Value,
+                alias.Value,
+                null,
+                startOffset));
+        }
+
         private void AddUserType(DataTypeReference? dataType)
         {
             if (dataType is not UserDataTypeReference userType)
@@ -494,7 +765,7 @@ internal sealed record TsqlScriptAnalysis(
     TsqlUserTypeReference[] UserTypes,
     TsqlParameterDefinition[] Parameters,
     TsqlTempTable[] TempTables,
-    IReadOnlyDictionary<string, TsqlObjectReference> TableBindings,
+    TsqlTableVariable[] TableVariables,
     string[] CteNames,
     TsqlValidationDiagnostic[] Diagnostics);
 
@@ -523,15 +794,39 @@ internal sealed record TsqlObjectReference(
     string? Database,
     string? Server);
 
-internal sealed record TsqlColumnReference(string[] Identifiers, int Line, int Column);
+internal sealed record TsqlColumnReference(
+    string[] Identifiers,
+    int Line,
+    int Column,
+    TsqlColumnBinding? Binding,
+    string? InconclusiveReason,
+    int? ScopeStartOffset);
+
+internal sealed record TsqlColumnBinding(
+    string Kind,
+    string? Schema,
+    string Name,
+    IReadOnlySet<string> Columns);
 
 internal sealed record TsqlUserTypeReference(string Schema, string Name, int Line, int Column);
 
 internal sealed record TsqlParameterDefinition(string Name, string DataType, int Line, int Column);
 
-internal sealed record TsqlVariableReference(string Name, int Line, int Column);
+internal sealed record TsqlVariableReference(
+    string Name,
+    int Line,
+    int Column,
+    int StartOffset);
+
+internal sealed record TsqlVariableIdentity(string Name, int StartOffset);
 
 internal sealed record TsqlTempTable(
+    string Name,
+    int Line,
+    int Column,
+    IReadOnlySet<string> Columns);
+
+internal sealed record TsqlTableVariable(
     string Name,
     int Line,
     int Column,
@@ -542,3 +837,25 @@ internal sealed record TsqlInsertShape(
     int[] SourceColumnCounts,
     int Line,
     int Column);
+
+internal sealed record TsqlRawColumnReference(
+    string[] Identifiers,
+    int Line,
+    int Column,
+    int StartOffset);
+
+internal sealed record TsqlQueryScope(int StartOffset, int EndOffset)
+{
+    public int Length => EndOffset - StartOffset;
+
+    public bool Contains(int offset)
+    {
+        return offset >= StartOffset && offset < EndOffset;
+    }
+}
+
+internal sealed record TsqlTableSource(
+    string Qualifier,
+    string ObjectName,
+    TsqlObjectReference? Reference,
+    int StartOffset);

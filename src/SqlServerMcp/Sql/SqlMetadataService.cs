@@ -1276,6 +1276,7 @@ public sealed class SqlMetadataService
                 .ToArray(),
             references = referenceValidation,
             tempTables = analysis.TempTables,
+            tableVariables = analysis.TableVariables,
             elapsedMs = stopwatch.ElapsedMilliseconds
         };
     }
@@ -1377,8 +1378,7 @@ public sealed class SqlMetadataService
 
         foreach (var column in analysis.ColumnReferences.Where(reference => reference.Identifiers.Length >= 2))
         {
-            var qualifier = column.Identifiers[^2];
-            if (!analysis.TableBindings.TryGetValue(qualifier, out var binding))
+            if (column.Binding is not { Kind: "database_object", Schema: not null } binding)
             {
                 continue;
             }
@@ -6114,16 +6114,19 @@ public sealed class SqlMetadataService
             lines.RemoveAt(lines.Count - 1);
         }
 
-        for (var i = 0; i < lines.Count; i++)
+        var moduleHeaderIndex = lines.FindIndex(line => SqlModuleCreateRegex.IsMatch(line.Text));
+        if (moduleHeaderIndex > 0)
         {
-            if (string.IsNullOrWhiteSpace(lines[i].Text))
-            {
-                continue;
-            }
+            // Comments and deployment directives before CREATE/ALTER are batch wrapper,
+            // not part of sys.sql_modules.definition.
+            lines.RemoveRange(0, moduleHeaderIndex);
+        }
 
-            lines[i] = lines[i] with
+        if (lines.Count > 0 && SqlModuleCreateRegex.IsMatch(lines[0].Text))
+        {
+            lines[0] = lines[0] with
             {
-                Text = SqlModuleCreateRegex.Replace(lines[i].Text, match =>
+                Text = SqlModuleCreateRegex.Replace(lines[0].Text, match =>
                 {
                     var objectType = match.Groups[1].Value.StartsWith("PROC", StringComparison.OrdinalIgnoreCase)
                         ? "PROCEDURE"
@@ -6131,7 +6134,6 @@ public sealed class SqlMetadataService
                     return $"CREATE {objectType}";
                 })
             };
-            break;
         }
 
         return lines.ToArray();
