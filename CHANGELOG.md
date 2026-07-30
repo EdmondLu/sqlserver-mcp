@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## 2.0.1 - 2026-07-30
+
+- Fixed static T-SQL validation alias binding by resolving table sources within nested query, subquery, APPLY, and update scopes instead of using one global alias dictionary.
+- Added `DECLARE @table TABLE (...)` symbol and column support; named EXEC argument labels and update target aliases are no longer reported as undeclared variables or missing objects.
+- Downgraded derived/CTE row sources that cannot be bound uniquely to non-blocking `analysis_inconclusive` warnings instead of false `unresolved_column` errors.
+- Fixed module comparison normalization when deployment comments precede `CREATE OR ALTER`; preamble, `GO`, CREATE/ALTER form, and CREATE keyword whitespace are normalized before body and semantic hashes.
+
 ## 2.0.0 - 2026-07-30
 
 - Replaced JSON-in-text tool payloads with native MCP `structuredContent`, short compatibility text, MCP error signaling, and a uniform connection context.

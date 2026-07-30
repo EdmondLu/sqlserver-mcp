@@ -151,6 +151,45 @@ public sealed class ModuleFileDiffTests
     }
 
     [Fact]
+    public void NormalizeSqlModuleTextForComparison_IgnoresPreambleCommentAndCreateWhitespace()
+    {
+        const string databaseDefinition = """
+                                          CREATE   PROCEDURE dbo.Sample
+                                          AS
+                                          BEGIN
+                                              SELECT Value = 1;
+                                          END
+                                          """;
+        const string fileText = """
+                                /*
+                                    Deployment-only preamble. SQL Server does not retain this before CREATE.
+                                */
+                                CREATE OR ALTER PROCEDURE dbo.Sample
+                                AS
+                                BEGIN
+                                    SELECT Value = 1;
+                                END
+                                GO
+                                """;
+
+        var databaseBody = SqlMetadataService.NormalizeSqlModuleTextForComparison(databaseDefinition);
+        var fileBody = SqlMetadataService.NormalizeSqlModuleTextForComparison(fileText);
+        var databaseSemantic = SqlMetadataService.NormalizeSqlModuleTokens(databaseDefinition, includeComments: false);
+        var fileSemantic = SqlMetadataService.NormalizeSqlModuleTokens(fileText, includeComments: false);
+
+        Assert.Equal(databaseBody, fileBody);
+        Assert.Equal(databaseSemantic, fileSemantic);
+        Assert.Null(SqlMetadataService.FindFirstBodyDifference(databaseDefinition, fileText));
+        Assert.Equal(
+            "wrapper_only",
+            SqlMetadataService.ClassifyModuleFileDifference(
+                exactMatch: false,
+                bodyMatch: databaseBody == fileBody,
+                semanticMatch: databaseSemantic == fileSemantic,
+                formatAndCommentMatch: true));
+    }
+
+    [Fact]
     public void NormalizeSqlModuleTokens_DistinguishesCommentOnlyFromBodyChanges()
     {
         const string left = """
