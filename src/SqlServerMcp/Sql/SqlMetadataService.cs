@@ -28,6 +28,7 @@ public sealed class SqlMetadataService
     private const int DefaultCompactDiffLinesPerSide = 120;
     private const int MaxConfiguredDiffHunks = 50;
     private const int MaxConfiguredDiffLinesPerSide = 1000;
+    private static readonly TimeSpan ModuleCatalogFreshness = TimeSpan.FromSeconds(10);
     private static readonly Regex TempTableNameRegex = new(@"(?<![#\w])#[A-Za-z_][A-Za-z0-9_]*", RegexOptions.Compiled);
     private static readonly Regex SqlBatchSeparatorRegex = new(@"^\s*GO(?:\s+\d+)?\s*;?\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex SqlModuleCreateRegex = new(
@@ -79,6 +80,10 @@ public sealed class SqlMetadataService
     private readonly SqlServerMcpOptions _options;
     private readonly SqlConnectionFactory _connectionFactory;
     private readonly ReadonlySqlGuard _sqlGuard;
+    private readonly SemaphoreSlim _moduleCatalogRefreshLock = new(1, 1);
+    private readonly SemaphoreSlim _dependencyEdgeRefreshLock = new(1, 1);
+    private ModuleCatalogSnapshot? _moduleCatalogSnapshot;
+    private DependencyEdgeSnapshot? _dependencyEdgeSnapshot;
 
     public SqlMetadataService(
         SqlServerMcpOptions options,
@@ -88,6 +93,12 @@ public sealed class SqlMetadataService
         _options = options;
         _connectionFactory = connectionFactory;
         _sqlGuard = sqlGuard;
+    }
+
+    internal void ClearMetadataCaches()
+    {
+        Volatile.Write(ref _moduleCatalogSnapshot, null);
+        Volatile.Write(ref _dependencyEdgeSnapshot, null);
     }
 
     public async Task<object> TestConnectionAsync(CancellationToken cancellationToken)
@@ -1127,6 +1138,7 @@ public sealed class SqlMetadataService
             createDate = module.CreateDate,
             modifyDate = module.ModifyDate,
             definition = slice.Definition,
+            slices = slice.Slices,
             definitionLength = definition.Length,
             definitionSha256 = ComputeSha256Hex(definition),
             lineCount = slice.TotalLines,
@@ -1960,7 +1972,15 @@ public sealed class SqlMetadataService
             cancellationToken);
         var effectiveLimit = _options.Limits.ClampRows(limit);
         var allowedTypes = ObjectTypeMapper.MapModuleTypes(objectTypes).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var dependencyEdges = await LoadDependencyEdgesAsync(cancellationToken);
+        var dependencyTask = LoadDependencyEdgesForObjectAsync(target.ObjectId, incoming: true, cancellationToken);
+        var staticMatchesTask = FindUsageModuleMatchesAsync(
+            target.Name,
+            target.Schema,
+            objectTypes,
+            "ranked",
+            cancellationToken);
+        await Task.WhenAll(dependencyTask, staticMatchesTask);
+        var dependencyEdges = dependencyTask.Result;
         var confirmed = dependencyEdges
             .Where(edge => edge.ToObjectId == target.ObjectId && allowedTypes.Contains(edge.FromType))
             .OrderBy(edge => edge.FromSchema, StringComparer.OrdinalIgnoreCase)
@@ -1970,12 +1990,7 @@ public sealed class SqlMetadataService
         var transactionSignals = await LoadModuleTransactionSignalsAsync(
             confirmed.Select(edge => edge.FromObjectId).Distinct().ToArray(),
             cancellationToken);
-        var staticMatches = await FindUsageModuleMatchesAsync(
-            target.Name,
-            target.Schema,
-            objectTypes,
-            "ranked",
-            cancellationToken);
+        var staticMatches = staticMatchesTask.Result;
         var staticPage = staticMatches
             .Where(match => !match.Schema.Equals(target.Schema, StringComparison.OrdinalIgnoreCase)
                             || !match.ObjectName.Equals(target.Name, StringComparison.OrdinalIgnoreCase))
@@ -2030,14 +2045,17 @@ public sealed class SqlMetadataService
             ["V", "P", "PC", "FN", "IF", "TF", "FS", "FT", "TR"],
             cancellationToken);
         var effectiveLimit = _options.Limits.ClampRows(limit);
-        var dependencyEdges = await LoadDependencyEdgesAsync(cancellationToken);
+        var dependencyTask = LoadDependencyEdgesForObjectAsync(caller.ObjectId, incoming: false, cancellationToken);
+        var moduleTask = GetModuleDefinitionCoreAsync(caller.Schema, caller.Name, cancellationToken);
+        await Task.WhenAll(dependencyTask, moduleTask);
+        var dependencyEdges = dependencyTask.Result;
         var confirmed = dependencyEdges
             .Where(edge => edge.FromObjectId == caller.ObjectId)
             .OrderBy(edge => edge.ToSchema, StringComparer.OrdinalIgnoreCase)
             .ThenBy(edge => edge.ToName, StringComparer.OrdinalIgnoreCase)
             .Take(effectiveLimit)
             .ToArray();
-        var module = await GetModuleDefinitionCoreAsync(caller.Schema, caller.Name, cancellationToken);
+        var module = moduleTask.Result;
         var analysis = TsqlScriptAnalyzer.Analyze(module.Definition);
         var staticCalls = analysis.ObjectReferences
             .Where(reference => reference.Kind == "procedure_call")
@@ -3401,28 +3419,106 @@ public sealed class SqlMetadataService
 
     private async Task<DependencyEdge[]> LoadDependencyEdgesAsync(CancellationToken cancellationToken)
     {
-        const string sql = """
-                           SELECT DISTINCT
-                               from_object_id=F.object_id,
-                               from_schema=FS.name,
-                               from_name=F.name,
-                               from_type=F.type,
-                               to_object_id=T.object_id,
-                               to_schema=TS.name,
-                               to_name=T.name,
-                               to_type=T.type
-                           FROM sys.sql_expression_dependencies D
-                           INNER JOIN sys.objects F ON F.object_id=D.referencing_id
-                           INNER JOIN sys.schemas FS ON FS.schema_id=F.schema_id
-                           INNER JOIN sys.objects T ON T.object_id=D.referenced_id
-                           INNER JOIN sys.schemas TS ON TS.schema_id=T.schema_id
-                           WHERE F.is_ms_shipped=0
-                               AND T.is_ms_shipped=0
-                           ORDER BY FS.name, F.name, TS.name, T.name;
-                           """;
+        var now = DateTimeOffset.UtcNow;
+        var cached = Volatile.Read(ref _dependencyEdgeSnapshot);
+        if (cached is not null && now - cached.LoadedAt < ModuleCatalogFreshness)
+        {
+            return cached.Edges;
+        }
+
+        await _dependencyEdgeRefreshLock.WaitAsync(cancellationToken);
+        try
+        {
+            now = DateTimeOffset.UtcNow;
+            cached = Volatile.Read(ref _dependencyEdgeSnapshot);
+            if (cached is not null && now - cached.LoadedAt < ModuleCatalogFreshness)
+            {
+                return cached.Edges;
+            }
+
+            const string sql = """
+                               SELECT DISTINCT
+                                   from_object_id=F.object_id,
+                                   from_schema=FS.name,
+                                   from_name=F.name,
+                                   from_type=F.type,
+                                   to_object_id=T.object_id,
+                                   to_schema=TS.name,
+                                   to_name=T.name,
+                                   to_type=T.type
+                               FROM sys.sql_expression_dependencies D
+                               INNER JOIN sys.objects F ON F.object_id=D.referencing_id
+                               INNER JOIN sys.schemas FS ON FS.schema_id=F.schema_id
+                               INNER JOIN sys.objects T ON T.object_id=D.referenced_id
+                               INNER JOIN sys.schemas TS ON TS.schema_id=T.schema_id
+                               WHERE F.is_ms_shipped=0
+                                   AND T.is_ms_shipped=0
+                               ORDER BY FS.name, F.name, TS.name, T.name;
+                               """;
+            var rows = await QueryAsync(
+                sql,
+                [],
+                reader => new DependencyEdge(
+                    reader.GetInt32("from_object_id"),
+                    reader.GetString("from_schema"),
+                    reader.GetString("from_name"),
+                    reader.GetString("from_type").Trim(),
+                    reader.GetInt32("to_object_id"),
+                    reader.GetString("to_schema"),
+                    reader.GetString("to_name"),
+                    reader.GetString("to_type").Trim()),
+                cancellationToken);
+            var edges = rows.ToArray();
+            Volatile.Write(ref _dependencyEdgeSnapshot, new DependencyEdgeSnapshot(now, edges));
+            return edges;
+        }
+        finally
+        {
+            _dependencyEdgeRefreshLock.Release();
+        }
+    }
+
+    private async Task<DependencyEdge[]> LoadDependencyEdgesForObjectAsync(
+        int objectId,
+        bool incoming,
+        CancellationToken cancellationToken)
+    {
+        var cached = Volatile.Read(ref _dependencyEdgeSnapshot);
+        if (cached is not null && DateTimeOffset.UtcNow - cached.LoadedAt < ModuleCatalogFreshness)
+        {
+            return cached.Edges
+                .Where(edge => incoming
+                    ? edge.ToObjectId == objectId
+                    : edge.FromObjectId == objectId)
+                .ToArray();
+        }
+
+        var predicate = incoming
+            ? "D.referenced_id=@objectId"
+            : "D.referencing_id=@objectId";
+        var sql = $"""
+                   SELECT DISTINCT
+                       from_object_id=F.object_id,
+                       from_schema=FS.name,
+                       from_name=F.name,
+                       from_type=F.type,
+                       to_object_id=T.object_id,
+                       to_schema=TS.name,
+                       to_name=T.name,
+                       to_type=T.type
+                   FROM sys.sql_expression_dependencies D
+                   INNER JOIN sys.objects F ON F.object_id=D.referencing_id
+                   INNER JOIN sys.schemas FS ON FS.schema_id=F.schema_id
+                   INNER JOIN sys.objects T ON T.object_id=D.referenced_id
+                   INNER JOIN sys.schemas TS ON TS.schema_id=T.schema_id
+                   WHERE F.is_ms_shipped=0
+                       AND T.is_ms_shipped=0
+                       AND {predicate}
+                   ORDER BY FS.name, F.name, TS.name, T.name;
+                   """;
         var rows = await QueryAsync(
             sql,
-            [],
+            [new("@objectId", SqlDbType.Int) { Value = objectId }],
             reader => new DependencyEdge(
                 reader.GetInt32("from_object_id"),
                 reader.GetString("from_schema"),
@@ -3445,30 +3541,15 @@ public sealed class SqlMetadataService
             return [];
         }
 
-        var parameters = new List<SqlParameter>();
-        var parameterNames = new List<string>();
-        for (var i = 0; i < objectIds.Count; i++)
-        {
-            var parameterName = $"@transactionObject{i}";
-            parameters.Add(new(parameterName, SqlDbType.Int) { Value = objectIds[i] });
-            parameterNames.Add(parameterName);
-        }
-
-        var sql = $"""
-                   SELECT object_id=O.object_id, definition=M.definition
-                   FROM sys.objects O
-                   INNER JOIN sys.sql_modules M ON M.object_id=O.object_id
-                   WHERE O.object_id IN ({string.Join(", ", parameterNames)});
-                   """;
-        var rows = await QueryAsync(
-            sql,
-            parameters,
-            reader => new
+        var requestedObjectIds = objectIds.ToHashSet();
+        var rows = (await LoadModuleCatalogAsync(cancellationToken))
+            .Where(module => requestedObjectIds.Contains(module.ObjectId))
+            .Select(module => new
             {
-                ObjectId = reader.GetInt32("object_id"),
-                Definition = reader.GetNullableString("definition") ?? string.Empty
-            },
-            cancellationToken);
+                module.ObjectId,
+                module.Definition
+            })
+            .ToArray();
         var signalRegex = new Regex(
             @"\b(?:BEGIN\s+(?:DISTRIBUTED\s+)?TRAN(?:SACTION)?|COMMIT(?:\s+TRAN(?:SACTION)?)?|ROLLBACK(?:\s+TRAN(?:SACTION)?)?|BEGIN\s+TRY|BEGIN\s+CATCH|XACT_STATE\s*\()",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -3639,63 +3720,29 @@ public sealed class SqlMetadataService
         CancellationToken cancellationToken)
     {
         var typeCodes = ObjectTypeMapper.MapModuleTypes(objectTypes);
-        var parameters = new List<SqlParameter>
-        {
-            new("@name", SqlDbType.NVarChar, 128) { Value = name }
-        };
-        var typePredicate = BuildInPredicate("RO.type", "usageDependencyType", typeCodes, parameters);
-        var schemaPredicate = string.Empty;
-        if (!string.IsNullOrWhiteSpace(schema))
-        {
-            parameters.Add(new("@schema", SqlDbType.NVarChar, 128) { Value = schema });
-            schemaPredicate = "AND COALESCE(RS.name, D.referenced_schema_name, N'dbo')=@schema";
-        }
-
-        var sql = $"""
-                   SELECT DISTINCT
-                       schema_name=S.name,
-                       object_name=RO.name,
-                       object_type=RO.type,
-                       object_type_desc=RO.type_desc,
-                       referenced_schema=COALESCE(RS.name, D.referenced_schema_name),
-                       referenced_name=COALESCE(T.name, D.referenced_entity_name)
-                   FROM sys.sql_expression_dependencies D
-                   INNER JOIN sys.objects RO ON RO.object_id=D.referencing_id
-                   INNER JOIN sys.schemas S ON S.schema_id=RO.schema_id
-                   LEFT JOIN sys.objects T ON T.object_id=D.referenced_id
-                   LEFT JOIN sys.schemas RS ON RS.schema_id=T.schema_id
-                   WHERE RO.is_ms_shipped=0
-                       AND {typePredicate}
-                       AND COALESCE(T.name, D.referenced_entity_name)=@name
-                       {schemaPredicate}
-                   ORDER BY S.name, RO.type, RO.name;
-                   """;
-
-        var rows = await QueryAsync(
-            sql,
-            parameters,
-            reader => new UsageMatch(
+        var edges = await LoadDependencyEdgesAsync(cancellationToken);
+        return edges
+            .Where(edge => typeCodes.Contains(edge.FromType, StringComparer.OrdinalIgnoreCase))
+            .Where(edge => edge.ToName.Equals(name, StringComparison.OrdinalIgnoreCase))
+            .Where(edge => string.IsNullOrWhiteSpace(schema)
+                           || edge.ToSchema.Equals(schema, StringComparison.OrdinalIgnoreCase))
+            .Select(edge => new UsageMatch(
                 "dependency",
-                reader.GetString("schema_name"),
-                reader.GetString("object_name"),
-                ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
-                reader.GetString("object_type_desc"),
+                edge.FromSchema,
+                edge.FromName,
+                ObjectTypeMapper.ToPublicType(edge.FromType),
+                ObjectTypeMapper.ToTypeDescription(edge.FromType),
                 "sql_expression_dependency",
-                string.Join(
-                    ".",
-                    new[]
-                    {
-                        reader.GetNullableString("referenced_schema"),
-                        reader.GetNullableString("referenced_name")
-                    }.Where(value => !string.IsNullOrWhiteSpace(value))),
+                $"{edge.ToSchema}.{edge.ToName}",
                 null,
                 null,
                 "Confirmed by sys.sql_expression_dependencies.",
                 1.0,
-                null),
-            cancellationToken);
-
-        return rows.ToArray();
+                null))
+            .OrderBy(match => match.Schema, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(match => match.ObjectType, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(match => match.ObjectName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 
     private async Task<UsageMatch[]> FindUsageColumnMatchesAsync(
@@ -3760,51 +3807,130 @@ public sealed class SqlMetadataService
         CancellationToken cancellationToken)
     {
         var typeCodes = ObjectTypeMapper.MapModuleTypes(objectTypes);
-        var parameters = new List<SqlParameter>
-        {
-            new("@scanLimit", SqlDbType.Int) { Value = 10_000 }
-        };
-
-        var textPredicate = string.Empty;
-        if (matchMode != "regex")
-        {
-            parameters.Add(new("@needle", SqlDbType.NVarChar, 4000) { Value = name });
-            textPredicate = "AND CHARINDEX(@needle, M.definition) > 0";
-        }
-
-        var typePredicates = BuildInPredicate("O.type", "type", typeCodes, parameters);
-        var sql = $"""
-                   SELECT TOP (@scanLimit)
-                       schema_name=S.name,
-                       object_name=O.name,
-                       object_type=O.type,
-                       object_type_desc=O.type_desc,
-                       definition=M.definition,
-                       modify_date=O.modify_date
-                   FROM sys.sql_modules M
-                   INNER JOIN sys.objects O ON O.object_id=M.object_id
-                   INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
-                   WHERE O.is_ms_shipped=0
-                       AND {typePredicates}
-                       {textPredicate}
-                   ORDER BY S.name, O.type, O.name;
-                   """;
-
-        var rows = await QueryAsync(
-            sql,
-            parameters,
-            reader => new UsageModuleSource(
-                reader.GetString("schema_name"),
-                reader.GetString("object_name"),
-                ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
-                reader.GetString("object_type_desc"),
-                reader.GetNullableString("definition") ?? string.Empty,
-                reader.GetDateTime("modify_date")),
-            cancellationToken);
-
-        return rows
+        var catalog = await LoadModuleCatalogAsync(cancellationToken);
+        var candidates = catalog
+            .Where(module => typeCodes.Contains(module.TypeCode, StringComparer.OrdinalIgnoreCase))
+            .Where(module => matchMode == "regex"
+                             || module.Definition.Contains(name, StringComparison.OrdinalIgnoreCase));
+        return candidates
             .SelectMany(row => AnalyzeUsageMatches(row, name, schema, matchMode))
             .ToArray();
+    }
+
+    private async Task<UsageModuleSource[]> LoadModuleCatalogAsync(CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var cached = Volatile.Read(ref _moduleCatalogSnapshot);
+        if (cached is not null && now - cached.ValidatedAt < ModuleCatalogFreshness)
+        {
+            return cached.Modules;
+        }
+
+        await _moduleCatalogRefreshLock.WaitAsync(cancellationToken);
+        try
+        {
+            now = DateTimeOffset.UtcNow;
+            cached = Volatile.Read(ref _moduleCatalogSnapshot);
+            if (cached is not null && now - cached.ValidatedAt < ModuleCatalogFreshness)
+            {
+                return cached.Modules;
+            }
+
+            if (cached is not null)
+            {
+                var currentVersions = await LoadModuleCatalogVersionsAsync(cancellationToken);
+                if (ModuleCatalogVersionsMatch(cached.Versions, currentVersions))
+                {
+                    var refreshed = cached with { ValidatedAt = now };
+                    Volatile.Write(ref _moduleCatalogSnapshot, refreshed);
+                    return refreshed.Modules;
+                }
+            }
+
+            var modules = await LoadAllModuleSourcesAsync(cancellationToken);
+            var snapshot = new ModuleCatalogSnapshot(
+                now,
+                modules,
+                modules.ToDictionary(module => module.ObjectId, module => module.ModifyDate));
+            Volatile.Write(ref _moduleCatalogSnapshot, snapshot);
+            return snapshot.Modules;
+        }
+        finally
+        {
+            _moduleCatalogRefreshLock.Release();
+        }
+    }
+
+    private async Task<Dictionary<int, DateTime>> LoadModuleCatalogVersionsAsync(
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+                           SELECT object_id=O.object_id, modify_date=O.modify_date
+                           FROM sys.sql_modules M
+                           INNER JOIN sys.objects O ON O.object_id=M.object_id
+                           WHERE O.is_ms_shipped=0
+                               AND O.type IN (N'V', N'P', N'PC', N'FN', N'IF', N'TF', N'FS', N'FT', N'TR');
+                           """;
+        var rows = await QueryAsync(
+            sql,
+            [],
+            reader => new
+            {
+                ObjectId = reader.GetInt32("object_id"),
+                ModifyDate = reader.GetDateTime("modify_date")
+            },
+            cancellationToken);
+        return rows.ToDictionary(row => row.ObjectId, row => row.ModifyDate);
+    }
+
+    private async Task<UsageModuleSource[]> LoadAllModuleSourcesAsync(CancellationToken cancellationToken)
+    {
+        const string sql = """
+                           SELECT
+                               object_id=O.object_id,
+                               schema_name=S.name,
+                               object_name=O.name,
+                               object_type=O.type,
+                               object_type_desc=O.type_desc,
+                               definition=M.definition,
+                               modify_date=O.modify_date
+                           FROM sys.sql_modules M
+                           INNER JOIN sys.objects O ON O.object_id=M.object_id
+                           INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
+                           WHERE O.is_ms_shipped=0
+                               AND O.type IN (N'V', N'P', N'PC', N'FN', N'IF', N'TF', N'FS', N'FT', N'TR')
+                           ORDER BY S.name, O.type, O.name;
+                           """;
+        var rows = await QueryAsync(
+            sql,
+            [],
+            reader =>
+            {
+                var definition = reader.GetNullableString("definition") ?? string.Empty;
+                var typeCode = reader.GetString("object_type").Trim();
+                return new UsageModuleSource(
+                    reader.GetString("schema_name"),
+                    reader.GetString("object_name"),
+                    ObjectTypeMapper.ToPublicType(typeCode),
+                    reader.GetString("object_type_desc"),
+                    definition,
+                    reader.GetDateTime("modify_date"),
+                    reader.GetInt32("object_id"),
+                    typeCode,
+                    BuildLineStartOffsets(definition));
+            },
+            cancellationToken);
+        return rows.ToArray();
+    }
+
+    private static bool ModuleCatalogVersionsMatch(
+        IReadOnlyDictionary<int, DateTime> cached,
+        IReadOnlyDictionary<int, DateTime> current)
+    {
+        return cached.Count == current.Count
+               && cached.All(pair =>
+                   current.TryGetValue(pair.Key, out var modifyDate)
+                   && modifyDate == pair.Value);
     }
 
     internal static UsageMatch[] AnalyzeUsageMatches(
@@ -3865,7 +3991,10 @@ public sealed class SqlMetadataService
 
         foreach (var occurrence in occurrences)
         {
-            var (lineNumber, columnNumber, context) = LocateTextMatch(definition, occurrence.Index);
+            var (lineNumber, columnNumber, context) = LocateTextMatch(
+                definition,
+                occurrence.Index,
+                source.LineStartOffsets);
             var isDynamicSql = IsInsideSqlString(definition, occurrence.Index);
             var isComment = IsInsideSqlComment(definition, occurrence.Index);
             var isTwoPart = IsTwoPartIdentifierMatch(definition, occurrence.Index, occurrence.Length, schema);
@@ -3952,21 +4081,25 @@ public sealed class SqlMetadataService
         }
     }
 
-    private static (int LineNumber, int ColumnNumber, string Context) LocateTextMatch(string text, int index)
+    private static (int LineNumber, int ColumnNumber, string Context) LocateTextMatch(
+        string text,
+        int index,
+        int[]? lineStartOffsets)
     {
-        var lineNumber = 1;
-        for (var i = 0; i < index; i++)
+        var offsets = lineStartOffsets is { Length: > 0 }
+            ? lineStartOffsets
+            : BuildLineStartOffsets(text);
+        var lineIndex = Array.BinarySearch(offsets, index);
+        if (lineIndex < 0)
         {
-            if (text[i] == '\n')
-            {
-                lineNumber++;
-            }
+            lineIndex = Math.Max(0, ~lineIndex - 1);
         }
 
-        var lineStart = text.LastIndexOf('\n', Math.Max(0, index - 1));
-        lineStart = lineStart < 0 ? 0 : lineStart + 1;
-        var lineEnd = text.IndexOf('\n', index);
-        lineEnd = lineEnd < 0 ? text.Length : lineEnd;
+        var lineNumber = lineIndex + 1;
+        var lineStart = offsets[lineIndex];
+        var lineEnd = lineIndex + 1 < offsets.Length
+            ? Math.Max(lineStart, offsets[lineIndex + 1] - 1)
+            : text.Length;
         var context = text[lineStart..lineEnd].TrimEnd('\r');
         if (context.Length > 500)
         {
@@ -3977,6 +4110,20 @@ public sealed class SqlMetadataService
         }
 
         return (lineNumber, index - lineStart + 1, context);
+    }
+
+    private static int[] BuildLineStartOffsets(string text)
+    {
+        var offsets = new List<int> { 0 };
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '\n' && i + 1 < text.Length)
+            {
+                offsets.Add(i + 1);
+            }
+        }
+
+        return offsets.ToArray();
     }
 
     private static bool IsInsideSqlString(string text, int index)
@@ -5685,11 +5832,13 @@ public sealed class SqlMetadataService
             ? MergeLineRanges(ranges)
             : ranges.OrderBy(range => range.Start).ThenBy(range => range.End).ToArray();
         var selectedLines = new List<ModuleDefinitionLine>();
+        var slices = new List<ModuleDefinitionSliceSegment>();
         var matchedLines = new List<int>();
         var truncated = false;
 
         foreach (var range in effectiveRanges)
         {
+            var sliceLines = new List<ModuleDefinitionLine>();
             for (var lineNumber = range.Start; lineNumber <= range.End; lineNumber++)
             {
                 if (selectedLines.Count >= maxLines)
@@ -5699,11 +5848,22 @@ public sealed class SqlMetadataService
                 }
 
                 var text = allLines[lineNumber - 1];
-                selectedLines.Add(new ModuleDefinitionLine(lineNumber, text));
+                var selectedLine = new ModuleDefinitionLine(lineNumber, text);
+                selectedLines.Add(selectedLine);
+                sliceLines.Add(selectedLine);
                 if (keywords.Any(keyword => text.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
                 {
                     matchedLines.Add(lineNumber);
                 }
+            }
+
+            if (sliceLines.Count > 0)
+            {
+                slices.Add(new ModuleDefinitionSliceSegment(
+                    sliceLines[0].LineNumber,
+                    sliceLines[^1].LineNumber,
+                    string.Join(Environment.NewLine, sliceLines.Select(line => line.Text)),
+                    sliceLines.ToArray()));
             }
 
             if (truncated)
@@ -5713,18 +5873,42 @@ public sealed class SqlMetadataService
         }
 
         var isPartial = reason != "full" || truncated;
+        var returnedDefinition = BuildSlicedDefinition(slices);
         return new ModuleDefinitionSlice(
-            string.Join(Environment.NewLine, selectedLines.Select(line => line.Text)),
+            returnedDefinition,
             totalLines,
-            selectedLines.Count == 0 ? null : selectedLines[0].LineNumber,
-            selectedLines.Count == 0 ? null : selectedLines[^1].LineNumber,
+            selectedLines.Count == 0 ? null : selectedLines.Min(line => line.LineNumber),
+            selectedLines.Count == 0 ? null : selectedLines.Max(line => line.LineNumber),
             selectedLines.Count,
             isPartial,
             truncated,
             reason,
             contextLines,
             matchedLines.Distinct().ToArray(),
-            selectedLines.ToArray());
+            selectedLines.ToArray(),
+            slices.ToArray());
+    }
+
+    private static string BuildSlicedDefinition(IReadOnlyList<ModuleDefinitionSliceSegment> slices)
+    {
+        if (slices.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string> { slices[0].Definition };
+        for (var i = 1; i < slices.Count; i++)
+        {
+            var previous = slices[i - 1];
+            var current = slices[i];
+            var separator = current.StartLine > previous.EndLine + 1
+                ? $"-- ... omitted lines {previous.EndLine + 1}-{current.StartLine - 1} ..."
+                : $"-- ... next selected slice starts at line {current.StartLine} ...";
+            parts.Add(separator);
+            parts.Add(current.Definition);
+        }
+
+        return string.Join(Environment.NewLine, parts);
     }
 
     private static IReadOnlyList<(int Start, int End)> MergeLineRanges(IReadOnlyList<(int Start, int End)> ranges)
@@ -6974,33 +7158,45 @@ public sealed class SqlMetadataService
         return maxLength < 0 ? -1 : maxLength;
     }
 
-    private static int? NormalizeMaxLengthCharacters(short maxLength, string dataType)
+    internal static int? NormalizeMaxLengthCharacters(short maxLength, string dataType)
     {
-        if (maxLength < 0)
+        if (dataType.Equals("nvarchar", StringComparison.OrdinalIgnoreCase)
+            || dataType.Equals("nchar", StringComparison.OrdinalIgnoreCase)
+            || dataType.Equals("sysname", StringComparison.OrdinalIgnoreCase))
         {
-            return -1;
+            return maxLength < 0 ? -1 : maxLength / 2;
         }
 
-        return dataType.Equals("nvarchar", StringComparison.OrdinalIgnoreCase)
-               || dataType.Equals("nchar", StringComparison.OrdinalIgnoreCase)
-               || dataType.Equals("sysname", StringComparison.OrdinalIgnoreCase)
-            ? maxLength / 2
-            : maxLength;
+        if (dataType.Equals("varchar", StringComparison.OrdinalIgnoreCase)
+            || dataType.Equals("char", StringComparison.OrdinalIgnoreCase))
+        {
+            return maxLength < 0 ? -1 : maxLength;
+        }
+
+        return null;
     }
 
-    private static int? NormalizeResultMaxLengthCharacters(int? maxLength, string? systemTypeName)
+    internal static int? NormalizeResultMaxLengthCharacters(int? maxLength, string? systemTypeName)
     {
-        if (maxLength is null or < 0)
+        if (maxLength is null || string.IsNullOrWhiteSpace(systemTypeName))
         {
-            return maxLength;
+            return null;
         }
 
-        return systemTypeName is not null
-               && (systemTypeName.StartsWith("nvarchar", StringComparison.OrdinalIgnoreCase)
-                   || systemTypeName.StartsWith("nchar", StringComparison.OrdinalIgnoreCase)
-                   || systemTypeName.StartsWith("sysname", StringComparison.OrdinalIgnoreCase))
-            ? maxLength / 2
-            : maxLength;
+        if (systemTypeName.StartsWith("nvarchar", StringComparison.OrdinalIgnoreCase)
+            || systemTypeName.StartsWith("nchar", StringComparison.OrdinalIgnoreCase)
+            || systemTypeName.StartsWith("sysname", StringComparison.OrdinalIgnoreCase))
+        {
+            return maxLength < 0 ? -1 : maxLength / 2;
+        }
+
+        if (systemTypeName.StartsWith("varchar", StringComparison.OrdinalIgnoreCase)
+            || systemTypeName.StartsWith("char", StringComparison.OrdinalIgnoreCase))
+        {
+            return maxLength < 0 ? -1 : maxLength;
+        }
+
+        return null;
     }
 
     internal static DescribeTablePreset BuildDescribeTablePreset(string? mode)
@@ -7422,6 +7618,8 @@ public sealed class SqlMetadataService
         var memoryGrants = new List<ShowplanMemoryGrantNode>();
         var parseErrors = new List<string>();
         var implicitConversionCount = 0;
+        var columnSideImplicitConversionCount = 0;
+        var seekPreservingImplicitConversionCount = 0;
 
         foreach (var plan in plans.Where(plan => !string.IsNullOrWhiteSpace(plan)))
         {
@@ -7457,11 +7655,10 @@ public sealed class SqlMetadataService
             operators.AddRange(rootOperators);
             missingIndexes.AddRange(ReadMissingIndexes(document.Root));
             warnings.AddRange(ReadShowplanWarnings(document.Root));
-            implicitConversionCount += Math.Max(
-                DescendantsByLocalName(document.Root, "PlanAffectingConvert").Count(),
-                DescendantsByLocalName(document.Root, "ScalarOperator")
-                    .Count(element => (ReadAttribute(element, "ScalarString") ?? string.Empty)
-                        .Contains("CONVERT_IMPLICIT", StringComparison.OrdinalIgnoreCase)));
+            var conversionCounts = ReadImplicitConversionCounts(document.Root);
+            implicitConversionCount += conversionCounts.TotalCount;
+            columnSideImplicitConversionCount += conversionCounts.ColumnSideCount;
+            seekPreservingImplicitConversionCount += conversionCounts.SeekPreservingCount;
         }
 
         if (statementCount == 0 && parseErrors.Count == 0)
@@ -7477,6 +7674,8 @@ public sealed class SqlMetadataService
             operators.Count(operatorSummary => ContainsOperator(operatorSummary.PhysicalOp, "Parallelism")),
             missingIndexes.Count,
             implicitConversionCount,
+            columnSideImplicitConversionCount,
+            seekPreservingImplicitConversionCount,
             warnings.Count);
         var warningCounts = BuildShowplanWarningCounts(warnings);
         var memoryGrantSummary = BuildShowplanMemoryGrantSummary(memoryGrants);
@@ -7526,11 +7725,23 @@ public sealed class SqlMetadataService
 
         if (counts.ImplicitConversionCount > 0)
         {
+            var isHighRisk = warningCounts.PlanAffectingConvertCount > 0
+                             || counts.ColumnSideImplicitConversionCount > 0;
+            var preservesSeeks = !isHighRisk
+                                 && counts.SeekPreservingImplicitConversionCount == counts.ImplicitConversionCount;
             risks.Add(new ShowplanRisk(
                 "implicit_conversion",
-                "high",
-                $"Plan reports {counts.ImplicitConversionCount} plan-affecting implicit conversion(s).",
-                "Check mismatched parameter, variable, and column data types; conversions on indexed columns can block seeks."));
+                isHighRisk ? "high" : preservesSeeks ? "info" : "medium",
+                isHighRisk
+                    ? $"Plan reports {counts.ImplicitConversionCount} implicit conversion(s), including a column-side or plan-affecting conversion."
+                    : preservesSeeks
+                        ? $"Plan reports {counts.ImplicitConversionCount} non-plan-affecting implicit conversion(s) while retaining index seek operators."
+                        : $"Plan reports {counts.ImplicitConversionCount} implicit conversion(s) without a column-side or PlanAffectingConvert signal.",
+                isHighRisk
+                    ? "Align parameter, variable, and indexed-column data types; column-side conversions can block seeks or distort estimates."
+                    : preservesSeeks
+                        ? "Treat this as informational unless runtime evidence shows regressions; the estimated plan still preserves index seeks."
+                        : "Review the converted expression and runtime plan before changing types; no direct seek-blocking signal was detected."));
         }
 
         if (counts.ScanCount > 0)
@@ -7636,6 +7847,50 @@ public sealed class SqlMetadataService
                 ReadAttribute(statement, "NonParallelPlanReason"),
                 ReadAttribute(statement, "CardinalityEstimationModelVersion"));
         }
+    }
+
+    private static ShowplanImplicitConversionCounts ReadImplicitConversionCounts(XElement root)
+    {
+        var planAffectingCount = DescendantsByLocalName(root, "PlanAffectingConvert").Count();
+        var convertNodes = DescendantsByLocalName(root, "Convert")
+            .Where(element =>
+                string.Equals(ReadAttribute(element, "Implicit"), "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ReadAttribute(element, "Implicit"), "true", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        XElement[] conversionNodes;
+        if (convertNodes.Length > 0)
+        {
+            conversionNodes = convertNodes;
+        }
+        else
+        {
+            conversionNodes = DescendantsByLocalName(root, "ScalarOperator")
+                .Where(element => (ReadAttribute(element, "ScalarString") ?? string.Empty)
+                    .Contains("CONVERT_IMPLICIT", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+        }
+
+        var columnSideCount = conversionNodes.Count(HasTableBackedColumnReference);
+        var seekPreservingCount = conversionNodes.Count(element =>
+            !HasTableBackedColumnReference(element)
+            && element.Ancestors()
+                .Where(ancestor => ancestor.Name.LocalName.Equals("RelOp", StringComparison.Ordinal))
+                .Select(ancestor => ReadAttribute(ancestor, "PhysicalOp"))
+                .Any(physicalOp => ContainsOperator(physicalOp, "Seek")));
+        return new ShowplanImplicitConversionCounts(
+            Math.Max(planAffectingCount, conversionNodes.Length),
+            columnSideCount,
+            seekPreservingCount);
+    }
+
+    private static bool HasTableBackedColumnReference(XElement element)
+    {
+        return element.Descendants()
+            .Where(descendant => descendant.Name.LocalName.Equals("ColumnReference", StringComparison.Ordinal))
+            .Any(column =>
+                !string.IsNullOrWhiteSpace(ReadAttribute(column, "Table"))
+                || !string.IsNullOrWhiteSpace(ReadAttribute(column, "Schema"))
+                || !string.IsNullOrWhiteSpace(ReadAttribute(column, "Database")));
     }
 
     private static ShowplanMemoryGrantNode ReadShowplanMemoryGrant(XElement element)
@@ -7873,7 +8128,14 @@ public sealed class SqlMetadataService
         int ParallelismCount,
         int MissingIndexCount,
         int ImplicitConversionCount,
+        int ColumnSideImplicitConversionCount,
+        int SeekPreservingImplicitConversionCount,
         int WarningCount);
+
+    private sealed record ShowplanImplicitConversionCounts(
+        int TotalCount,
+        int ColumnSideCount,
+        int SeekPreservingCount);
 
     internal sealed record ShowplanRisk(
         string Code,
@@ -7999,6 +8261,10 @@ public sealed class SqlMetadataService
         string ToName,
         string ToType);
 
+    private sealed record DependencyEdgeSnapshot(
+        DateTimeOffset LoadedAt,
+        DependencyEdge[] Edges);
+
     private sealed record DependencyGraphNode(
         int ObjectId,
         string Schema,
@@ -8022,9 +8288,16 @@ public sealed class SqlMetadataService
         string Reason,
         int ContextLines,
         int[] MatchedLines,
-        ModuleDefinitionLine[] Lines);
+        ModuleDefinitionLine[] Lines,
+        ModuleDefinitionSliceSegment[] Slices);
 
     internal sealed record ModuleDefinitionLine(int LineNumber, string Text);
+
+    internal sealed record ModuleDefinitionSliceSegment(
+        int StartLine,
+        int EndLine,
+        string Definition,
+        ModuleDefinitionLine[] Lines);
 
     private sealed record ModuleDefinitionInfo(
         string Schema,
@@ -8367,7 +8640,15 @@ public sealed class SqlMetadataService
         string Type,
         string TypeDesc,
         string Definition,
-        DateTime ModifyDate);
+        DateTime ModifyDate,
+        int ObjectId = 0,
+        string TypeCode = "",
+        int[]? LineStartOffsets = null);
+
+    private sealed record ModuleCatalogSnapshot(
+        DateTimeOffset ValidatedAt,
+        UsageModuleSource[] Modules,
+        IReadOnlyDictionary<int, DateTime> Versions);
 
     internal sealed record UsageMatch(
         string SourceKind,
@@ -8504,6 +8785,24 @@ internal static class ObjectTypeMapper
             "FN" or "IF" or "TF" or "FS" or "FT" => "function",
             "TR" => "trigger",
             _ => normalized
+        };
+    }
+
+    public static string ToTypeDescription(string sqlType)
+    {
+        return sqlType.Trim() switch
+        {
+            "U" => "USER_TABLE",
+            "V" => "VIEW",
+            "P" => "SQL_STORED_PROCEDURE",
+            "PC" => "CLR_STORED_PROCEDURE",
+            "FN" => "SQL_SCALAR_FUNCTION",
+            "IF" => "SQL_INLINE_TABLE_VALUED_FUNCTION",
+            "TF" => "SQL_TABLE_VALUED_FUNCTION",
+            "FS" => "CLR_SCALAR_FUNCTION",
+            "FT" => "CLR_TABLE_VALUED_FUNCTION",
+            "TR" => "SQL_TRIGGER",
+            var normalized => normalized
         };
     }
 

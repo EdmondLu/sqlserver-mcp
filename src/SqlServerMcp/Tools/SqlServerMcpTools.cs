@@ -451,7 +451,7 @@ public static class SqlServerMcpTools
         return service.BatchMetadataAsync(requests, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Clear cached Credential Manager values and SQL connection pools. The next DB request will read the credential again.")]
+    [McpServerTool(ReadOnly = true), Description("Clear cached Credential Manager values, SQL connection pools, and metadata snapshots. The next DB request will reload them.")]
     public static Task<CallToolResult> ReloadConnection(
         SqlServerToolService service,
         CancellationToken cancellationToken)

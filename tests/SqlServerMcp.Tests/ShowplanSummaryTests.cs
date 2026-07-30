@@ -100,4 +100,54 @@ public sealed class ShowplanSummaryTests
         Assert.Single(summary.ParseErrors);
         Assert.Empty(summary.Risks);
     }
+
+    [Fact]
+    public void SummarizeShowplanXml_DemotesConstantSideSeekPreservingConversionToInfo()
+    {
+        const string xml = """
+                           <ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+                             <BatchSequence>
+                               <Batch>
+                                 <Statements>
+                                   <StmtSimple StatementText="SELECT Id FROM dbo.Plan WHERE Id = 1" StatementType="SELECT" StatementSubTreeCost="0.01">
+                                     <QueryPlan>
+                                       <RelOp NodeId="0" PhysicalOp="Index Seek" LogicalOp="Index Seek" EstimatedTotalSubtreeCost="0.01" EstimateRows="1">
+                                         <IndexScan>
+                                           <Object Database="[TDSCM]" Schema="[dbo]" Table="[Plan]" Index="[IX_Plan_Id]" />
+                                           <SeekPredicates>
+                                             <SeekPredicateNew>
+                                               <SeekKeys>
+                                                 <Prefix ScanType="EQ">
+                                                   <RangeExpressions>
+                                                     <ScalarOperator ScalarString="CONVERT_IMPLICIT(bigint,(1),0)">
+                                                       <Convert DataType="bigint" Style="0" Implicit="1">
+                                                         <ScalarOperator>
+                                                           <Const ConstValue="(1)" />
+                                                         </ScalarOperator>
+                                                       </Convert>
+                                                     </ScalarOperator>
+                                                   </RangeExpressions>
+                                                 </Prefix>
+                                               </SeekKeys>
+                                             </SeekPredicateNew>
+                                           </SeekPredicates>
+                                         </IndexScan>
+                                       </RelOp>
+                                     </QueryPlan>
+                                   </StmtSimple>
+                                 </Statements>
+                               </Batch>
+                             </BatchSequence>
+                           </ShowPlanXML>
+                           """;
+
+        var summary = SqlMetadataService.SummarizeShowplanXml([xml]);
+
+        Assert.Equal(1, summary.OperatorCounts.ImplicitConversionCount);
+        Assert.Equal(0, summary.OperatorCounts.ColumnSideImplicitConversionCount);
+        Assert.Equal(1, summary.OperatorCounts.SeekPreservingImplicitConversionCount);
+        var risk = Assert.Single(summary.Risks, risk => risk.Code == "implicit_conversion");
+        Assert.Equal("info", risk.Severity);
+        Assert.Contains("retaining index seek", risk.Message, StringComparison.OrdinalIgnoreCase);
+    }
 }

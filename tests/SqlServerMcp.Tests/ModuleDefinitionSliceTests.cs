@@ -117,4 +117,43 @@ public sealed class ModuleDefinitionSliceTests
         Assert.Equal([4], slice.MatchedLines);
         Assert.Equal("INSERT INTO B(id) SELECT 1", slice.Definition);
     }
+
+    [Fact]
+    public void BuildModuleDefinitionSlice_PreservesDiscontinuousSliceBoundaries()
+    {
+        var definition = string.Join('\n', Enumerable.Range(1, 12).Select(line => $"line {line}"));
+
+        var slice = SqlMetadataService.BuildModuleDefinitionSlice(
+            definition,
+            null,
+            ["line 2", "line 10"],
+            null,
+            null,
+            0,
+            0,
+            0,
+            10,
+            null,
+            true,
+            500);
+
+        Assert.Equal(2, slice.Slices.Length);
+        Assert.Collection(
+            slice.Slices,
+            first =>
+            {
+                Assert.Equal(2, first.StartLine);
+                Assert.Equal(2, first.EndLine);
+                Assert.Equal("line 2", first.Definition);
+            },
+            second =>
+            {
+                Assert.Equal(10, second.StartLine);
+                Assert.Equal(10, second.EndLine);
+                Assert.Equal("line 10", second.Definition);
+            });
+        Assert.Contains("-- ... omitted lines 3-9 ...", slice.Definition);
+        Assert.Contains("line 2", slice.Definition);
+        Assert.Contains("line 10", slice.Definition);
+    }
 }

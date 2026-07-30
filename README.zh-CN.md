@@ -84,7 +84,7 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 
 `health_check` 顶层返回 `serverVersion`，可直接确认当前发布到运行目录的服务端版本。
 
-`explain_query_plan` 默认只返回语句、内存授予、warning、扫描、缺失索引、隐式转换、排序、hash、lookup、并行等摘要；仅在 `includeXml=true` 时返回原始 SHOWPLAN XML。
+`explain_query_plan` 默认只返回语句、内存授予、warning、扫描、缺失索引、隐式转换、排序、hash、lookup、并行等摘要；仅在 `includeXml=true` 时返回原始 SHOWPLAN XML。只有列侧转换或 `PlanAffectingConvert` 才会把隐式转换列为高风险；常量侧转换且保留索引查找时仅返回提示。
 
 `analyze_module_temp_tables` 会分析模块内本地临时表的创建、读写、JOIN、跨行 INSERT/SELECT INTO/UPDATE 和字段流转摘要。
 
@@ -94,11 +94,15 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 
 大结果搜索和只读查询会返回 `cursor`、`nextCursor`、`hasMore` 和可直接续查的 `nextRequest`。`find_usage` 使用字面量搜索，不再让过程名或字段名中的 `_` 进入 SQL `LIKE` 通配语义；每个命中都带 `matchKind`、`matchedText`、行列、上下文和置信度。
 
+`find_usage` 和调用方分析会复用按 `object_id + modify_date` 失效的模块正文、行号索引和确认依赖边缓存，避免热态重复传输并扫描全部模块；`reload_connection` 会明确清除这些元数据缓存。
+
+`get_module_definition` 的多关键字结果会在 `slices[]` 中分别返回每个代码窗口；兼容字段 `definition` 会在不连续窗口之间插入 `-- ... omitted lines X-Y ...`，不再直接拼接无关语句。
+
 `describe_query_result` 可显式传入 `templateValues` 描述 UI SQL 模板，例如 `{ "0": "1=1" }` 会先把 `{0}` 替换为 `1=1`，再推断结果列。替换值按 SQL 片段处理，最终 SQL 仍会经过只读 Guard。
 
 结构工具会识别 `vwp_`、`vwpr_`、`vwt_`、`vwtr_` 这四种历史视图前缀，并优先尝试对应的无前缀物理表。
 
-字段长度明确区分 `maxLengthBytes` 和 `maxLengthCharacters`，避免把 `nvarchar` / `nchar` 的 SQL Server 字节长度误当成字符长度。
+字段长度明确区分 `maxLengthBytes` 和 `maxLengthCharacters`。只有 `char` / `varchar` / `nchar` / `nvarchar` / `sysname` 会返回字符容量；数值、二进制、日期时间、GUID 等非字符类型的 `maxLengthCharacters` 为 null。
 
 ## 构建与测试
 
