@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## 2.1.0 - 2026-07-30
+
+- Made `maxLengthCharacters` null for numeric, binary, date/time, GUID, and other non-character types while preserving `maxLengthBytes`.
+- Added explicit `slices[]` to `get_module_definition`; discontinuous keyword windows now include omitted-line separators instead of silently concatenating unrelated code.
+- Refined implicit-conversion plan risk: only column-side conversions or `PlanAffectingConvert` signals are high risk, while constant-side conversions that retain an index seek are informational.
+- Added an in-memory SQL module catalog keyed by `object_id + modify_date`, cached line offsets, and cached confirmed dependency edges for hot `find_usage` and caller analysis.
+- Changed `get_callers` and `get_callees` to use object-targeted dependency queries when no fresh dependency snapshot exists; `reload_connection` now also clears metadata caches.
+
 ## 2.0.1 - 2026-07-30
 
 - Fixed static T-SQL validation alias binding by resolving table sources within nested query, subquery, APPLY, and update scopes instead of using one global alias dictionary.

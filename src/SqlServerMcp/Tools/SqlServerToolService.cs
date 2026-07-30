@@ -501,12 +501,13 @@ public sealed class SqlServerToolService
     {
         cancellationToken.ThrowIfCancellationRequested();
         _connectionFactory.Reload();
+        _metadataService.ClearMetadataCaches();
         return Task.FromResult(JsonResponse.SuccessResult(
             "reload_connection",
             new
             {
                 reloaded = true,
-                message = "Credential cache and SQL connection pools were cleared."
+                message = "Credential cache, SQL connection pools, and metadata caches were cleared."
             },
             _options,
             _connectionFactory.CachedUserName,

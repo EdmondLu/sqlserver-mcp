@@ -110,7 +110,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `get_constraints` | Inspect key, unique, default, and check constraints |
 | `get_foreign_keys` | Inspect incoming and outgoing foreign keys |
 | `search_sql_modules` | Search SQL module definitions with next-step compare hints |
-| `get_module_definition` | Read a module definition, optionally by keyword or line range |
+| `get_module_definition` | Read a module definition, optionally by keyword or line range, with explicit discontinuous `slices[]` |
 | `validate_tsql_script` | Parse and metadata-check T-SQL without execution or database writes |
 | `validate_tsql_file` | Validate a local `.sql` file without executing it |
 | `compare_module_to_file` | Compare a database module definition with a known local file |
@@ -132,9 +132,13 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `explain_query_plan` | Return an estimated-plan summary, with raw XML only when requested |
 | `explain_query_plan_summary` | Return only the compact estimated-plan summary |
 | `batch_metadata` | Run independent metadata requests in parallel with per-item errors |
-| `reload_connection` | Clear cached credentials and SQL connection pools |
+| `reload_connection` | Clear cached credentials, SQL connection pools, and metadata snapshots |
 
 Bounded search/query tools expose stable `cursor`, `nextCursor`, `hasMore`, and executable `nextRequest` metadata where paging is supported. `find_usage` performs literal matching rather than SQL `LIKE`, so `_` in procedure and column names is never treated as a wildcard.
+
+`find_usage` and caller analysis reuse an in-memory module catalog keyed by `object_id + modify_date`, plus line indexes and confirmed dependency edges. Hot calls avoid repeatedly transferring and scanning all module definitions; `reload_connection` explicitly invalidates these snapshots.
+
+Multi-keyword `get_module_definition` results expose each selected window in `slices[]`. The compatibility `definition` string inserts `-- ... omitted lines X-Y ...` between discontinuous windows instead of joining unrelated statements directly.
 
 Module/file comparison now reports `exactMatch`, `bodyMatch`, and `semanticMatch`, with `differenceKind` values `exact_match`, `wrapper_only`, `format_only`, `comment_only`, and `body_changed`. `CREATE`/`CREATE OR ALTER`, BOMs, leading/trailing blank lines, session `SET` wrappers, and trailing `GO` do not change `bodyMatch`. Ordered deployment-set comparison also reports `target_missing` and `local_missing`, and validates a missing target's local script before deployment.
 
@@ -142,7 +146,9 @@ Module/file comparison now reports `exactMatch`, `bodyMatch`, and `semanticMatch
 
 Structure tools recognize the legacy view prefixes `vwp_`, `vwpr_`, `vwt_`, and `vwtr_`, and try the corresponding unprefixed physical table first.
 
-Column metadata uses `maxLengthBytes` and `maxLengthCharacters` explicitly. This avoids interpreting SQL Server's byte-based `sys.columns.max_length` as a character count for `nvarchar`/`nchar`.
+Column metadata uses `maxLengthBytes` and `maxLengthCharacters` explicitly. `maxLengthCharacters` is populated only for `char`/`varchar`/`nchar`/`nvarchar`/`sysname`; numeric, binary, date/time, GUID, and other non-character types return null.
+
+Implicit-conversion plan risks are high only when the plan contains a column-side conversion or `PlanAffectingConvert`. A constant-side conversion that retains an index seek is returned as informational.
 
 ## Build
 
