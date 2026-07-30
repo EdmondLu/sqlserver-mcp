@@ -8,8 +8,10 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Microsoft.Data.SqlClient;
+using Microsoft.SqlServer.TransactSql.ScriptDom;
 using SqlServerMcp.Configuration;
 using SqlServerMcp.Infrastructure;
+using SqlServerMcp.Tools;
 
 namespace SqlServerMcp.Sql;
 
@@ -274,6 +276,7 @@ public sealed class SqlMetadataService
         string keyword,
         string[]? objectTypes,
         int? limit,
+        string? cursor,
         CancellationToken cancellationToken)
     {
         var terms = SplitKeyword(keyword);
@@ -284,7 +287,9 @@ public sealed class SqlMetadataService
 
         var objectTypeCodes = ObjectTypeMapper.MapObjectTypes(objectTypes);
         var effectiveLimit = _options.Limits.ClampRows(limit);
-        var rowLimit = Math.Min((effectiveLimit + 1) * 20, 5000);
+        var fingerprint = ComputeSha256Hex($"find_objects\n{keyword}\n{string.Join(",", objectTypeCodes)}");
+        var offset = DecodeCursor(cursor, fingerprint);
+        var rowLimit = Math.Min((offset + effectiveLimit + 1) * 20, 20_000);
         var parameters = new List<SqlParameter>
         {
             new("@rowLimit", SqlDbType.Int) { Value = rowLimit }
@@ -354,11 +359,8 @@ public sealed class SqlMetadataService
             reader.GetBooleanFromInt("matched_column_description")),
             cancellationToken);
 
-        var distinctObjectCount = rows.Select(row => row.ObjectId).Distinct().Count();
-        var truncated = distinctObjectCount > effectiveLimit || rows.Count >= rowLimit;
-        var items = rows
+        var groupedItems = rows
             .GroupBy(row => row.ObjectId)
-            .Take(effectiveLimit)
             .Select(group =>
             {
                 var first = group.First();
@@ -390,9 +392,15 @@ public sealed class SqlMetadataService
                 };
             })
             .ToArray();
+        var items = groupedItems.Skip(offset).Take(effectiveLimit).ToArray();
+        var nextOffset = offset + items.Length;
+        var scanTruncated = rows.Count >= rowLimit && rowLimit >= 20_000;
+        var hasMore = nextOffset < groupedItems.Length
+                      || (items.Length > 0 && rows.Count >= rowLimit && rowLimit < 20_000);
+        var nextCursor = hasMore ? EncodeCursor(nextOffset, fingerprint) : null;
 
-        var hint = truncated
-            ? "Narrow keyword terms, pass objectTypes, or increase limit within the configured server cap."
+        var hint = hasMore
+            ? "Use nextRequest.cursor for the next page, or narrow keyword/objectTypes."
             : null;
 
         return new
@@ -400,23 +408,208 @@ public sealed class SqlMetadataService
             items,
             count = items.Length,
             limit = effectiveLimit,
-            truncated,
-            resultInfo = BuildResultInfo(items.Length, effectiveLimit, truncated, hint, truncated ? "limit" : null),
+            cursor,
+            nextCursor,
+            hasMore,
+            scanTruncated,
+            truncated = hasMore,
+            resultInfo = BuildResultInfo(items.Length, effectiveLimit, hasMore, hint, hasMore ? "page" : null),
+            nextRequest = hasMore
+                ? new { keyword, objectTypes, limit = effectiveLimit, cursor = nextCursor }
+                : null,
             hint
         };
+    }
+
+    public async Task<object> ResolveObjectAsync(
+        string name,
+        string? schema,
+        string[]? objectTypes,
+        int? limit,
+        CancellationToken cancellationToken)
+    {
+        var (requestedSchema, requestedName) = ParseObjectReference(name, schema);
+        var effectiveLimit = Math.Clamp(limit ?? 10, 1, 50);
+        var typeCodes = ObjectTypeMapper.MapAllTypes(objectTypes);
+        var parameters = new List<SqlParameter>();
+        var typePredicate = BuildInPredicate("O.type", "resolveType", typeCodes, parameters);
+        const int scanLimit = 20_000;
+        parameters.Add(new("@scanLimit", SqlDbType.Int) { Value = scanLimit });
+
+        var sql = $"""
+                   SELECT TOP (@scanLimit)
+                       object_id=O.object_id,
+                       schema_name=S.name,
+                       object_name=O.name,
+                       object_type=O.type,
+                       object_type_desc=O.type_desc,
+                       create_date=O.create_date,
+                       modify_date=O.modify_date,
+                       description=CONVERT(NVARCHAR(4000), EP.value)
+                   FROM sys.objects O
+                   INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
+                   LEFT JOIN sys.extended_properties EP ON EP.class=1
+                       AND EP.major_id=O.object_id
+                       AND EP.minor_id=0
+                       AND EP.name=N'MS_Description'
+                   WHERE O.is_ms_shipped=0
+                       AND {typePredicate}
+                   ORDER BY S.name, O.type, O.name;
+                   """;
+
+        var rows = await QueryAsync(
+            sql,
+            parameters,
+            reader => new DbObjectInfo(
+                reader.GetInt32("object_id"),
+                reader.GetString("schema_name"),
+                reader.GetString("object_name"),
+                reader.GetString("object_type").Trim(),
+                reader.GetString("object_type_desc"),
+                reader.GetDateTime("create_date"),
+                reader.GetDateTime("modify_date"),
+                reader.GetNullableString("description")),
+            cancellationToken);
+
+        var candidates = rows
+            .Select(row => BuildObjectResolutionCandidate(row, requestedSchema, requestedName))
+            .Where(candidate => candidate.Score >= 150)
+            .OrderByDescending(candidate => candidate.Score)
+            .ThenBy(candidate => candidate.Schema, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.Type, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.Name, StringComparer.OrdinalIgnoreCase)
+            .Take(effectiveLimit)
+            .ToArray();
+        var exact = candidates.FirstOrDefault(candidate =>
+            candidate.Name.Equals(requestedName, StringComparison.OrdinalIgnoreCase)
+            && candidate.Schema.Equals(requestedSchema, StringComparison.OrdinalIgnoreCase));
+
+        return new
+        {
+            input = new
+            {
+                original = name,
+                schema = requestedSchema,
+                name = requestedName
+            },
+            exists = exact is not null,
+            resolved = exact,
+            candidates,
+            candidateCount = candidates.Length,
+            scannedObjectCount = rows.Count,
+            scanTruncated = rows.Count >= scanLimit,
+            hint = exact is null
+                ? "Use a high-ranked candidate, then inspect it with get_object_overview or describe_table."
+                : null
+        };
+    }
+
+    public async Task<IReadOnlyList<string>> GetSqlErrorSuggestionsAsync(
+        int sqlErrorNumber,
+        string message,
+        string? sql,
+        CancellationToken cancellationToken)
+    {
+        var quotedReference = Regex.Match(message, @"'(?<value>[^']+)'");
+        if (!quotedReference.Success)
+        {
+            return [];
+        }
+
+        var requested = quotedReference.Groups["value"].Value;
+        if (sqlErrorNumber == 208)
+        {
+            var resolved = await ResolveObjectAsync(requested, null, null, 5, cancellationToken);
+            var element = JsonSerializer.SerializeToElement(resolved, JsonResponse.Options);
+            return element.GetProperty("candidates")
+                .EnumerateArray()
+                .Select(candidate => $"{candidate.GetProperty("schema").GetString()}.{candidate.GetProperty("name").GetString()}")
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+
+        if (sqlErrorNumber != 207)
+        {
+            return [];
+        }
+
+        const string columnSql = """
+                                 SELECT TOP (20000)
+                                     schema_name=S.name,
+                                     object_name=O.name,
+                                     column_name=C.name
+                                 FROM sys.columns C
+                                 INNER JOIN sys.objects O ON O.object_id=C.object_id
+                                 INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
+                                 WHERE O.is_ms_shipped=0 AND O.type IN (N'U', N'V')
+                                 ORDER BY S.name, O.name, C.column_id;
+                                 """;
+        var rows = await QueryAsync(
+            columnSql,
+            [],
+            reader => new
+            {
+                Schema = reader.GetString("schema_name"),
+                ObjectName = reader.GetString("object_name"),
+                ColumnName = reader.GetString("column_name")
+            },
+            cancellationToken);
+        return rows
+            .Select(row =>
+            {
+                var distance = ComputeLevenshteinDistance(
+                    requested.ToUpperInvariant(),
+                    row.ColumnName.ToUpperInvariant());
+                var maxLength = Math.Max(requested.Length, row.ColumnName.Length);
+                var similarity = maxLength == 0 ? 1.0 : 1.0 - (double)distance / maxLength;
+                var containsBoost = row.ColumnName.Contains(requested, StringComparison.OrdinalIgnoreCase)
+                                    || requested.Contains(row.ColumnName, StringComparison.OrdinalIgnoreCase)
+                    ? 0.25
+                    : 0;
+                return new
+                {
+                    row.Schema,
+                    row.ObjectName,
+                    row.ColumnName,
+                    Score = similarity + containsBoost
+                };
+            })
+            .Where(candidate => candidate.Score >= 0.45)
+            .OrderByDescending(candidate => candidate.Score)
+            .ThenBy(candidate => candidate.Schema, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.ObjectName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.ColumnName, StringComparer.OrdinalIgnoreCase)
+            .Take(8)
+            .Select(candidate => $"{candidate.Schema}.{candidate.ObjectName}.{candidate.ColumnName}")
+            .ToArray();
     }
 
     public async Task<object> DescribeTableAsync(
         string schema,
         string name,
-        bool includeIndexes,
-        bool includeConstraints,
-        bool includeForeignKeys,
+        string? mode,
+        string[]? selectedColumns,
+        bool? includeIndexes,
+        bool? includeConstraints,
+        bool? includeForeignKeys,
+        bool? includeDefaults,
+        bool? includeDescriptions,
         CancellationToken cancellationToken)
     {
+        var preset = BuildDescribeTablePreset(mode);
+        var effectiveIncludeIndexes = includeIndexes ?? preset.IncludeIndexes;
+        var effectiveIncludeConstraints = includeConstraints ?? preset.IncludeConstraints;
+        var effectiveIncludeForeignKeys = includeForeignKeys ?? preset.IncludeForeignKeys;
+        var effectiveIncludeDefaults = includeDefaults ?? preset.IncludeDefaults;
+        var effectiveIncludeDescriptions = includeDescriptions ?? preset.IncludeDescriptions;
         var resolution = await GetStructureObjectAsync(schema, name, cancellationToken);
         var dbObject = resolution.Object;
-        var columns = await GetColumnsAsync(dbObject.ObjectId, cancellationToken);
+        var columns = await GetColumnsAsync(
+            dbObject.ObjectId,
+            effectiveIncludeDefaults,
+            effectiveIncludeDescriptions,
+            selectedColumns,
+            cancellationToken);
 
         return new
         {
@@ -424,12 +617,21 @@ public sealed class SqlMetadataService
             name = dbObject.Name,
             type = ObjectTypeMapper.ToPublicType(dbObject.Type),
             typeDesc = dbObject.TypeDesc,
-            description = dbObject.Description,
+            description = effectiveIncludeDescriptions ? dbObject.Description : null,
             resolution = BuildResolutionInfo(resolution),
+            mode = preset.Mode,
+            includes = new
+            {
+                indexes = effectiveIncludeIndexes,
+                constraints = effectiveIncludeConstraints,
+                foreignKeys = effectiveIncludeForeignKeys,
+                defaults = effectiveIncludeDefaults,
+                descriptions = effectiveIncludeDescriptions
+            },
             columns,
-            indexes = includeIndexes ? await GetIndexesCoreAsync(dbObject.ObjectId, cancellationToken) : null,
-            constraints = includeConstraints ? await GetConstraintsCoreAsync(dbObject.ObjectId, cancellationToken) : null,
-            foreignKeys = includeForeignKeys ? await GetForeignKeysCoreAsync(dbObject.ObjectId, cancellationToken) : null
+            indexes = effectiveIncludeIndexes ? await GetIndexesCoreAsync(dbObject.ObjectId, cancellationToken) : null,
+            constraints = effectiveIncludeConstraints ? await GetConstraintsCoreAsync(dbObject.ObjectId, cancellationToken) : null,
+            foreignKeys = effectiveIncludeForeignKeys ? await GetForeignKeysCoreAsync(dbObject.ObjectId, cancellationToken) : null
         };
     }
 
@@ -492,6 +694,7 @@ public sealed class SqlMetadataService
         string column,
         bool exact,
         int? limit,
+        string? cursor,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(column))
@@ -500,9 +703,11 @@ public sealed class SqlMetadataService
         }
 
         var effectiveLimit = _options.Limits.ClampRows(limit);
+        var fingerprint = ComputeSha256Hex($"find_column\n{column}\n{exact}");
+        var offset = DecodeCursor(cursor, fingerprint);
         var queryLimit = effectiveLimit + 1;
         var sql = $"""
-                   SELECT TOP (@limit)
+                   SELECT
                        schema_name=S.name,
                        object_name=O.name,
                        object_type=O.type,
@@ -526,7 +731,8 @@ public sealed class SqlMetadataService
                    WHERE O.type IN (N'U', N'V')
                        AND O.is_ms_shipped=0
                        AND C.name {(exact ? "= @column" : "LIKE @column")}
-                   ORDER BY C.name, S.name, O.name;
+                   ORDER BY C.name, S.name, O.name, C.column_id
+                   OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
                    """;
 
         var parameterValue = exact ? column : $"%{column}%";
@@ -534,6 +740,7 @@ public sealed class SqlMetadataService
             sql,
             [
                 new("@limit", SqlDbType.Int) { Value = queryLimit },
+                new("@offset", SqlDbType.Int) { Value = offset },
                 new("@column", SqlDbType.NVarChar, 256) { Value = parameterValue }
             ],
             reader => new
@@ -544,7 +751,8 @@ public sealed class SqlMetadataService
                 objectTypeDesc = reader.GetString("object_type_desc"),
                 columnName = reader.GetString("column_name"),
                 dataType = reader.GetString("data_type"),
-                maxLength = NormalizeMaxLength(reader.GetInt16("max_length"), reader.GetString("data_type")),
+                maxLengthBytes = NormalizeMaxLengthBytes(reader.GetInt16("max_length")),
+                maxLengthCharacters = NormalizeMaxLengthCharacters(reader.GetInt16("max_length"), reader.GetString("data_type")),
                 precision = reader.GetByte("precision"),
                 scale = reader.GetByte("scale"),
                 nullable = reader.GetBoolean("is_nullable"),
@@ -554,9 +762,10 @@ public sealed class SqlMetadataService
             cancellationToken);
 
         var items = rows.Take(effectiveLimit).ToArray();
-        var truncated = rows.Count > effectiveLimit;
-        var hint = truncated
-            ? "Use exact=true for a specific column, add a narrower column search text, or increase limit within the configured cap."
+        var hasMore = rows.Count > effectiveLimit;
+        var nextCursor = hasMore ? EncodeCursor(offset + items.Length, fingerprint) : null;
+        var hint = hasMore
+            ? "Use nextRequest.cursor for the next page, or narrow the column search."
             : null;
 
         return new
@@ -564,9 +773,179 @@ public sealed class SqlMetadataService
             items,
             count = items.Length,
             limit = effectiveLimit,
-            truncated,
-            resultInfo = BuildResultInfo(items.Length, effectiveLimit, truncated, hint, truncated ? "limit" : null),
+            cursor,
+            nextCursor,
+            hasMore,
+            truncated = hasMore,
+            resultInfo = BuildResultInfo(items.Length, effectiveLimit, hasMore, hint, hasMore ? "page" : null),
+            nextRequest = hasMore
+                ? new { column, exact, limit = effectiveLimit, cursor = nextCursor }
+                : null,
             hint
+        };
+    }
+
+    public async Task<object> ProfileColumnAsync(
+        string schema,
+        string name,
+        string column,
+        string? expectedFormat,
+        int sampleLimit,
+        CancellationToken cancellationToken)
+    {
+        if (!IsSafeIdentifier(column))
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "Invalid column identifier.", column);
+        }
+
+        var normalizedFormat = string.IsNullOrWhiteSpace(expectedFormat)
+            ? null
+            : expectedFormat.Trim().ToLowerInvariant();
+        if (normalizedFormat is not (null or "json" or "numeric" or "csv"))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "expectedFormat must be json, numeric, or csv.");
+        }
+
+        var effectiveSampleLimit = Math.Clamp(sampleLimit, 0, 20);
+        var resolution = await GetStructureObjectAsync(schema, name, cancellationToken);
+        var dbObject = resolution.Object;
+        const string metadataSql = """
+                                   SELECT TOP 1
+                                       data_type=T.name,
+                                       max_length=C.max_length,
+                                       precision=C.precision,
+                                       scale=C.scale,
+                                       is_nullable=C.is_nullable
+                                   FROM sys.columns C
+                                   INNER JOIN sys.types T ON T.user_type_id=C.user_type_id
+                                   WHERE C.object_id=@objectId AND C.name=@column;
+                                   """;
+        var metadataRows = await QueryAsync(
+            metadataSql,
+            [
+                new("@objectId", SqlDbType.Int) { Value = dbObject.ObjectId },
+                new("@column", SqlDbType.NVarChar, 128) { Value = column }
+            ],
+            reader => new ProfileColumnMetadata(
+                reader.GetString("data_type"),
+                reader.GetInt16("max_length"),
+                reader.GetByte("precision"),
+                reader.GetByte("scale"),
+                reader.GetBoolean("is_nullable")),
+            cancellationToken);
+        var metadata = metadataRows.SingleOrDefault()
+            ?? throw new SqlMcpException(
+                ErrorCodes.ColumnNotFound,
+                $"Column '{dbObject.Schema}.{dbObject.Name}.{column}' was not found.");
+
+        var qualifiedObject = $"{QuoteIdentifier(dbObject.Schema)}.{QuoteIdentifier(dbObject.Name)}";
+        var quotedColumn = QuoteIdentifier(column);
+        var textExpression = $"CONVERT(NVARCHAR(MAX), {quotedColumn})";
+        var declaredMaxCharacters = NormalizeMaxLengthCharacters(metadata.MaxLength, metadata.DataType);
+        var atLimitExpression = declaredMaxCharacters is > 0
+            ? $"CASE WHEN LEN({textExpression}) >= @declaredMaxCharacters THEN 1 ELSE 0 END"
+            : "0";
+        var invalidExpression = normalizedFormat switch
+        {
+            "json" => $"CASE WHEN {quotedColumn} IS NOT NULL AND NULLIF(LTRIM(RTRIM({textExpression})), N'') IS NOT NULL AND ISJSON({textExpression})=0 THEN 1 ELSE 0 END",
+            "numeric" => $"CASE WHEN {quotedColumn} IS NOT NULL AND NULLIF(LTRIM(RTRIM({textExpression})), N'') IS NOT NULL AND TRY_CONVERT(DECIMAL(38,10), {textExpression}) IS NULL THEN 1 ELSE 0 END",
+            "csv" => $"CASE WHEN {quotedColumn} IS NOT NULL AND (LEN({textExpression})-LEN(REPLACE({textExpression}, N'\"', N'')))%2<>0 THEN 1 ELSE 0 END",
+            _ => "0"
+        };
+        var aggregateSql = $"""
+                            SELECT
+                                total_count=COUNT_BIG(1),
+                                null_count=SUM(CONVERT(BIGINT, CASE WHEN {quotedColumn} IS NULL THEN 1 ELSE 0 END)),
+                                empty_count=SUM(CONVERT(BIGINT, CASE WHEN {quotedColumn} IS NOT NULL AND LEN(LTRIM(RTRIM({textExpression})))=0 THEN 1 ELSE 0 END)),
+                                min_length=MIN(CASE WHEN {quotedColumn} IS NULL THEN NULL ELSE LEN({textExpression}) END),
+                                max_length=MAX(CASE WHEN {quotedColumn} IS NULL THEN NULL ELSE LEN({textExpression}) END),
+                                avg_length=AVG(CONVERT(DECIMAL(18,2), CASE WHEN {quotedColumn} IS NULL THEN NULL ELSE LEN({textExpression}) END)),
+                                at_limit_count=SUM(CONVERT(BIGINT, {atLimitExpression})),
+                                invalid_format_count=SUM(CONVERT(BIGINT, {invalidExpression}))
+                            FROM {qualifiedObject};
+                            """;
+        var aggregateParameters = declaredMaxCharacters is > 0
+            ? new[] { new SqlParameter("@declaredMaxCharacters", SqlDbType.Int) { Value = declaredMaxCharacters.Value } }
+            : [];
+        var aggregate = (await QueryAsync(
+            aggregateSql,
+            aggregateParameters,
+            reader => new
+            {
+                totalCount = GetNullableInt64(reader, "total_count") ?? 0,
+                nullCount = GetNullableInt64(reader, "null_count") ?? 0,
+                emptyCount = GetNullableInt64(reader, "empty_count") ?? 0,
+                minLength = reader.GetNullableInt32("min_length"),
+                maxLength = reader.GetNullableInt32("max_length"),
+                averageLength = GetNullableDecimal(reader, "avg_length"),
+                atLimitCount = GetNullableInt64(reader, "at_limit_count") ?? 0,
+                invalidFormatCount = GetNullableInt64(reader, "invalid_format_count") ?? 0
+            },
+            cancellationToken)).Single();
+        var distributionSql = $"""
+                              SELECT TOP (100)
+                                  value_length=LEN({textExpression}),
+                                  value_count=COUNT_BIG(1)
+                              FROM {qualifiedObject}
+                              WHERE {quotedColumn} IS NOT NULL
+                              GROUP BY LEN({textExpression})
+                              ORDER BY value_length;
+                              """;
+        var distribution = await QueryAsync(
+            distributionSql,
+            [],
+            reader => new
+            {
+                length = reader.GetNullableInt32("value_length"),
+                count = GetNullableInt64(reader, "value_count") ?? 0
+            },
+            cancellationToken);
+        var sampleSql = $"""
+                        SELECT TOP (@sampleLimit)
+                            sample_value=LEFT({textExpression}, @maxTextLength),
+                            value_length=LEN({textExpression})
+                        FROM {qualifiedObject}
+                        WHERE {quotedColumn} IS NOT NULL
+                        ORDER BY LEN({textExpression}) DESC, LEFT({textExpression}, @maxTextLength);
+                        """;
+        var samples = effectiveSampleLimit == 0
+            ? []
+            : await QueryAsync(
+                sampleSql,
+                [
+                    new("@sampleLimit", SqlDbType.Int) { Value = effectiveSampleLimit },
+                    new("@maxTextLength", SqlDbType.Int) { Value = _options.Limits.MaxTextLength }
+                ],
+                reader => new
+                {
+                    value = reader.GetNullableString("sample_value"),
+                    length = reader.GetNullableInt32("value_length")
+                },
+                cancellationToken);
+
+        return new
+        {
+            schema = dbObject.Schema,
+            name = dbObject.Name,
+            column,
+            resolution = BuildResolutionInfo(resolution),
+            dataType = metadata.DataType,
+            maxLengthBytes = NormalizeMaxLengthBytes(metadata.MaxLength),
+            maxLengthCharacters = declaredMaxCharacters,
+            metadata.Precision,
+            metadata.Scale,
+            nullable = metadata.Nullable,
+            statistics = aggregate,
+            lengthDistribution = distribution,
+            lengthDistributionTruncated = distribution.Count >= 100,
+            expectedFormat = normalizedFormat,
+            formatCheck = normalizedFormat == "csv"
+                ? "csv_unbalanced_quotes"
+                : normalizedFormat,
+            samples,
+            sampleLimit = effectiveSampleLimit
         };
     }
 
@@ -613,6 +992,7 @@ public sealed class SqlMetadataService
         string keyword,
         string[]? objectTypes,
         int? limit,
+        string? cursor,
         CancellationToken cancellationToken)
     {
         var terms = SplitKeyword(keyword);
@@ -623,22 +1003,25 @@ public sealed class SqlMetadataService
 
         var objectTypeCodes = ObjectTypeMapper.MapModuleTypes(objectTypes);
         var effectiveLimit = _options.Limits.ClampRows(limit);
+        var fingerprint = ComputeSha256Hex($"search_sql_modules\n{keyword}\n{string.Join(",", objectTypeCodes)}");
+        var offset = DecodeCursor(cursor, fingerprint);
         var parameters = new List<SqlParameter>
         {
-            new("@limit", SqlDbType.Int) { Value = effectiveLimit + 1 }
+            new("@limit", SqlDbType.Int) { Value = effectiveLimit + 1 },
+            new("@offset", SqlDbType.Int) { Value = offset }
         };
 
         var termPredicates = new List<string>();
         for (var i = 0; i < terms.Count; i++)
         {
             var parameterName = $"@term{i}";
-            parameters.Add(new SqlParameter(parameterName, SqlDbType.NVarChar, 4000) { Value = $"%{terms[i]}%" });
-            termPredicates.Add($"M.definition LIKE {parameterName}");
+            parameters.Add(new SqlParameter(parameterName, SqlDbType.NVarChar, 4000) { Value = terms[i] });
+            termPredicates.Add($"CHARINDEX({parameterName}, M.definition) > 0");
         }
 
         var typePredicates = BuildInPredicate("O.type", "type", objectTypeCodes, parameters);
         var sql = $"""
-                   SELECT TOP (@limit)
+                   SELECT
                        schema_name=S.name,
                        object_name=O.name,
                        object_type=O.type,
@@ -651,7 +1034,8 @@ public sealed class SqlMetadataService
                    WHERE O.is_ms_shipped=0
                        AND {typePredicates}
                        AND ({string.Join(" OR ", termPredicates)})
-                   ORDER BY O.modify_date DESC, S.name, O.name;
+                   ORDER BY S.name, O.type, O.name
+                   OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
                    """;
 
         var rows = await QueryAsync(
@@ -673,10 +1057,11 @@ public sealed class SqlMetadataService
             cancellationToken);
 
         var items = rows.Take(effectiveLimit).ToArray();
-        var truncated = rows.Count > effectiveLimit;
+        var hasMore = rows.Count > effectiveLimit;
+        var nextCursor = hasMore ? EncodeCursor(offset + items.Length, fingerprint) : null;
 
-        var hint = truncated
-            ? "Use objectTypes or get_module_definition with keyword/startLine to inspect a narrower module slice."
+        var hint = hasMore
+            ? "Use nextRequest.cursor, objectTypes, or get_module_definition keyword slices."
             : null;
 
         return new
@@ -684,8 +1069,14 @@ public sealed class SqlMetadataService
             items,
             count = items.Length,
             limit = effectiveLimit,
-            truncated,
-            resultInfo = BuildResultInfo(items.Length, effectiveLimit, truncated, hint, truncated ? "limit" : null),
+            cursor,
+            nextCursor,
+            hasMore,
+            truncated = hasMore,
+            resultInfo = BuildResultInfo(items.Length, effectiveLimit, hasMore, hint, hasMore ? "page" : null),
+            nextRequest = hasMore
+                ? new { keyword, objectTypes, limit = effectiveLimit, cursor = nextCursor }
+                : null,
             hint,
             nextActions = ModuleSearchNextActions
         };
@@ -695,9 +1086,15 @@ public sealed class SqlMetadataService
         string schema,
         string name,
         string? keyword,
+        string[]? keywords,
         int? startLine,
         int? endLine,
         int? contextLines,
+        int? beforeLines,
+        int? afterLines,
+        int? maxMatches,
+        int? occurrence,
+        bool collapseOverlaps,
         bool includeLineNumbers,
         CancellationToken cancellationToken)
     {
@@ -706,9 +1103,15 @@ public sealed class SqlMetadataService
         var slice = BuildModuleDefinitionSlice(
             definition,
             keyword,
+            keywords,
             startLine,
             endLine,
             contextLines,
+            beforeLines,
+            afterLines,
+            maxMatches,
+            occurrence,
+            collapseOverlaps,
             _options.Limits.MaxRows);
 
         var hint = slice.Truncated
@@ -731,7 +1134,18 @@ public sealed class SqlMetadataService
             {
                 slice.Reason,
                 keyword = string.IsNullOrWhiteSpace(keyword) ? null : keyword,
+                keywords = new[] { keyword }
+                    .Concat(keywords ?? [])
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Select(value => value!.Trim())
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
                 slice.ContextLines,
+                beforeLines = beforeLines ?? contextLines ?? DefaultModuleContextLines,
+                afterLines = afterLines ?? contextLines ?? DefaultModuleContextLines,
+                maxMatches,
+                occurrence,
+                collapseOverlaps,
                 slice.StartLine,
                 slice.EndLine,
                 slice.SelectedLineCount,
@@ -759,6 +1173,479 @@ public sealed class SqlMetadataService
                 ? slice.Lines
                 : null
         };
+    }
+
+    public async Task<object> ValidateTsqlFileAsync(
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        var file = GetReadableCompareFile(filePath);
+        var script = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
+        return await ValidateTsqlScriptAsync(script, file.FullName, cancellationToken);
+    }
+
+    public async Task<object> ValidateTsqlScriptAsync(
+        string script,
+        string? sourceName,
+        CancellationToken cancellationToken)
+    {
+        return await ValidateTsqlScriptCoreAsync(
+            script,
+            sourceName,
+            plannedModules: null,
+            cancellationToken);
+    }
+
+    private async Task<object> ValidateTsqlScriptCoreAsync(
+        string script,
+        string? sourceName,
+        IReadOnlySet<string>? plannedModules,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(script))
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "script is required.");
+        }
+
+        if (Encoding.UTF8.GetByteCount(script) > MaxCompareFileBytes)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "T-SQL script is too large.",
+                $"Maximum validation size is {MaxCompareFileBytes} bytes.");
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var analysis = TsqlScriptAnalyzer.Analyze(script);
+        var diagnostics = analysis.Diagnostics.ToList();
+        var referenceValidation = await ValidateTsqlReferencesAsync(
+            analysis,
+            diagnostics,
+            plannedModules,
+            cancellationToken);
+        var target = analysis.Module is null
+            ? null
+            : await GetValidationTargetAsync(analysis.Module, cancellationToken);
+        if (target is { Exists: true })
+        {
+            AddTargetParameterContractDiagnostics(analysis.Parameters, target.Parameters, diagnostics);
+        }
+        var errorCount = diagnostics.Count(diagnostic => diagnostic.Severity == "error");
+        var warningCount = diagnostics.Count(diagnostic => diagnostic.Severity == "warning");
+        var readyToDeploy = analysis.SyntaxValid
+                            && errorCount == 0
+                            && (analysis.Module is null || analysis.HasCreateOrAlter);
+        stopwatch.Stop();
+
+        return new
+        {
+            ok = errorCount == 0,
+            validationMode = "static_parse_and_metadata_no_execute",
+            executed = false,
+            databaseWritten = false,
+            source = sourceName,
+            scriptLength = script.Length,
+            scriptSha256 = ComputeSha256Hex(script),
+            syntaxValid = analysis.SyntaxValid,
+            wrapper = new
+            {
+                hasCreateOrAlter = analysis.HasCreateOrAlter,
+                module = analysis.Module
+            },
+            target = target is null
+                ? null
+                : new
+                {
+                    target.Schema,
+                    target.Name,
+                    target.Type,
+                    target.Exists,
+                    status = target.Exists ? "target_exists" : "target_missing",
+                    parameters = target.Parameters
+                },
+            localSyntaxValid = analysis.SyntaxValid,
+            referencedObjectsValid = referenceValidation.Objects.All(reference => reference.Status is "resolved" or "external_unverified" or "local_deployment_set"),
+            referencedTypesValid = referenceValidation.Types.All(reference => reference.Exists),
+            readyToDeploy,
+            errorCount,
+            warningCount,
+            diagnostics = diagnostics
+                .OrderBy(diagnostic => diagnostic.Line ?? int.MaxValue)
+                .ThenBy(diagnostic => diagnostic.Column ?? int.MaxValue)
+                .ThenBy(diagnostic => diagnostic.Category, StringComparer.OrdinalIgnoreCase)
+                .ToArray(),
+            references = referenceValidation,
+            tempTables = analysis.TempTables,
+            elapsedMs = stopwatch.ElapsedMilliseconds
+        };
+    }
+
+    private async Task<TsqlReferenceValidation> ValidateTsqlReferencesAsync(
+        TsqlScriptAnalysis analysis,
+        List<TsqlValidationDiagnostic> diagnostics,
+        IReadOnlySet<string>? plannedModules,
+        CancellationToken cancellationToken)
+    {
+        var localReferences = analysis.ObjectReferences
+            .Where(reference => !reference.Name.StartsWith('#'))
+            .Where(reference => !reference.Name.Equals("inserted", StringComparison.OrdinalIgnoreCase))
+            .Where(reference => !reference.Name.Equals("deleted", StringComparison.OrdinalIgnoreCase))
+            .Where(reference => !analysis.CteNames.Contains(reference.Name, StringComparer.OrdinalIgnoreCase))
+            .Where(reference => analysis.Module is null
+                                || !reference.Schema.Equals(analysis.Module.Schema, StringComparison.OrdinalIgnoreCase)
+                                || !reference.Name.Equals(analysis.Module.Name, StringComparison.OrdinalIgnoreCase))
+            .Where(reference => string.IsNullOrWhiteSpace(reference.Server))
+            .Where(reference => string.IsNullOrWhiteSpace(reference.Database)
+                                || reference.Database.Equals(_options.Database, StringComparison.OrdinalIgnoreCase))
+            .GroupBy(reference => new { reference.Schema, reference.Name })
+            .Select(group => group.First())
+            .Take(500)
+            .ToArray();
+        var externalReferences = analysis.ObjectReferences
+            .Where(reference => !string.IsNullOrWhiteSpace(reference.Server)
+                                || (!string.IsNullOrWhiteSpace(reference.Database)
+                                    && !reference.Database.Equals(_options.Database, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+        foreach (var reference in externalReferences)
+        {
+            diagnostics.Add(new TsqlValidationDiagnostic(
+                "external_reference_unverified",
+                "warning",
+                $"External reference '{BuildObjectDisplayName(reference)}' was not resolved against the target database.",
+                reference.Line,
+                reference.Column,
+                BuildObjectDisplayName(reference),
+                "Validate the referenced database or server separately."));
+        }
+
+        var objectRows = await LoadValidationObjectsAsync(localReferences, cancellationToken);
+        var objectLookup = objectRows
+            .GroupBy(row => BuildTargetKey(row.Schema, row.Name), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        var objectResults = new List<TsqlObjectValidation>();
+        foreach (var reference in localReferences)
+        {
+            var key = BuildTargetKey(reference.Schema, reference.Name);
+            if (!objectLookup.TryGetValue(key, out var found))
+            {
+                if (plannedModules?.Contains(key) == true)
+                {
+                    objectResults.Add(new TsqlObjectValidation(
+                        reference.Schema,
+                        reference.Name,
+                        reference.Kind,
+                        "local_deployment_set",
+                        "module",
+                        []));
+                    continue;
+                }
+
+                diagnostics.Add(new TsqlValidationDiagnostic(
+                    "unresolved_object",
+                    "error",
+                    $"Referenced object '{reference.Schema}.{reference.Name}' was not found.",
+                    reference.Line,
+                    reference.Column,
+                    $"{reference.Schema}.{reference.Name}",
+                    "Use resolve_object to find the intended object."));
+                objectResults.Add(new TsqlObjectValidation(
+                    reference.Schema,
+                    reference.Name,
+                    reference.Kind,
+                    "unresolved",
+                    null,
+                    []));
+                continue;
+            }
+
+            objectResults.Add(new TsqlObjectValidation(
+                found.Schema,
+                found.Name,
+                reference.Kind,
+                "resolved",
+                ObjectTypeMapper.ToPublicType(found.Type),
+                found.Columns.OrderBy(column => column, StringComparer.OrdinalIgnoreCase).ToArray()));
+        }
+
+        objectResults.AddRange(externalReferences.Select(reference => new TsqlObjectValidation(
+            reference.Schema,
+            reference.Name,
+            reference.Kind,
+            "external_unverified",
+            null,
+            [])));
+
+        foreach (var column in analysis.ColumnReferences.Where(reference => reference.Identifiers.Length >= 2))
+        {
+            var qualifier = column.Identifiers[^2];
+            if (!analysis.TableBindings.TryGetValue(qualifier, out var binding))
+            {
+                continue;
+            }
+
+            var key = BuildTargetKey(binding.Schema, binding.Name);
+            if (!objectLookup.TryGetValue(key, out var found))
+            {
+                continue;
+            }
+
+            var columnName = column.Identifiers[^1];
+            if (!found.Columns.Contains(columnName, StringComparer.OrdinalIgnoreCase))
+            {
+                diagnostics.Add(new TsqlValidationDiagnostic(
+                    "unresolved_column",
+                    "error",
+                    $"Object '{found.Schema}.{found.Name}' has no column '{columnName}'.",
+                    column.Line,
+                    column.Column,
+                    columnName,
+                    $"Available columns: {string.Join(", ", found.Columns.OrderBy(value => value).Take(30))}"));
+            }
+        }
+
+        var typeResults = await ValidateUserTypesAsync(analysis.UserTypes, diagnostics, cancellationToken);
+        return new TsqlReferenceValidation(objectResults.ToArray(), typeResults);
+    }
+
+    private async Task<ValidationObject[]> LoadValidationObjectsAsync(
+        IReadOnlyList<TsqlObjectReference> references,
+        CancellationToken cancellationToken)
+    {
+        if (references.Count == 0)
+        {
+            return [];
+        }
+
+        var parameters = new List<SqlParameter>();
+        var predicates = new List<string>();
+        for (var i = 0; i < references.Count; i++)
+        {
+            parameters.Add(new($"@validationSchema{i}", SqlDbType.NVarChar, 128) { Value = references[i].Schema });
+            parameters.Add(new($"@validationName{i}", SqlDbType.NVarChar, 128) { Value = references[i].Name });
+            predicates.Add($"(S.name=@validationSchema{i} AND O.name=@validationName{i})");
+        }
+
+        var sql = $"""
+                   SELECT
+                       schema_name=S.name,
+                       object_name=O.name,
+                       object_type=O.type,
+                       column_name=C.name
+                   FROM sys.all_objects O
+                   INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
+                   LEFT JOIN sys.all_columns C ON C.object_id=O.object_id
+                   WHERE ({string.Join(" OR ", predicates)})
+                   ORDER BY S.name, O.name, C.column_id;
+                   """;
+        var rows = await QueryAsync(
+            sql,
+            parameters,
+            reader => new
+            {
+                Schema = reader.GetString("schema_name"),
+                Name = reader.GetString("object_name"),
+                Type = reader.GetString("object_type").Trim(),
+                Column = reader.GetNullableString("column_name")
+            },
+            cancellationToken);
+        return rows
+            .GroupBy(row => BuildTargetKey(row.Schema, row.Name), StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var first = group.First();
+                return new ValidationObject(
+                    first.Schema,
+                    first.Name,
+                    first.Type,
+                    group.Select(row => row.Column)
+                        .Where(column => !string.IsNullOrWhiteSpace(column))
+                        .Select(column => column!)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase));
+            })
+            .ToArray();
+    }
+
+    private async Task<TsqlTypeValidation[]> ValidateUserTypesAsync(
+        IReadOnlyList<TsqlUserTypeReference> userTypes,
+        List<TsqlValidationDiagnostic> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        var uniqueTypes = userTypes
+            .GroupBy(type => new { type.Schema, type.Name })
+            .Select(group => group.First())
+            .Take(200)
+            .ToArray();
+        if (uniqueTypes.Length == 0)
+        {
+            return [];
+        }
+
+        var parameters = new List<SqlParameter>();
+        var predicates = new List<string>();
+        for (var i = 0; i < uniqueTypes.Length; i++)
+        {
+            parameters.Add(new($"@typeSchema{i}", SqlDbType.NVarChar, 128) { Value = uniqueTypes[i].Schema });
+            parameters.Add(new($"@typeName{i}", SqlDbType.NVarChar, 128) { Value = uniqueTypes[i].Name });
+            predicates.Add($"(S.name=@typeSchema{i} AND T.name=@typeName{i})");
+        }
+
+        var sql = $"""
+                   SELECT schema_name=S.name, type_name=T.name, is_table_type=T.is_table_type
+                   FROM sys.types T
+                   INNER JOIN sys.schemas S ON S.schema_id=T.schema_id
+                   WHERE {string.Join(" OR ", predicates)};
+                   """;
+        var rows = await QueryAsync(
+            sql,
+            parameters,
+            reader => new
+            {
+                Schema = reader.GetString("schema_name"),
+                Name = reader.GetString("type_name"),
+                IsTableType = reader.GetBoolean("is_table_type")
+            },
+            cancellationToken);
+        var lookup = rows.ToDictionary(
+            row => BuildTargetKey(row.Schema, row.Name),
+            StringComparer.OrdinalIgnoreCase);
+        return uniqueTypes.Select(type =>
+        {
+            var exists = lookup.TryGetValue(BuildTargetKey(type.Schema, type.Name), out var row);
+            if (!exists)
+            {
+                diagnostics.Add(new TsqlValidationDiagnostic(
+                    "unresolved_type",
+                    "error",
+                    $"User-defined type '{type.Schema}.{type.Name}' was not found.",
+                    type.Line,
+                    type.Column,
+                    $"{type.Schema}.{type.Name}",
+                    "Create the type first or correct the parameter/column type."));
+            }
+
+            return new TsqlTypeValidation(
+                type.Schema,
+                type.Name,
+                exists,
+                row?.IsTableType);
+        }).ToArray();
+    }
+
+    private async Task<ValidationTarget> GetValidationTargetAsync(
+        TsqlModuleTarget module,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+                           SELECT
+                               object_type=O.type,
+                               parameter_name=P.name,
+                               type_schema=TS.name,
+                               type_name=T.name
+                           FROM sys.objects O
+                           INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
+                           LEFT JOIN sys.parameters P ON P.object_id=O.object_id AND P.parameter_id>0
+                           LEFT JOIN sys.types T ON T.user_type_id=P.user_type_id
+                           LEFT JOIN sys.schemas TS ON TS.schema_id=T.schema_id
+                           WHERE S.name=@schema AND O.name=@name
+                           ORDER BY P.parameter_id;
+                           """;
+        var rows = await QueryAsync(
+            sql,
+            [
+                new("@schema", SqlDbType.NVarChar, 128) { Value = module.Schema },
+                new("@name", SqlDbType.NVarChar, 128) { Value = module.Name }
+            ],
+            reader => new
+            {
+                Type = reader.GetString("object_type").Trim(),
+                ParameterName = reader.GetNullableString("parameter_name"),
+                TypeSchema = reader.GetNullableString("type_schema"),
+                TypeName = reader.GetNullableString("type_name")
+            },
+            cancellationToken);
+        return new ValidationTarget(
+            module.Schema,
+            module.Name,
+            module.Type,
+            rows.Count > 0,
+            rows
+                .Where(row => !string.IsNullOrWhiteSpace(row.ParameterName))
+                .Select(row => new ValidationParameter(
+                    row.ParameterName!,
+                    string.IsNullOrWhiteSpace(row.TypeSchema)
+                    || row.TypeSchema.Equals("sys", StringComparison.OrdinalIgnoreCase)
+                        ? row.TypeName ?? string.Empty
+                        : $"{row.TypeSchema}.{row.TypeName}"))
+                .ToArray());
+    }
+
+    private static void AddTargetParameterContractDiagnostics(
+        IReadOnlyList<TsqlParameterDefinition> localParameters,
+        IReadOnlyList<ValidationParameter> targetParameters,
+        List<TsqlValidationDiagnostic> diagnostics)
+    {
+        var localLookup = localParameters.ToDictionary(
+            parameter => parameter.Name,
+            StringComparer.OrdinalIgnoreCase);
+        var targetLookup = targetParameters.ToDictionary(
+            parameter => parameter.Name,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var local in localParameters)
+        {
+            if (!targetLookup.TryGetValue(local.Name, out var target))
+            {
+                diagnostics.Add(new TsqlValidationDiagnostic(
+                    "type_warning",
+                    "warning",
+                    $"Parameter '{local.Name}' is new relative to the current target module.",
+                    local.Line,
+                    local.Column,
+                    local.Name,
+                    "Confirm callers will supply the new parameter or that it has a default."));
+                continue;
+            }
+
+            if (!NormalizeTypeName(local.DataType).Equals(
+                    NormalizeTypeName(target.DataType),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                diagnostics.Add(new TsqlValidationDiagnostic(
+                    "type_warning",
+                    "warning",
+                    $"Parameter '{local.Name}' changes type from '{target.DataType}' to '{local.DataType}'.",
+                    local.Line,
+                    local.Column,
+                    local.Name,
+                    "Review caller compatibility and implicit conversions."));
+            }
+        }
+
+        foreach (var target in targetParameters.Where(target => !localLookup.ContainsKey(target.Name)))
+        {
+            diagnostics.Add(new TsqlValidationDiagnostic(
+                "type_warning",
+                "warning",
+                $"Target parameter '{target.Name}' is removed by the local script.",
+                null,
+                null,
+                target.Name,
+                "Review existing callers before deployment."));
+        }
+    }
+
+    private static string NormalizeTypeName(string typeName)
+    {
+        return typeName.Replace("[", string.Empty, StringComparison.Ordinal)
+            .Replace("]", string.Empty, StringComparison.Ordinal)
+            .Replace(" ", string.Empty, StringComparison.Ordinal);
+    }
+
+    private static string BuildObjectDisplayName(TsqlObjectReference reference)
+    {
+        return string.Join(
+            ".",
+            new[] { reference.Server, reference.Database, reference.Schema, reference.Name }
+                .Where(value => !string.IsNullOrWhiteSpace(value)));
     }
 
     public async Task<object> CompareModuleToFileAsync(
@@ -833,10 +1720,168 @@ public sealed class SqlMetadataService
             exactMatch = comparison.ExactMatch,
             normalizedMatch = comparison.NormalizedMatch,
             sqlNormalizedMatch = comparison.SqlNormalizedMatch,
+            bodyMatch = comparison.BodyMatch,
+            semanticMatch = comparison.SemanticMatch,
             differenceKind = comparison.DifferenceKind,
             firstBodyDifference = comparison.FirstBodyDifference,
             changedLineSummary = comparison.ChangedLineSummary,
             nextActions = comparison.NextActions
+        };
+    }
+
+    public async Task<object> CompareModulesToFilesAsync(
+        DeploymentModuleInput[] modules,
+        string? diffMode,
+        CancellationToken cancellationToken)
+    {
+        if (modules is null || modules.Length == 0)
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "modules is required.");
+        }
+
+        if (modules.Length > 100)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Deployment set is too large.",
+                $"count={modules.Length}",
+                "Pass at most 100 modules.");
+        }
+
+        var diffOptions = BuildDiffOutputOptions(
+            contextLines: 3,
+            diffMode: string.IsNullOrWhiteSpace(diffMode) ? "summary" : diffMode,
+            maxHunks: null,
+            maxDiffLinesPerSide: null);
+        var plannedModules = modules
+            .Where(module => !string.IsNullOrWhiteSpace(module.Schema) && !string.IsNullOrWhiteSpace(module.Name))
+            .Select(module => BuildTargetKey(module.Schema, module.Name))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var items = new List<object>();
+        for (var i = 0; i < modules.Length; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var moduleInput = modules[i];
+            if (string.IsNullOrWhiteSpace(moduleInput.Schema)
+                || string.IsNullOrWhiteSpace(moduleInput.Name)
+                || string.IsNullOrWhiteSpace(moduleInput.FilePath))
+            {
+                items.Add(new
+                {
+                    deploymentOrder = i + 1,
+                    moduleInput.Schema,
+                    moduleInput.Name,
+                    filePath = moduleInput.FilePath,
+                    status = "local_missing",
+                    error = "schema, name, and filePath are required."
+                });
+                continue;
+            }
+
+            FileInfo file;
+            try
+            {
+                file = GetReadableCompareFile(moduleInput.FilePath);
+            }
+            catch (SqlMcpException ex)
+            {
+                items.Add(new
+                {
+                    deploymentOrder = i + 1,
+                    moduleInput.Schema,
+                    moduleInput.Name,
+                    filePath = moduleInput.FilePath,
+                    status = "local_missing",
+                    errorCode = ex.ErrorCode,
+                    error = ex.Message
+                });
+                continue;
+            }
+
+            var script = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
+            var validationObject = await ValidateTsqlScriptCoreAsync(
+                script,
+                file.FullName,
+                plannedModules,
+                cancellationToken);
+            var validation = JsonSerializer.SerializeToElement(validationObject, JsonResponse.Options);
+            var localSyntaxValid = validation.GetProperty("localSyntaxValid").GetBoolean();
+            var referencedObjectsValid = validation.GetProperty("referencedObjectsValid").GetBoolean();
+            var readyToDeploy = validation.GetProperty("readyToDeploy").GetBoolean();
+            try
+            {
+                var databaseModule = await GetModuleDefinitionCoreAsync(
+                    moduleInput.Schema,
+                    moduleInput.Name,
+                    cancellationToken);
+                var comparison = await BuildModuleFileComparisonAsync(
+                    databaseModule,
+                    file,
+                    diffOptions,
+                    cancellationToken);
+                items.Add(new
+                {
+                    deploymentOrder = i + 1,
+                    schema = databaseModule.Schema,
+                    name = databaseModule.Name,
+                    filePath = file.FullName,
+                    status = comparison.DifferenceKind,
+                    matched = comparison.DifferenceKind is "exact_match" or "wrapper_only" or "format_only" or "comment_only",
+                    localSyntaxValid,
+                    referencedObjectsValid,
+                    readyToDeploy,
+                    comparison
+                });
+            }
+            catch (SqlMcpException ex) when (ex.ErrorCode == ErrorCodes.ObjectNotFound)
+            {
+                items.Add(new
+                {
+                    deploymentOrder = i + 1,
+                    schema = moduleInput.Schema,
+                    name = moduleInput.Name,
+                    filePath = file.FullName,
+                    status = "target_missing",
+                    matched = false,
+                    localSyntaxValid,
+                    referencedObjectsValid,
+                    readyToDeploy,
+                    validation = validationObject
+                });
+            }
+            catch (SqlMcpException ex)
+            {
+                items.Add(new
+                {
+                    deploymentOrder = i + 1,
+                    schema = moduleInput.Schema,
+                    name = moduleInput.Name,
+                    filePath = file.FullName,
+                    status = "error",
+                    matched = false,
+                    localSyntaxValid,
+                    referencedObjectsValid,
+                    readyToDeploy = false,
+                    errorCode = ex.ErrorCode,
+                    error = ex.Message
+                });
+            }
+        }
+
+        var serializedItems = items
+            .Select(item => JsonSerializer.SerializeToElement(item, JsonResponse.Options))
+            .ToArray();
+        var statusCounts = serializedItems
+            .Select(item => item.GetProperty("status").GetString() ?? "unknown")
+            .GroupBy(status => status, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        return new
+        {
+            count = items.Count,
+            deploymentOrderPreserved = true,
+            statusCounts,
+            items
         };
     }
 
@@ -901,11 +1946,273 @@ public sealed class SqlMetadataService
         };
     }
 
+    public async Task<object> GetCallersAsync(
+        string schema,
+        string name,
+        string[]? objectTypes,
+        int? limit,
+        CancellationToken cancellationToken)
+    {
+        var target = await GetObjectAsync(
+            schema,
+            name,
+            ["U", "V", "P", "PC", "FN", "IF", "TF", "FS", "FT", "TR"],
+            cancellationToken);
+        var effectiveLimit = _options.Limits.ClampRows(limit);
+        var allowedTypes = ObjectTypeMapper.MapModuleTypes(objectTypes).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var dependencyEdges = await LoadDependencyEdgesAsync(cancellationToken);
+        var confirmed = dependencyEdges
+            .Where(edge => edge.ToObjectId == target.ObjectId && allowedTypes.Contains(edge.FromType))
+            .OrderBy(edge => edge.FromSchema, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(edge => edge.FromName, StringComparer.OrdinalIgnoreCase)
+            .Take(effectiveLimit)
+            .ToArray();
+        var transactionSignals = await LoadModuleTransactionSignalsAsync(
+            confirmed.Select(edge => edge.FromObjectId).Distinct().ToArray(),
+            cancellationToken);
+        var staticMatches = await FindUsageModuleMatchesAsync(
+            target.Name,
+            target.Schema,
+            objectTypes,
+            "ranked",
+            cancellationToken);
+        var staticPage = staticMatches
+            .Where(match => !match.Schema.Equals(target.Schema, StringComparison.OrdinalIgnoreCase)
+                            || !match.ObjectName.Equals(target.Name, StringComparison.OrdinalIgnoreCase))
+            .Where(match => match.MatchKind is not "text_contains")
+            .Take(effectiveLimit)
+            .ToArray();
+
+        return new
+        {
+            target = new
+            {
+                target.Schema,
+                target.Name,
+                type = ObjectTypeMapper.ToPublicType(target.Type)
+            },
+            confirmedCallers = confirmed.Select(edge => new
+            {
+                schema = edge.FromSchema,
+                name = edge.FromName,
+                type = ObjectTypeMapper.ToPublicType(edge.FromType),
+                source = "sys.sql_expression_dependencies",
+                confidence = 1.0,
+                lineNumber = (int?)null,
+                columnNumber = (int?)null,
+                context = "Confirmed dependency; SQL Server metadata does not retain source line.",
+                transactionSignals = transactionSignals.GetValueOrDefault(edge.FromObjectId, [])
+            }).ToArray(),
+            staticCallSites = staticPage,
+            dynamicSqlCallSites = staticPage
+                .Where(match => match.MatchKind == "dynamic_sql_string")
+                .ToArray(),
+            notFound = confirmed.Length == 0 && staticPage.Length == 0,
+            truncated = confirmed.Length >= effectiveLimit || staticMatches.Length > effectiveLimit,
+            limit = effectiveLimit,
+            nextActions = new[]
+            {
+                "Use get_module_definition with the returned lineNumber to inspect a call site.",
+                "Use search_config_text for page or low-code configuration callers."
+            }
+        };
+    }
+
+    public async Task<object> GetCalleesAsync(
+        string schema,
+        string name,
+        int? limit,
+        CancellationToken cancellationToken)
+    {
+        var caller = await GetObjectAsync(
+            schema,
+            name,
+            ["V", "P", "PC", "FN", "IF", "TF", "FS", "FT", "TR"],
+            cancellationToken);
+        var effectiveLimit = _options.Limits.ClampRows(limit);
+        var dependencyEdges = await LoadDependencyEdgesAsync(cancellationToken);
+        var confirmed = dependencyEdges
+            .Where(edge => edge.FromObjectId == caller.ObjectId)
+            .OrderBy(edge => edge.ToSchema, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(edge => edge.ToName, StringComparer.OrdinalIgnoreCase)
+            .Take(effectiveLimit)
+            .ToArray();
+        var module = await GetModuleDefinitionCoreAsync(caller.Schema, caller.Name, cancellationToken);
+        var analysis = TsqlScriptAnalyzer.Analyze(module.Definition);
+        var staticCalls = analysis.ObjectReferences
+            .Where(reference => reference.Kind == "procedure_call")
+            .Select(reference => new
+            {
+                schema = reference.Schema,
+                name = reference.Name,
+                type = "procedure",
+                source = "module_static_call",
+                confidence = 0.90,
+                lineNumber = reference.Line,
+                columnNumber = reference.Column,
+                context = GetDefinitionLine(module.Definition, reference.Line)
+            })
+            .Take(effectiveLimit)
+            .ToArray();
+        var dynamicWarnings = analysis.Diagnostics
+            .Where(diagnostic => diagnostic.Category == "dynamic_sql_unverified")
+            .ToArray();
+
+        return new
+        {
+            caller = new
+            {
+                caller.Schema,
+                caller.Name,
+                type = ObjectTypeMapper.ToPublicType(caller.Type)
+            },
+            confirmedCallees = confirmed.Select(edge => new
+            {
+                schema = edge.ToSchema,
+                name = edge.ToName,
+                type = ObjectTypeMapper.ToPublicType(edge.ToType),
+                source = "sys.sql_expression_dependencies",
+                confidence = 1.0,
+                lineNumber = (int?)null,
+                columnNumber = (int?)null,
+                context = "Confirmed dependency; SQL Server metadata does not retain source line."
+            }).ToArray(),
+            staticCallSites = staticCalls,
+            dynamicSqlWarnings = dynamicWarnings,
+            notFound = confirmed.Length == 0 && staticCalls.Length == 0,
+            truncated = confirmed.Length >= effectiveLimit || staticCalls.Length >= effectiveLimit,
+            limit = effectiveLimit
+        };
+    }
+
+    public async Task<object> GetDependencyGraphAsync(
+        string schema,
+        string name,
+        string direction,
+        int maxDepth,
+        int? limit,
+        CancellationToken cancellationToken)
+    {
+        var normalizedDirection = direction.Trim().ToLowerInvariant();
+        if (normalizedDirection is not ("callers" or "callees" or "both"))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "direction must be callers, callees, or both.");
+        }
+
+        var effectiveDepth = Math.Clamp(maxDepth, 1, 8);
+        var effectiveLimit = _options.Limits.ClampRows(limit);
+        var root = await GetObjectAsync(
+            schema,
+            name,
+            ["U", "V", "P", "PC", "FN", "IF", "TF", "FS", "FT", "TR"],
+            cancellationToken);
+        var allEdges = await LoadDependencyEdgesAsync(cancellationToken);
+        var selectedEdges = new List<DependencyEdge>();
+        var selectedKeys = new HashSet<(int From, int To)>();
+        var visitedDepth = new Dictionary<int, int> { [root.ObjectId] = 0 };
+        var queue = new Queue<(int ObjectId, int Depth)>();
+        queue.Enqueue((root.ObjectId, 0));
+        var truncated = false;
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            if (current.Depth >= effectiveDepth)
+            {
+                continue;
+            }
+
+            var adjacent = allEdges.Where(edge =>
+                (normalizedDirection is "callees" or "both" && edge.FromObjectId == current.ObjectId)
+                || (normalizedDirection is "callers" or "both" && edge.ToObjectId == current.ObjectId));
+            foreach (var edge in adjacent)
+            {
+                if (selectedKeys.Add((edge.FromObjectId, edge.ToObjectId)))
+                {
+                    if (selectedEdges.Count >= effectiveLimit)
+                    {
+                        truncated = true;
+                        break;
+                    }
+
+                    selectedEdges.Add(edge);
+                }
+
+                var nextObjectId = edge.FromObjectId == current.ObjectId
+                    ? edge.ToObjectId
+                    : edge.FromObjectId;
+                if (!visitedDepth.TryGetValue(nextObjectId, out var knownDepth)
+                    || knownDepth > current.Depth + 1)
+                {
+                    visitedDepth[nextObjectId] = current.Depth + 1;
+                    queue.Enqueue((nextObjectId, current.Depth + 1));
+                }
+            }
+
+            if (truncated)
+            {
+                break;
+            }
+        }
+
+        var nodes = selectedEdges
+            .SelectMany(edge => new[]
+            {
+                new DependencyGraphNode(
+                    edge.FromObjectId,
+                    edge.FromSchema,
+                    edge.FromName,
+                    ObjectTypeMapper.ToPublicType(edge.FromType),
+                    visitedDepth.GetValueOrDefault(edge.FromObjectId)),
+                new DependencyGraphNode(
+                    edge.ToObjectId,
+                    edge.ToSchema,
+                    edge.ToName,
+                    ObjectTypeMapper.ToPublicType(edge.ToType),
+                    visitedDepth.GetValueOrDefault(edge.ToObjectId))
+            })
+            .Append(new DependencyGraphNode(
+                root.ObjectId,
+                root.Schema,
+                root.Name,
+                ObjectTypeMapper.ToPublicType(root.Type),
+                0))
+            .GroupBy(node => node.ObjectId)
+            .Select(group => group.OrderBy(node => node.Depth).First())
+            .OrderBy(node => node.Depth)
+            .ThenBy(node => node.Schema, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(node => node.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return new
+        {
+            root = new { root.Schema, root.Name, type = ObjectTypeMapper.ToPublicType(root.Type) },
+            direction = normalizedDirection,
+            maxDepth = effectiveDepth,
+            nodes,
+            edges = selectedEdges.Select(edge => new
+            {
+                from = new { schema = edge.FromSchema, name = edge.FromName, type = ObjectTypeMapper.ToPublicType(edge.FromType) },
+                to = new { schema = edge.ToSchema, name = edge.ToName, type = ObjectTypeMapper.ToPublicType(edge.ToType) },
+                source = "sys.sql_expression_dependencies",
+                confidence = 1.0
+            }).ToArray(),
+            nodeCount = nodes.Length,
+            edgeCount = selectedEdges.Count,
+            truncated,
+            limit = effectiveLimit
+        };
+    }
+
     public async Task<object> FindUsageAsync(
         string name,
         string? schema,
         string[]? objectTypes,
+        string? matchMode,
         int? limit,
+        string? cursor,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(name))
@@ -913,52 +2220,117 @@ public sealed class SqlMetadataService
             throw new SqlMcpException(ErrorCodes.ConfigInvalid, "name is required.");
         }
 
+        var effectiveMatchMode = NormalizeUsageMatchMode(matchMode);
         var effectiveLimit = _options.Limits.ClampRows(limit);
-        var columnMatchesRaw = await FindUsageColumnMatchesAsync(name, schema, effectiveLimit + 1, cancellationToken);
-        var moduleMatchesRaw = await FindUsageModuleMatchesAsync(name, schema, objectTypes, effectiveLimit + 1, cancellationToken);
-        var columnMatches = columnMatchesRaw.Take(effectiveLimit).ToArray();
-        var moduleMatches = moduleMatchesRaw.Take(effectiveLimit).ToArray();
-        var columnMatchesTruncated = columnMatchesRaw.Length > effectiveLimit;
-        var moduleMatchesTruncated = moduleMatchesRaw.Length > effectiveLimit;
+        var fingerprint = ComputeSha256Hex(string.Join(
+            "\n",
+            name.Trim(),
+            schema?.Trim() ?? string.Empty,
+            effectiveMatchMode,
+            string.Join(",", ObjectTypeMapper.MapModuleTypes(objectTypes))));
+        var offset = DecodeCursor(cursor, fingerprint);
 
-        var truncated = columnMatchesTruncated || moduleMatchesTruncated;
+        var dependencyTask = FindUsageDependencyMatchesAsync(name.Trim(), schema, objectTypes, cancellationToken);
+        var columnTask = FindUsageColumnMatchesAsync(name.Trim(), schema, cancellationToken);
+        var moduleTask = FindUsageModuleMatchesAsync(
+            name.Trim(),
+            schema,
+            objectTypes,
+            effectiveMatchMode,
+            cancellationToken);
+        await Task.WhenAll(dependencyTask, columnTask, moduleTask);
+
+        var allMatches = dependencyTask.Result
+            .Concat(columnTask.Result)
+            .Concat(moduleTask.Result)
+            .GroupBy(
+                match => new
+                {
+                    match.SourceKind,
+                    match.Schema,
+                    match.ObjectName,
+                    match.ObjectType,
+                    match.MatchKind,
+                    match.LineNumber,
+                    match.ColumnNumber,
+                    match.MatchedText
+                })
+            .Select(group => group.OrderByDescending(match => match.Confidence).First())
+            .OrderByDescending(match => match.Confidence)
+            .ThenBy(match => match.Schema, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(match => match.ObjectType, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(match => match.ObjectName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(match => match.LineNumber ?? int.MaxValue)
+            .ThenBy(match => match.ColumnNumber ?? int.MaxValue)
+            .ToArray();
+
+        if (offset > allMatches.Length)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Pagination cursor is beyond the available result set.",
+                $"offset={offset}, resultCount={allMatches.Length}",
+                "Restart find_usage without cursor.");
+        }
+
+        var page = allMatches.Skip(offset).Take(effectiveLimit).ToArray();
+        var nextOffset = offset + page.Length;
+        var hasMore = nextOffset < allMatches.Length;
+        var nextCursor = hasMore ? EncodeCursor(nextOffset, fingerprint) : null;
+        var columnMatches = page.Where(match => match.SourceKind == "column").ToArray();
+        var moduleMatches = page.Where(match => match.SourceKind is "module" or "dependency").ToArray();
         var sections = new
         {
             columnMatches = new
             {
                 count = columnMatches.Length,
-                limit = effectiveLimit,
-                truncated = columnMatchesTruncated
+                total = allMatches.Count(match => match.SourceKind == "column")
             },
             moduleMatches = new
             {
                 count = moduleMatches.Length,
-                limit = effectiveLimit,
-                truncated = moduleMatchesTruncated
+                total = allMatches.Count(match => match.SourceKind is "module" or "dependency")
             }
         };
-        var hint = truncated
-            ? "Pass schema/objectTypes, use a more specific token, or inspect modules with get_module_definition keyword slices."
+        var hint = hasMore
+            ? "Use nextRequest.cursor for the next stable page, or narrow schema/objectTypes/matchMode."
             : null;
 
         return new
         {
             name,
             schema,
+            matchMode = effectiveMatchMode,
+            matches = page,
             columnMatches,
             moduleMatches,
             columnMatchCount = columnMatches.Length,
             moduleMatchCount = moduleMatches.Length,
+            totalMatchCount = allMatches.Length,
             limit = effectiveLimit,
-            truncated,
+            cursor,
+            nextCursor,
+            hasMore,
+            truncated = hasMore,
             sections,
             resultInfo = BuildResultInfo(
-                columnMatches.Length + moduleMatches.Length,
-                effectiveLimit * 2,
-                truncated,
+                page.Length,
+                effectiveLimit,
+                hasMore,
                 hint,
-                truncated ? "limit" : null,
+                hasMore ? "page" : null,
                 sections),
+            nextRequest = hasMore
+                ? new
+                {
+                    name,
+                    schema,
+                    objectTypes,
+                    matchMode = effectiveMatchMode == "ranked" ? null : effectiveMatchMode,
+                    limit = effectiveLimit,
+                    cursor = nextCursor
+                }
+                : null,
             hint
         };
     }
@@ -969,6 +2341,7 @@ public sealed class SqlMetadataService
         int? limit,
         bool includeTargets,
         bool usableOnly,
+        string? cursor,
         CancellationToken cancellationToken)
     {
         var terms = SplitKeyword(keyword);
@@ -994,16 +2367,17 @@ public sealed class SqlMetadataService
         }
 
         var effectiveLimit = _options.Limits.ClampRows(limit);
+        var fingerprint = ComputeSha256Hex($"search_config_text\n{keyword}\n{profile}\n{usableOnly}");
+        var offset = DecodeCursor(cursor, fingerprint);
+        var requiredCount = offset + effectiveLimit + 1;
         var columnLookup = await LoadTextSearchTargetColumnsAsync(targets, cancellationToken);
         var items = new List<object>();
-        var truncated = false;
 
         foreach (var target in targets)
         {
-            var remaining = effectiveLimit - items.Count;
+            var remaining = requiredCount - items.Count;
             if (remaining <= 0)
             {
-                truncated = true;
                 break;
             }
 
@@ -1017,7 +2391,6 @@ public sealed class SqlMetadataService
                 cancellationToken);
             if (targetRows.Count > remaining)
             {
-                truncated = true;
                 items.AddRange(targetRows.Take(remaining));
                 break;
             }
@@ -1025,8 +2398,11 @@ public sealed class SqlMetadataService
             items.AddRange(targetRows);
         }
 
-        var hint = truncated
-            ? "Use profile, a narrower keyword, or increase limit within the configured server cap."
+        var page = items.Skip(offset).Take(effectiveLimit).ToArray();
+        var hasMore = items.Count > offset + page.Length;
+        var nextCursor = hasMore ? EncodeCursor(offset + page.Length, fingerprint) : null;
+        var hint = hasMore
+            ? "Use nextRequest.cursor, profile, or a narrower keyword."
             : null;
 
         return new
@@ -1040,16 +2416,113 @@ public sealed class SqlMetadataService
             searchedTargets = includeTargets
                 ? targets.Select(target => BuildTextSearchTargetSummary(target, FindUsableColumn(target, columnLookup))).ToArray()
                 : null,
-            items,
-            count = items.Count,
-            truncated,
+            items = page,
+            count = page.Length,
+            cursor,
+            nextCursor,
+            hasMore,
+            truncated = hasMore,
             limit = effectiveLimit,
-            resultInfo = BuildResultInfo(items.Count, effectiveLimit, truncated, hint, truncated ? "limit" : null),
+            resultInfo = BuildResultInfo(page.Length, effectiveLimit, hasMore, hint, hasMore ? "page" : null),
+            nextRequest = hasMore
+                ? new
+                {
+                    keyword,
+                    profile,
+                    limit = effectiveLimit,
+                    includeTargets,
+                    usableOnly,
+                    cursor = nextCursor
+                }
+                : null,
             hint
         };
     }
 
-    public async Task<object> ExplainQueryPlanAsync(string sql, CancellationToken cancellationToken)
+    public async Task<object> FindFieldConsumersAsync(
+        string column,
+        string? schema,
+        string? profile,
+        int? limit,
+        CancellationToken cancellationToken)
+    {
+        var columnsTask = FindColumnAsync(column, true, limit, null, cancellationToken);
+        var usageTask = FindUsageAsync(
+            column,
+            schema,
+            null,
+            "exact_identifier",
+            limit,
+            null,
+            cancellationToken);
+        var configTask = SearchConfigTextAsync(
+            column,
+            profile,
+            limit,
+            includeTargets: false,
+            usableOnly: false,
+            cursor: null,
+            cancellationToken);
+        await Task.WhenAll(columnsTask, usageTask, configTask);
+        return new
+        {
+            column,
+            schema,
+            databaseColumns = columnsTask.Result,
+            moduleConsumers = usageTask.Result,
+            configuredConsumers = configTask.Result,
+            nextActions = new[]
+            {
+                "Use describe_table(mode=shape or write_contract) for the owning table.",
+                "Use get_module_definition on returned module line numbers.",
+                "Use profile_column to inspect actual values and length/format quality."
+            }
+        };
+    }
+
+    public async Task<object> FindPageByConfiguredReferenceAsync(
+        string name,
+        string referenceKind,
+        string? profile,
+        int? limit,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "name is required.");
+        }
+
+        var configuredMatches = await SearchConfigTextAsync(
+            name,
+            profile,
+            limit,
+            includeTargets: false,
+            usableOnly: false,
+            cursor: null,
+            cancellationToken);
+        return new
+        {
+            referenceKind,
+            name,
+            configuredMatches,
+            fields = new[]
+            {
+                "locator",
+                "label",
+                "contentKind",
+                "usable",
+                "matchColumn",
+                "matchedTerm",
+                "snippet"
+            },
+            hint = "Results depend on allow-listed textSearch.targets; use includeTargets on search_config_text to inspect configured coverage."
+        };
+    }
+
+    public async Task<object> ExplainQueryPlanAsync(
+        string sql,
+        bool includeXml,
+        CancellationToken cancellationToken)
     {
         _sqlGuard.ValidateShowplanQuery(sql);
 
@@ -1077,7 +2550,8 @@ public sealed class SqlMetadataService
             {
                 statementCount = plans.Count,
                 summary = SummarizeShowplanXml(plans),
-                showplanXml = plans,
+                xmlIncluded = includeXml,
+                showplanXml = includeXml ? plans : null,
                 elapsedMs = stopwatch.ElapsedMilliseconds
             };
         }
@@ -1171,7 +2645,8 @@ public sealed class SqlMetadataService
                     nullable = row.IsNullable == 1,
                     systemTypeName = row.SystemTypeName,
                     row.SystemTypeId,
-                    row.MaxLength,
+                    maxLengthBytes = row.MaxLength,
+                    maxLengthCharacters = NormalizeResultMaxLengthCharacters(row.MaxLength, row.SystemTypeName),
                     row.Precision,
                     row.Scale,
                     row.CollationName
@@ -1194,12 +2669,16 @@ public sealed class SqlMetadataService
         string sql,
         IReadOnlyDictionary<string, object?>? parameters,
         int? maxRows,
+        string? cursor,
         CancellationToken cancellationToken)
     {
         _sqlGuard.ValidateReadonlyQuery(sql);
 
         var parameterSpecs = BuildUserSqlParameters(parameters);
         var effectiveMaxRows = _options.Limits.ClampRows(maxRows);
+        var fingerprint = ComputeSha256Hex(
+            $"run_readonly_query\n{sql}\n{JsonSerializer.Serialize(parameters, JsonResponse.Options)}");
+        var offset = DecodeCursor(cursor, fingerprint);
         var resultLimitBytes = _options.Limits.MaxResultMb * 1024L * 1024L;
         var stopwatch = Stopwatch.StartNew();
         var rows = new List<Dictionary<string, object?>>();
@@ -1229,8 +2708,14 @@ public sealed class SqlMetadataService
             });
         }
 
+        var sourceRowIndex = 0;
         while (await reader.ReadAsync(cancellationToken))
         {
+            if (sourceRowIndex++ < offset)
+            {
+                continue;
+            }
+
             if (rows.Count >= effectiveMaxRows)
             {
                 rowLimitTruncated = true;
@@ -1277,6 +2762,9 @@ public sealed class SqlMetadataService
                 : null;
 
         var columnsWithTruncatedText = truncation.ColumnsWithTruncatedText.OrderBy(column => column).ToArray();
+        var nextCursor = rowLimitTruncated
+            ? EncodeCursor(offset + rows.Count, fingerprint)
+            : null;
 
         return new
         {
@@ -1284,6 +2772,9 @@ public sealed class SqlMetadataService
             rows,
             rowCount = rows.Count,
             truncated = rowLimitTruncated,
+            cursor,
+            nextCursor,
+            hasMore = rowLimitTruncated,
             resultInfo = BuildResultInfo(
                 rows.Count,
                 effectiveMaxRows,
@@ -1311,9 +2802,290 @@ public sealed class SqlMetadataService
                 reason = truncationReasons.Count == 0 ? null : string.Join(",", truncationReasons),
                 hint
             },
+            nextRequest = rowLimitTruncated
+                ? new
+                {
+                    sql,
+                    parameters,
+                    maxRows = effectiveMaxRows,
+                    cursor = nextCursor,
+                    requiresDeterministicOrder = true
+                }
+                : null,
             parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
             elapsedMs = stopwatch.ElapsedMilliseconds
         };
+    }
+
+    public async Task<object> RunReadonlyBatchAsync(
+        string sql,
+        IReadOnlyDictionary<string, object?>? parameters,
+        int? maxRows,
+        CancellationToken cancellationToken)
+    {
+        _sqlGuard.ValidateReadonlyBatch(sql);
+        var parameterSpecs = BuildUserSqlParameters(parameters);
+        var effectiveMaxRows = _options.Limits.ClampRows(maxRows);
+        var resultLimitBytes = _options.Limits.MaxResultMb * 1024L * 1024L;
+        var stopwatch = Stopwatch.StartNew();
+        var rows = new List<Dictionary<string, object?>>();
+        var columns = new List<object>();
+        var truncation = new QueryValueTruncationInfo();
+        var rowLimitTruncated = false;
+        long estimatedBytes = 0;
+        var resultSetCount = 0;
+
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(
+            System.Data.IsolationLevel.ReadCommitted,
+            cancellationToken);
+        try
+        {
+            await using var command = CreateCommand(
+                connection,
+                $"SET NOCOUNT ON; SET LOCK_TIMEOUT {_options.Limits.LockTimeoutMs};\n{sql}");
+            command.Transaction = transaction;
+            foreach (var parameter in parameterSpecs.Select(CreateSqlParameter))
+            {
+                command.Parameters.Add(parameter);
+            }
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            do
+            {
+                if (reader.FieldCount <= 0)
+                {
+                    while (await reader.ReadAsync(cancellationToken))
+                    {
+                    }
+
+                    continue;
+                }
+
+                resultSetCount++;
+                columns.Clear();
+                rows.Clear();
+                for (var i = 0; i < reader.FieldCount; i++)
+                {
+                    columns.Add(new
+                    {
+                        name = reader.GetName(i),
+                        dataType = reader.GetDataTypeName(i)
+                    });
+                }
+
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    if (rows.Count >= effectiveMaxRows)
+                    {
+                        rowLimitTruncated = true;
+                        break;
+                    }
+
+                    var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                    for (var i = 0; i < reader.FieldCount; i++)
+                    {
+                        var value = ReadValue(reader, i, truncation);
+                        row[reader.GetName(i)] = value;
+                        estimatedBytes += EstimateBytes(value);
+                    }
+
+                    if (estimatedBytes > resultLimitBytes)
+                    {
+                        throw new SqlMcpException(
+                            ErrorCodes.ResultTooLarge,
+                            "Batch result exceeded configured maxResultMb.",
+                            $"Estimated payload exceeded {_options.Limits.MaxResultMb} MB.",
+                            "Reduce selected columns or rows.");
+                    }
+
+                    rows.Add(row);
+                }
+            }
+            while (await reader.NextResultAsync(cancellationToken));
+        }
+        finally
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+        }
+
+        stopwatch.Stop();
+        var truncated = rowLimitTruncated || truncation.TextValuesTruncated > 0;
+        var nextRequest = rowLimitTruncated
+            ? new
+            {
+                maxRows = Math.Min(effectiveMaxRows * 2, _options.Limits.MaxRows),
+                note = "Add deterministic filtering or raise maxRows; batch cursors are not emitted because temp-table state is per execution."
+            }
+            : null;
+        return new
+        {
+            columns,
+            rows,
+            rowCount = rows.Count,
+            resultSetCount,
+            transactionRolledBack = true,
+            businessWritesAllowed = false,
+            truncated,
+            resultInfo = BuildResultInfo(
+                rows.Count,
+                effectiveMaxRows,
+                truncated,
+                rowLimitTruncated ? "Add filters or raise maxRows within the configured cap." : null,
+                rowLimitTruncated ? "maxRows" : truncation.TextValuesTruncated > 0 ? "maxTextLength" : null),
+            nextRequest,
+            parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
+            elapsedMs = stopwatch.ElapsedMilliseconds
+        };
+    }
+
+    public async Task<object> BatchMetadataAsync(
+        MetadataBatchRequest[] requests,
+        CancellationToken cancellationToken)
+    {
+        if (requests is null || requests.Length == 0)
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "requests is required.");
+        }
+
+        if (requests.Length > 20)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Too many metadata batch requests.",
+                $"count={requests.Length}",
+                "Pass at most 20 requests.");
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var tasks = requests
+            .Select((request, index) => ExecuteMetadataBatchItemAsync(index, request, cancellationToken))
+            .ToArray();
+        var items = await Task.WhenAll(tasks);
+        stopwatch.Stop();
+        return new
+        {
+            count = items.Length,
+            succeeded = items.Count(item => item.Ok),
+            failed = items.Count(item => !item.Ok),
+            parallel = true,
+            items,
+            elapsedMs = stopwatch.ElapsedMilliseconds
+        };
+    }
+
+    private async Task<MetadataBatchItemResult> ExecuteMetadataBatchItemAsync(
+        int index,
+        MetadataBatchRequest request,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var operation = request.Operation?.Trim().ToLowerInvariant();
+            object result = operation switch
+            {
+                "resolve_object" => await ResolveObjectAsync(
+                    RequireBatchValue(request.Name, "name", operation),
+                    request.Schema,
+                    null,
+                    10,
+                    cancellationToken),
+                "describe_table" => await DescribeTableAsync(
+                    request.Schema ?? "dbo",
+                    RequireBatchValue(request.Name, "name", operation),
+                    "shape",
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    cancellationToken),
+                "get_indexes" => await GetIndexesAsync(
+                    request.Schema ?? "dbo",
+                    RequireBatchValue(request.Name, "name", operation),
+                    cancellationToken),
+                "find_column" => await FindColumnAsync(
+                    RequireBatchValue(request.Column ?? request.Name, "column", operation),
+                    true,
+                    50,
+                    null,
+                    cancellationToken),
+                "get_module_definition" => await GetModuleDefinitionAsync(
+                    request.Schema ?? "dbo",
+                    RequireBatchValue(request.Name, "name", operation),
+                    null,
+                    null,
+                    null,
+                    null,
+                    3,
+                    null,
+                    null,
+                    null,
+                    null,
+                    true,
+                    false,
+                    cancellationToken),
+                "compare_module_to_file" => await CompareModuleToFileAsync(
+                    request.Schema ?? "dbo",
+                    RequireBatchValue(request.Name, "name", operation),
+                    RequireBatchValue(request.FilePath, "filePath", operation),
+                    3,
+                    "summary",
+                    null,
+                    null,
+                    cancellationToken),
+                _ => throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "Unsupported metadata batch operation.",
+                    request.Operation,
+                    "Use resolve_object, describe_table, get_indexes, find_column, get_module_definition, or compare_module_to_file.")
+            };
+            return new MetadataBatchItemResult(index, request.Operation ?? string.Empty, true, result, null);
+        }
+        catch (SqlMcpException ex)
+        {
+            return new MetadataBatchItemResult(
+                index,
+                request.Operation ?? string.Empty,
+                false,
+                null,
+                new
+                {
+                    errorCode = ex.ErrorCode,
+                    ex.Message,
+                    ex.Detail,
+                    ex.Hint,
+                    ex.SqlErrorNumber,
+                    ex.LineNumber,
+                    ex.Suggestions
+                });
+        }
+        catch (Exception ex)
+        {
+            return new MetadataBatchItemResult(
+                index,
+                request.Operation ?? string.Empty,
+                false,
+                null,
+                new
+                {
+                    errorCode = ErrorCodes.UnknownError,
+                    message = ex.Message
+                });
+        }
+    }
+
+    private static string RequireBatchValue(string? value, string field, string? operation)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+
+        throw new SqlMcpException(
+            ErrorCodes.ConfigInvalid,
+            $"Batch operation '{operation}' requires {field}.");
     }
 
     private async Task<DbObjectInfo> GetObjectAsync(
@@ -1421,6 +3193,145 @@ public sealed class SqlMetadataService
         return null;
     }
 
+    private static (string Schema, string Name) ParseObjectReference(string name, string? schema)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "name is required.");
+        }
+
+        var normalized = name.Trim().Replace("[", string.Empty, StringComparison.Ordinal).Replace("]", string.Empty, StringComparison.Ordinal);
+        var parts = normalized.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length is 0 or > 2)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Object reference must contain at most schema and object name.",
+                name,
+                "Use a two-part name such as dbo.ObjectName.");
+        }
+
+        var effectiveSchema = parts.Length == 2 ? parts[0] : string.IsNullOrWhiteSpace(schema) ? "dbo" : schema.Trim();
+        var effectiveName = parts.Length == 2 ? parts[1] : parts[0];
+        if (!IsSafeIdentifier(effectiveSchema) || !IsSafeIdentifier(effectiveName))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Object reference contains an invalid identifier.",
+                name);
+        }
+
+        return (effectiveSchema, effectiveName);
+    }
+
+    private static ObjectResolutionCandidate BuildObjectResolutionCandidate(
+        DbObjectInfo row,
+        string requestedSchema,
+        string requestedName)
+    {
+        var score = 0;
+        var reasons = new List<string>();
+        if (row.Schema.Equals(requestedSchema, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 50;
+            reasons.Add("schema_match");
+        }
+
+        if (row.Name.Equals(requestedName, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 1000;
+            reasons.Add("exact_name");
+        }
+
+        var normalizedRequested = NormalizeObjectSearchName(requestedName);
+        var normalizedCandidate = NormalizeObjectSearchName(row.Name);
+        if (normalizedCandidate.Equals(normalizedRequested, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 800;
+            reasons.Add("normalized_name_match");
+        }
+        else if (row.Name.Contains(requestedName, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 600;
+            reasons.Add("candidate_contains_input");
+        }
+        else if (requestedName.Contains(row.Name, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 450;
+            reasons.Add("input_contains_candidate");
+        }
+
+        var distance = ComputeLevenshteinDistance(
+            normalizedRequested.ToUpperInvariant(),
+            normalizedCandidate.ToUpperInvariant());
+        var maxLength = Math.Max(normalizedRequested.Length, normalizedCandidate.Length);
+        var similarity = maxLength == 0 ? 1.0 : 1.0 - (double)distance / maxLength;
+        if (similarity >= 0.35)
+        {
+            score += (int)Math.Round(similarity * 400, MidpointRounding.AwayFromZero);
+            reasons.Add($"name_similarity_{similarity:0.00}");
+        }
+
+        var physicalName = MapStructureObjectName(row.Name);
+        if (physicalName is not null)
+        {
+            reasons.Add("view_prefix_mapping");
+        }
+
+        return new ObjectResolutionCandidate(
+            row.Schema,
+            row.Name,
+            ObjectTypeMapper.ToPublicType(row.Type),
+            row.TypeDesc,
+            score,
+            similarity,
+            reasons.ToArray(),
+            physicalName,
+            physicalName is null ? "object" : "prefixed_view",
+            row.Description);
+    }
+
+    private static string NormalizeObjectSearchName(string name)
+    {
+        var mapped = MapStructureObjectName(name) ?? name;
+        return Regex.Replace(
+            mapped,
+            @"(?:Header|Detail|Hdr|Dtl)$",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    internal static int ComputeLevenshteinDistance(string left, string right)
+    {
+        if (left.Length == 0)
+        {
+            return right.Length;
+        }
+
+        if (right.Length == 0)
+        {
+            return left.Length;
+        }
+
+        var previous = Enumerable.Range(0, right.Length + 1).ToArray();
+        var current = new int[right.Length + 1];
+        for (var i = 1; i <= left.Length; i++)
+        {
+            current[0] = i;
+            for (var j = 1; j <= right.Length; j++)
+            {
+                var cost = left[i - 1] == right[j - 1] ? 0 : 1;
+                current[j] = Math.Min(
+                    Math.Min(current[j - 1] + 1, previous[j] + 1),
+                    previous[j - 1] + cost);
+            }
+
+            (previous, current) = (current, previous);
+        }
+
+        return previous[right.Length];
+    }
+
     private static object? BuildResolutionInfo(StructureObjectResolution resolution)
     {
         if (resolution.MappedName is null)
@@ -1486,6 +3397,100 @@ public sealed class SqlMetadataService
             cancellationToken);
 
         return rows.SingleOrDefault();
+    }
+
+    private async Task<DependencyEdge[]> LoadDependencyEdgesAsync(CancellationToken cancellationToken)
+    {
+        const string sql = """
+                           SELECT DISTINCT
+                               from_object_id=F.object_id,
+                               from_schema=FS.name,
+                               from_name=F.name,
+                               from_type=F.type,
+                               to_object_id=T.object_id,
+                               to_schema=TS.name,
+                               to_name=T.name,
+                               to_type=T.type
+                           FROM sys.sql_expression_dependencies D
+                           INNER JOIN sys.objects F ON F.object_id=D.referencing_id
+                           INNER JOIN sys.schemas FS ON FS.schema_id=F.schema_id
+                           INNER JOIN sys.objects T ON T.object_id=D.referenced_id
+                           INNER JOIN sys.schemas TS ON TS.schema_id=T.schema_id
+                           WHERE F.is_ms_shipped=0
+                               AND T.is_ms_shipped=0
+                           ORDER BY FS.name, F.name, TS.name, T.name;
+                           """;
+        var rows = await QueryAsync(
+            sql,
+            [],
+            reader => new DependencyEdge(
+                reader.GetInt32("from_object_id"),
+                reader.GetString("from_schema"),
+                reader.GetString("from_name"),
+                reader.GetString("from_type").Trim(),
+                reader.GetInt32("to_object_id"),
+                reader.GetString("to_schema"),
+                reader.GetString("to_name"),
+                reader.GetString("to_type").Trim()),
+            cancellationToken);
+        return rows.ToArray();
+    }
+
+    private async Task<Dictionary<int, ModuleTransactionSignal[]>> LoadModuleTransactionSignalsAsync(
+        IReadOnlyList<int> objectIds,
+        CancellationToken cancellationToken)
+    {
+        if (objectIds.Count == 0)
+        {
+            return [];
+        }
+
+        var parameters = new List<SqlParameter>();
+        var parameterNames = new List<string>();
+        for (var i = 0; i < objectIds.Count; i++)
+        {
+            var parameterName = $"@transactionObject{i}";
+            parameters.Add(new(parameterName, SqlDbType.Int) { Value = objectIds[i] });
+            parameterNames.Add(parameterName);
+        }
+
+        var sql = $"""
+                   SELECT object_id=O.object_id, definition=M.definition
+                   FROM sys.objects O
+                   INNER JOIN sys.sql_modules M ON M.object_id=O.object_id
+                   WHERE O.object_id IN ({string.Join(", ", parameterNames)});
+                   """;
+        var rows = await QueryAsync(
+            sql,
+            parameters,
+            reader => new
+            {
+                ObjectId = reader.GetInt32("object_id"),
+                Definition = reader.GetNullableString("definition") ?? string.Empty
+            },
+            cancellationToken);
+        var signalRegex = new Regex(
+            @"\b(?:BEGIN\s+(?:DISTRIBUTED\s+)?TRAN(?:SACTION)?|COMMIT(?:\s+TRAN(?:SACTION)?)?|ROLLBACK(?:\s+TRAN(?:SACTION)?)?|BEGIN\s+TRY|BEGIN\s+CATCH|XACT_STATE\s*\()",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return rows.ToDictionary(
+            row => row.ObjectId,
+            row => SplitDefinitionLines(row.Definition)
+                .Select((line, index) => new { line, lineNumber = index + 1, match = signalRegex.Match(line) })
+                .Where(item => item.match.Success)
+                .Select(item => new ModuleTransactionSignal(
+                    item.match.Value,
+                    item.lineNumber,
+                    item.line.Trim()))
+                .Take(50)
+                .ToArray());
+    }
+
+    private static string GetDefinitionLine(string definition, int lineNumber)
+    {
+        var lines = SplitDefinitionLines(definition);
+        return lineNumber >= 1 && lineNumber <= lines.Length
+            ? lines[lineNumber - 1].Trim()
+            : string.Empty;
     }
 
     private async Task<object[]> GetOutgoingDependenciesAsync(int objectId, CancellationToken cancellationToken)
@@ -1627,14 +3632,79 @@ public sealed class SqlMetadataService
         return rows.Cast<object>().ToArray();
     }
 
-    private async Task<object[]> FindUsageColumnMatchesAsync(
+    private async Task<UsageMatch[]> FindUsageDependencyMatchesAsync(
         string name,
         string? schema,
-        int limit,
+        string[]? objectTypes,
+        CancellationToken cancellationToken)
+    {
+        var typeCodes = ObjectTypeMapper.MapModuleTypes(objectTypes);
+        var parameters = new List<SqlParameter>
+        {
+            new("@name", SqlDbType.NVarChar, 128) { Value = name }
+        };
+        var typePredicate = BuildInPredicate("RO.type", "usageDependencyType", typeCodes, parameters);
+        var schemaPredicate = string.Empty;
+        if (!string.IsNullOrWhiteSpace(schema))
+        {
+            parameters.Add(new("@schema", SqlDbType.NVarChar, 128) { Value = schema });
+            schemaPredicate = "AND COALESCE(RS.name, D.referenced_schema_name, N'dbo')=@schema";
+        }
+
+        var sql = $"""
+                   SELECT DISTINCT
+                       schema_name=S.name,
+                       object_name=RO.name,
+                       object_type=RO.type,
+                       object_type_desc=RO.type_desc,
+                       referenced_schema=COALESCE(RS.name, D.referenced_schema_name),
+                       referenced_name=COALESCE(T.name, D.referenced_entity_name)
+                   FROM sys.sql_expression_dependencies D
+                   INNER JOIN sys.objects RO ON RO.object_id=D.referencing_id
+                   INNER JOIN sys.schemas S ON S.schema_id=RO.schema_id
+                   LEFT JOIN sys.objects T ON T.object_id=D.referenced_id
+                   LEFT JOIN sys.schemas RS ON RS.schema_id=T.schema_id
+                   WHERE RO.is_ms_shipped=0
+                       AND {typePredicate}
+                       AND COALESCE(T.name, D.referenced_entity_name)=@name
+                       {schemaPredicate}
+                   ORDER BY S.name, RO.type, RO.name;
+                   """;
+
+        var rows = await QueryAsync(
+            sql,
+            parameters,
+            reader => new UsageMatch(
+                "dependency",
+                reader.GetString("schema_name"),
+                reader.GetString("object_name"),
+                ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
+                reader.GetString("object_type_desc"),
+                "sql_expression_dependency",
+                string.Join(
+                    ".",
+                    new[]
+                    {
+                        reader.GetNullableString("referenced_schema"),
+                        reader.GetNullableString("referenced_name")
+                    }.Where(value => !string.IsNullOrWhiteSpace(value))),
+                null,
+                null,
+                "Confirmed by sys.sql_expression_dependencies.",
+                1.0,
+                null),
+            cancellationToken);
+
+        return rows.ToArray();
+    }
+
+    private async Task<UsageMatch[]> FindUsageColumnMatchesAsync(
+        string name,
+        string? schema,
         CancellationToken cancellationToken)
     {
         var sql = $"""
-                   SELECT TOP (@limit)
+                   SELECT
                        schema_name=S.name,
                        object_name=O.name,
                        object_type=O.type,
@@ -1653,7 +3723,6 @@ public sealed class SqlMetadataService
 
         var parameters = new List<SqlParameter>
         {
-            new("@limit", SqlDbType.Int) { Value = limit },
             new("@name", SqlDbType.NVarChar, 128) { Value = name }
         };
 
@@ -1665,46 +3734,47 @@ public sealed class SqlMetadataService
         var rows = await QueryAsync(
             sql,
             parameters,
-            reader => new
-            {
-                schema = reader.GetString("schema_name"),
-                objectName = reader.GetString("object_name"),
-                objectType = ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
-                objectTypeDesc = reader.GetString("object_type_desc"),
-                columnName = reader.GetString("column_name"),
-                ordinal = reader.GetInt32("column_id")
-            },
+            reader => new UsageMatch(
+                "column",
+                reader.GetString("schema_name"),
+                reader.GetString("object_name"),
+                ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
+                reader.GetString("object_type_desc"),
+                "exact_column",
+                reader.GetString("column_name"),
+                null,
+                null,
+                $"Column ordinal {reader.GetInt32("column_id")}.",
+                1.0,
+                reader.GetInt32("column_id")),
             cancellationToken);
 
-        return rows.Cast<object>().ToArray();
+        return rows.ToArray();
     }
 
-    private async Task<object[]> FindUsageModuleMatchesAsync(
+    private async Task<UsageMatch[]> FindUsageModuleMatchesAsync(
         string name,
         string? schema,
         string[]? objectTypes,
-        int limit,
+        string matchMode,
         CancellationToken cancellationToken)
     {
         var typeCodes = ObjectTypeMapper.MapModuleTypes(objectTypes);
         var parameters = new List<SqlParameter>
         {
-            new("@limit", SqlDbType.Int) { Value = limit },
-            new("@name", SqlDbType.NVarChar, 4000) { Value = $"%{name}%" },
-            new("@bracketName", SqlDbType.NVarChar, 4000) { Value = $"%[{name}]%" }
+            new("@scanLimit", SqlDbType.Int) { Value = 10_000 }
         };
 
-        var schemaPredicate = string.Empty;
-        if (!string.IsNullOrWhiteSpace(schema))
+        var textPredicate = string.Empty;
+        if (matchMode != "regex")
         {
-            parameters.Add(new("@schemaDotName", SqlDbType.NVarChar, 4000) { Value = $"%{schema}.{name}%" });
-            parameters.Add(new("@bracketSchemaDotName", SqlDbType.NVarChar, 4000) { Value = $"%[{schema}].[{name}]%" });
-            schemaPredicate = "OR M.definition LIKE @schemaDotName OR M.definition LIKE @bracketSchemaDotName";
+            parameters.Add(new("@needle", SqlDbType.NVarChar, 4000) { Value = name });
+            textPredicate = "AND CHARINDEX(@needle, M.definition) > 0";
         }
 
         var typePredicates = BuildInPredicate("O.type", "type", typeCodes, parameters);
         var sql = $"""
-                   SELECT TOP (@limit)
+                   SELECT TOP (@scanLimit)
                        schema_name=S.name,
                        object_name=O.name,
                        object_type=O.type,
@@ -1716,36 +3786,382 @@ public sealed class SqlMetadataService
                    INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
                    WHERE O.is_ms_shipped=0
                        AND {typePredicates}
-                       AND (
-                           M.definition LIKE @name
-                           OR M.definition LIKE @bracketName
-                           {schemaPredicate}
-                       )
-                   ORDER BY O.modify_date DESC, S.name, O.name;
+                       {textPredicate}
+                   ORDER BY S.name, O.type, O.name;
                    """;
 
         var rows = await QueryAsync(
             sql,
             parameters,
-            reader =>
-            {
-                var definition = reader.GetNullableString("definition") ?? string.Empty;
-                return new
-                {
-                    schema = reader.GetString("schema_name"),
-                    name = reader.GetString("object_name"),
-                    type = ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
-                    typeDesc = reader.GetString("object_type_desc"),
-                    matchedSnippet = BuildSnippet(definition, name),
-                    modifyDate = reader.GetDateTime("modify_date")
-                };
-            },
+            reader => new UsageModuleSource(
+                reader.GetString("schema_name"),
+                reader.GetString("object_name"),
+                ObjectTypeMapper.ToPublicType(reader.GetString("object_type")),
+                reader.GetString("object_type_desc"),
+                reader.GetNullableString("definition") ?? string.Empty,
+                reader.GetDateTime("modify_date")),
             cancellationToken);
 
-        return rows.Cast<object>().ToArray();
+        return rows
+            .SelectMany(row => AnalyzeUsageMatches(row, name, schema, matchMode))
+            .ToArray();
     }
 
-    private async Task<object[]> GetColumnsAsync(int objectId, CancellationToken cancellationToken)
+    internal static UsageMatch[] AnalyzeUsageMatches(
+        UsageModuleSource source,
+        string searchText,
+        string? schema,
+        string matchMode)
+    {
+        var matches = new List<UsageMatch>();
+        var definition = source.Definition;
+        var normalizedMode = NormalizeUsageMatchMode(matchMode);
+        IEnumerable<(int Index, int Length, string Value)> occurrences;
+
+        if (normalizedMode == "regex")
+        {
+            Regex regex;
+            try
+            {
+                regex = new Regex(
+                    searchText,
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                    TimeSpan.FromMilliseconds(250));
+            }
+            catch (ArgumentException ex)
+            {
+                throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "Invalid find_usage regular expression.",
+                    ex.Message,
+                    "Pass a valid .NET regular expression in name.");
+            }
+
+            try
+            {
+                occurrences = regex.Matches(definition)
+                    .Cast<Match>()
+                    .Where(match => match.Success && match.Length > 0)
+                    .Take(100)
+                    .Select(match => (match.Index, match.Length, match.Value))
+                    .ToArray();
+            }
+            catch (RegexMatchTimeoutException ex)
+            {
+                throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "find_usage regular expression timed out.",
+                    ex.Message,
+                    "Use a simpler expression without catastrophic backtracking.");
+            }
+        }
+        else
+        {
+            occurrences = FindLiteralOccurrences(definition, searchText)
+                .Take(100)
+                .Select(index => (index, searchText.Length, definition.Substring(index, searchText.Length)))
+                .ToArray();
+        }
+
+        foreach (var occurrence in occurrences)
+        {
+            var (lineNumber, columnNumber, context) = LocateTextMatch(definition, occurrence.Index);
+            var isDynamicSql = IsInsideSqlString(definition, occurrence.Index);
+            var isComment = IsInsideSqlComment(definition, occurrence.Index);
+            var isTwoPart = IsTwoPartIdentifierMatch(definition, occurrence.Index, occurrence.Length, schema);
+            var isIdentifier = IsIdentifierBoundaryMatch(definition, occurrence.Index, occurrence.Length);
+            var isDeclaration = Regex.IsMatch(
+                context,
+                @"^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+(?:PROC(?:EDURE)?|FUNCTION|VIEW|TRIGGER)\b",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            var (matchKind, confidence) = normalizedMode switch
+            {
+                "regex" => ("regex", 0.70),
+                "exact_text" => ("exact_text", 0.90),
+                "contains" => ("contains", 0.50),
+                "exact_identifier" when isComment => (string.Empty, 0),
+                "exact_identifier" when isTwoPart => ("two_part_identifier", 0.99),
+                "exact_identifier" when isIdentifier => ("identifier", 0.95),
+                "exact_identifier" => (string.Empty, 0),
+                _ when isComment => ("comment_text", 0.20),
+                _ when isDeclaration => ("module_declaration", 0.85),
+                _ when isTwoPart => ("two_part_identifier", 0.99),
+                _ when isIdentifier && !isDynamicSql => ("identifier", 0.95),
+                _ when isDynamicSql => ("dynamic_sql_string", 0.75),
+                _ => ("text_contains", 0.40)
+            };
+
+            if (matchKind.Length == 0)
+            {
+                continue;
+            }
+
+            matches.Add(new UsageMatch(
+                "module",
+                source.Schema,
+                source.Name,
+                source.Type,
+                source.TypeDesc,
+                matchKind,
+                occurrence.Value,
+                lineNumber,
+                columnNumber,
+                context,
+                confidence,
+                null));
+        }
+
+        return matches.ToArray();
+    }
+
+    internal static string NormalizeUsageMatchMode(string? matchMode)
+    {
+        var normalized = string.IsNullOrWhiteSpace(matchMode)
+            ? "ranked"
+            : matchMode.Trim().ToLowerInvariant();
+        if (normalized is not ("ranked" or "exact_identifier" or "exact_text" or "contains" or "regex"))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Invalid find_usage matchMode.",
+                matchMode,
+                "Use exact_identifier, exact_text, contains, or regex; omit matchMode for ranked matching.");
+        }
+
+        return normalized;
+    }
+
+    private static IEnumerable<int> FindLiteralOccurrences(string text, string value)
+    {
+        if (value.Length == 0)
+        {
+            yield break;
+        }
+
+        var start = 0;
+        while (start <= text.Length - value.Length)
+        {
+            var index = text.IndexOf(value, start, StringComparison.OrdinalIgnoreCase);
+            if (index < 0)
+            {
+                yield break;
+            }
+
+            yield return index;
+            start = index + Math.Max(1, value.Length);
+        }
+    }
+
+    private static (int LineNumber, int ColumnNumber, string Context) LocateTextMatch(string text, int index)
+    {
+        var lineNumber = 1;
+        for (var i = 0; i < index; i++)
+        {
+            if (text[i] == '\n')
+            {
+                lineNumber++;
+            }
+        }
+
+        var lineStart = text.LastIndexOf('\n', Math.Max(0, index - 1));
+        lineStart = lineStart < 0 ? 0 : lineStart + 1;
+        var lineEnd = text.IndexOf('\n', index);
+        lineEnd = lineEnd < 0 ? text.Length : lineEnd;
+        var context = text[lineStart..lineEnd].TrimEnd('\r');
+        if (context.Length > 500)
+        {
+            var relativeIndex = Math.Max(0, index - lineStart);
+            var snippetStart = Math.Max(0, relativeIndex - 200);
+            var snippetLength = Math.Min(500, context.Length - snippetStart);
+            context = context.Substring(snippetStart, snippetLength);
+        }
+
+        return (lineNumber, index - lineStart + 1, context);
+    }
+
+    private static bool IsInsideSqlString(string text, int index)
+    {
+        var inside = false;
+        for (var i = 0; i < index; i++)
+        {
+            if (text[i] != '\'')
+            {
+                continue;
+            }
+
+            if (i + 1 < index && text[i + 1] == '\'')
+            {
+                i++;
+                continue;
+            }
+
+            inside = !inside;
+        }
+
+        return inside;
+    }
+
+    private static bool IsInsideSqlComment(string text, int index)
+    {
+        var inString = false;
+        var inLineComment = false;
+        var inBlockComment = false;
+        for (var i = 0; i < index; i++)
+        {
+            if (inLineComment)
+            {
+                if (text[i] == '\n')
+                {
+                    inLineComment = false;
+                }
+
+                continue;
+            }
+
+            if (inBlockComment)
+            {
+                if (text[i] == '*' && i + 1 < index && text[i + 1] == '/')
+                {
+                    inBlockComment = false;
+                    i++;
+                }
+
+                continue;
+            }
+
+            if (text[i] == '\'')
+            {
+                if (inString && i + 1 < index && text[i + 1] == '\'')
+                {
+                    i++;
+                    continue;
+                }
+
+                inString = !inString;
+                continue;
+            }
+
+            if (inString || i + 1 >= index)
+            {
+                continue;
+            }
+
+            if (text[i] == '-' && text[i + 1] == '-')
+            {
+                inLineComment = true;
+                i++;
+            }
+            else if (text[i] == '/' && text[i + 1] == '*')
+            {
+                inBlockComment = true;
+                i++;
+            }
+        }
+
+        return inLineComment || inBlockComment;
+    }
+
+    private static bool IsTwoPartIdentifierMatch(
+        string text,
+        int index,
+        int length,
+        string? schema)
+    {
+        var windowStart = Math.Max(0, index - 180);
+        var windowEnd = Math.Min(text.Length, index + length + 4);
+        var window = text[windowStart..windowEnd];
+        var schemaPattern = string.IsNullOrWhiteSpace(schema)
+            ? @"\[?[A-Za-z_][A-Za-z0-9_$#]*\]?"
+            : $@"\[?{Regex.Escape(schema.Trim())}\]?";
+        var pattern = $@"(?<![A-Za-z0-9_$#]){schemaPattern}\s*\.\s*(?<target>\[?{Regex.Escape(text.Substring(index, length))}\]?)(?![A-Za-z0-9_$#])";
+        return Regex.Matches(window, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+            .Cast<Match>()
+            .Any(match =>
+            {
+                var target = match.Groups["target"];
+                var targetStart = windowStart + target.Index;
+                var targetEnd = targetStart + target.Length;
+                return index >= targetStart && index + length <= targetEnd;
+            });
+    }
+
+    private static bool IsIdentifierBoundaryMatch(string text, int index, int length)
+    {
+        var left = index;
+        var right = index + length;
+        if (left > 0 && text[left - 1] == '[')
+        {
+            left--;
+        }
+
+        if (right < text.Length && text[right] == ']')
+        {
+            right++;
+        }
+
+        var leftBoundary = left == 0 || !IsSqlIdentifierCharacter(text[left - 1]);
+        var rightBoundary = right >= text.Length || !IsSqlIdentifierCharacter(text[right]);
+        return leftBoundary && rightBoundary;
+    }
+
+    private static bool IsSqlIdentifierCharacter(char value)
+    {
+        return char.IsLetterOrDigit(value) || value is '_' or '$' or '#';
+    }
+
+    private static string EncodeCursor(int offset, string fingerprint)
+    {
+        var json = JsonSerializer.Serialize(new PaginationCursor(offset, fingerprint), JsonResponse.Options);
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(json))
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+    }
+
+    private static int DecodeCursor(string? cursor, string fingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(cursor))
+        {
+            return 0;
+        }
+
+        try
+        {
+            var base64 = cursor.Trim().Replace('-', '+').Replace('_', '/');
+            base64 = base64.PadRight(base64.Length + ((4 - base64.Length % 4) % 4), '=');
+            var value = JsonSerializer.Deserialize<PaginationCursor>(
+                Encoding.UTF8.GetString(Convert.FromBase64String(base64)),
+                JsonResponse.Options);
+            if (value is null
+                || value.Offset < 0
+                || !string.Equals(value.Fingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                throw new FormatException();
+            }
+
+            return value.Offset;
+        }
+        catch (Exception ex) when (ex is FormatException or JsonException)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Invalid or stale pagination cursor.",
+                null,
+                "Restart the request without cursor.");
+        }
+    }
+
+    private Task<object[]> GetColumnsAsync(int objectId, CancellationToken cancellationToken)
+    {
+        return GetColumnsAsync(objectId, true, true, null, cancellationToken);
+    }
+
+    private async Task<object[]> GetColumnsAsync(
+        int objectId,
+        bool includeDefaults,
+        bool includeDescriptions,
+        string[]? selectedColumns,
+        CancellationToken cancellationToken)
     {
         const string sql = """
                            SELECT
@@ -1781,25 +4197,71 @@ public sealed class SqlMetadataService
         var rows = await QueryAsync(
             sql,
             [new("@objectId", SqlDbType.Int) { Value = objectId }],
-            reader => new
-            {
-                ordinal = reader.GetInt32("column_id"),
-                name = reader.GetString("column_name"),
-                dataType = reader.GetString("data_type"),
-                maxLength = NormalizeMaxLength(reader.GetInt16("max_length"), reader.GetString("data_type")),
-                precision = reader.GetByte("precision"),
-                scale = reader.GetByte("scale"),
-                nullable = reader.GetBoolean("is_nullable"),
-                identity = reader.GetBoolean("is_identity"),
-                computed = reader.GetBoolean("is_computed"),
-                computedDefinition = reader.GetNullableString("computed_definition"),
-                defaultConstraintName = reader.GetNullableString("default_constraint_name"),
-                defaultDefinition = reader.GetNullableString("default_definition"),
-                description = reader.GetNullableString("description")
-            },
+            reader => new ColumnInfo(
+                reader.GetInt32("column_id"),
+                reader.GetString("column_name"),
+                reader.GetString("data_type"),
+                NormalizeMaxLengthBytes(reader.GetInt16("max_length")),
+                NormalizeMaxLengthCharacters(reader.GetInt16("max_length"), reader.GetString("data_type")),
+                reader.GetByte("precision"),
+                reader.GetByte("scale"),
+                reader.GetBoolean("is_nullable"),
+                reader.GetBoolean("is_identity"),
+                reader.GetBoolean("is_computed"),
+                reader.GetNullableString("computed_definition"),
+                reader.GetNullableString("default_constraint_name"),
+                reader.GetNullableString("default_definition"),
+                reader.GetNullableString("description")),
             cancellationToken);
 
-        return rows.Cast<object>().ToArray();
+        var filter = selectedColumns?
+            .Where(column => !string.IsNullOrWhiteSpace(column))
+            .Select(column => column.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var missingColumns = filter is null
+            ? []
+            : filter.Except(rows.Select(row => row.Name), StringComparer.OrdinalIgnoreCase).ToArray();
+        if (missingColumns.Length > 0)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ColumnNotFound,
+                "One or more requested columns were not found.",
+                string.Join(", ", missingColumns),
+                "Use mode=shape without columns to inspect available names.");
+        }
+
+        return rows
+            .Where(row => filter is null || filter.Count == 0 || filter.Contains(row.Name))
+            .Select(row =>
+            {
+                var item = new Dictionary<string, object?>
+                {
+                    ["ordinal"] = row.Ordinal,
+                    ["name"] = row.Name,
+                    ["dataType"] = row.DataType,
+                    ["maxLengthBytes"] = row.MaxLengthBytes,
+                    ["maxLengthCharacters"] = row.MaxLengthCharacters,
+                    ["precision"] = row.Precision,
+                    ["scale"] = row.Scale,
+                    ["nullable"] = row.Nullable,
+                    ["identity"] = row.Identity,
+                    ["computed"] = row.Computed,
+                    ["computedDefinition"] = row.ComputedDefinition
+                };
+                if (includeDefaults)
+                {
+                    item["defaultConstraintName"] = row.DefaultConstraintName;
+                    item["defaultDefinition"] = row.DefaultDefinition;
+                }
+
+                if (includeDescriptions)
+                {
+                    item["description"] = row.Description;
+                }
+
+                return (object)item;
+            })
+            .ToArray();
     }
 
     private async Task<object[]> GetIndexesCoreAsync(int objectId, CancellationToken cancellationToken)
@@ -2135,8 +4597,8 @@ public sealed class SqlMetadataService
         for (var i = 0; i < terms.Count; i++)
         {
             var parameterName = $"@term{i}";
-            parameters.Add(new SqlParameter(parameterName, SqlDbType.NVarChar, 4000) { Value = $"%{terms[i]}%" });
-            predicates.Add($"({string.Join(" OR ", searchableColumns.Select(column => $"{column.Expression} LIKE {parameterName}"))})");
+            parameters.Add(new SqlParameter(parameterName, SqlDbType.NVarChar, 4000) { Value = terms[i] });
+            predicates.Add($"({string.Join(" OR ", searchableColumns.Select(column => $"CHARINDEX({parameterName}, {column.Expression}) > 0"))})");
         }
 
         var wherePredicate = string.Join(" OR ", predicates);
@@ -2311,7 +4773,15 @@ public sealed class SqlMetadataService
         }
         catch (SqlException ex)
         {
-            throw new SqlMcpException(ErrorCodes.UnknownError, "SQL command failed.", ex.Message, null, ex);
+            var errorCode = SqlServerToolService.ClassifySqlError(ex.Number);
+            throw new SqlMcpException(
+                errorCode,
+                ex.Message,
+                ex.Message,
+                null,
+                ex,
+                ex.Number,
+                ex.LineNumber);
         }
     }
 
@@ -2472,11 +4942,28 @@ public sealed class SqlMetadataService
         var fileNormalized = NormalizeTextForComparison(fileText);
         var dbSqlNormalized = NormalizeSqlModuleTextForComparison(module.Definition);
         var fileSqlNormalized = NormalizeSqlModuleTextForComparison(fileText);
+        var databaseTokensWithComments = NormalizeSqlModuleTokens(module.Definition, includeComments: true);
+        var fileTokensWithComments = NormalizeSqlModuleTokens(fileText, includeComments: true);
+        var databaseSemanticTokens = NormalizeSqlModuleTokens(module.Definition, includeComments: false);
+        var fileSemanticTokens = NormalizeSqlModuleTokens(fileText, includeComments: false);
         var diff = BuildLineDiff(module.Definition, fileText, diffOptions);
         var exactMatch = string.Equals(module.Definition, fileText, StringComparison.Ordinal);
         var normalizedMatch = string.Equals(dbNormalized, fileNormalized, StringComparison.Ordinal);
-        var sqlNormalizedMatch = string.Equals(dbSqlNormalized, fileSqlNormalized, StringComparison.Ordinal);
-        var differenceKind = ClassifyModuleFileDifference(exactMatch, normalizedMatch, sqlNormalizedMatch);
+        var bodyMatch = string.Equals(dbSqlNormalized, fileSqlNormalized, StringComparison.Ordinal);
+        var formatAndCommentMatch = string.Equals(
+            databaseTokensWithComments,
+            fileTokensWithComments,
+            StringComparison.Ordinal);
+        var semanticMatch = string.Equals(
+            databaseSemanticTokens,
+            fileSemanticTokens,
+            StringComparison.Ordinal);
+        var sqlNormalizedMatch = bodyMatch;
+        var differenceKind = ClassifyModuleFileDifference(
+            exactMatch,
+            bodyMatch,
+            semanticMatch,
+            formatAndCommentMatch);
         var ignoredWrapperDifferences = DetectIgnoredWrapperDifferences(module.Definition, fileText);
         var firstBodyDifference = FindFirstBodyDifference(module.Definition, fileText);
         var changedLineSummary = BuildChangedLineSummary(diff);
@@ -2486,7 +4973,8 @@ public sealed class SqlMetadataService
             changedLineSummary,
             exactMatch,
             normalizedMatch,
-            sqlNormalizedMatch,
+            bodyMatch,
+            semanticMatch,
             differenceKind,
             firstBodyDifference);
         var nextActions = BuildModuleCompareNextActions(firstBodyDifference, diff);
@@ -2516,6 +5004,8 @@ public sealed class SqlMetadataService
             exactMatch,
             normalizedMatch,
             sqlNormalizedMatch,
+            bodyMatch,
+            semanticMatch,
             differenceKind,
             ignoredWrapperDifferences,
             firstBodyDifference,
@@ -2695,21 +5185,30 @@ public sealed class SqlMetadataService
         return nextActions.ToArray();
     }
 
-    private static string ClassifyModuleFileDifference(bool exactMatch, bool normalizedMatch, bool sqlNormalizedMatch)
+    internal static string ClassifyModuleFileDifference(
+        bool exactMatch,
+        bool bodyMatch,
+        bool semanticMatch,
+        bool formatAndCommentMatch)
     {
         if (exactMatch)
         {
-            return "identical";
+            return "exact_match";
         }
 
-        if (normalizedMatch)
+        if (bodyMatch)
         {
-            return "whitespace_or_line_ending_only";
+            return "wrapper_only";
         }
 
-        if (sqlNormalizedMatch)
+        if (semanticMatch && formatAndCommentMatch)
         {
-            return "script_wrapper_only";
+            return "format_only";
+        }
+
+        if (semanticMatch)
+        {
+            return "comment_only";
         }
 
         return "body_changed";
@@ -2755,7 +5254,8 @@ public sealed class SqlMetadataService
         ModuleChangedLineSummary changedLineSummary,
         bool exactMatch,
         bool normalizedMatch,
-        bool sqlNormalizedMatch,
+        bool bodyMatch,
+        bool semanticMatch,
         string differenceKind,
         ModuleBodyDifference? firstBodyDifference)
     {
@@ -2763,7 +5263,7 @@ public sealed class SqlMetadataService
         var firstBodyText = firstBodyDifference is null
             ? "firstBodyDifference=none"
             : $"firstBodyDifference=body:{firstBodyDifference.BodyLine},db:{FormatNullableInt(firstBodyDifference.DatabaseLine)},file:{FormatNullableInt(firstBodyDifference.FileLine)}";
-        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; sqlNormalizedMatch={FormatBool(sqlNormalizedMatch)}; {diff.Hunks.Length} hunks; changedLines=db:{changedLineSummary.Database},file:{changedLineSummary.File}; returnedDiffLines={changedLineSummary.Returned}; {firstBodyText}; {truncatedText}";
+        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; bodyMatch={FormatBool(bodyMatch)}; semanticMatch={FormatBool(semanticMatch)}; {diff.Hunks.Length} hunks; changedLines=db:{changedLineSummary.Database},file:{changedLineSummary.File}; returnedDiffLines={changedLineSummary.Returned}; {firstBodyText}; {truncatedText}";
     }
 
     private static string FormatBool(bool value)
@@ -3010,6 +5510,22 @@ public sealed class SqlMetadataService
         return Encoding.UTF8.GetByteCount(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty);
     }
 
+    private static long? GetNullableInt64(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal)
+            ? null
+            : Convert.ToInt64(reader.GetValue(ordinal), CultureInfo.InvariantCulture);
+    }
+
+    private static decimal? GetNullableDecimal(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal)
+            ? null
+            : Convert.ToDecimal(reader.GetValue(ordinal), CultureInfo.InvariantCulture);
+    }
+
     private static IReadOnlyList<string> SplitKeyword(string keyword)
     {
         return keyword
@@ -3028,12 +5544,56 @@ public sealed class SqlMetadataService
         int? contextLines,
         int maxLines)
     {
+        return BuildModuleDefinitionSlice(
+            definition,
+            keyword,
+            null,
+            startLine,
+            endLine,
+            contextLines,
+            null,
+            null,
+            null,
+            null,
+            true,
+            maxLines);
+    }
+
+    internal static ModuleDefinitionSlice BuildModuleDefinitionSlice(
+        string definition,
+        string? keyword,
+        string[]? keywords,
+        int? startLine,
+        int? endLine,
+        int? contextLines,
+        int? beforeLines,
+        int? afterLines,
+        int? maxMatches,
+        int? occurrence,
+        bool collapseOverlaps,
+        int maxLines)
+    {
         var lines = SplitDefinitionLines(definition);
         var totalLines = lines.Length;
-        var cleanKeyword = string.IsNullOrWhiteSpace(keyword) ? null : keyword.Trim();
+        var searchTerms = new[] { keyword }
+            .Concat(keywords ?? [])
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value!.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(20)
+            .ToArray();
         var hasLineRange = startLine.HasValue || endLine.HasValue;
         var effectiveMaxLines = Math.Clamp(maxLines, 1, 5000);
         var effectiveContextLines = Math.Clamp(contextLines ?? DefaultModuleContextLines, 0, MaxModuleContextLines);
+        var effectiveBeforeLines = Math.Clamp(beforeLines ?? effectiveContextLines, 0, MaxModuleContextLines);
+        var effectiveAfterLines = Math.Clamp(afterLines ?? effectiveContextLines, 0, MaxModuleContextLines);
+        var effectiveMaxMatches = Math.Clamp(maxMatches ?? 100, 1, 1000);
+        if (occurrence is <= 0)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "occurrence must be a positive 1-based value.");
+        }
 
         if (hasLineRange)
         {
@@ -3061,62 +5621,74 @@ public sealed class SqlMetadataService
             return BuildSlice(
                 lines,
                 [(start, end)],
-                cleanKeyword,
+                searchTerms,
                 totalLines,
                 "line_range",
                 effectiveContextLines,
-                effectiveMaxLines);
+                effectiveMaxLines,
+                true);
         }
 
-        if (!string.IsNullOrWhiteSpace(cleanKeyword))
+        if (searchTerms.Length > 0)
         {
-            var ranges = new List<(int Start, int End)>();
+            var matchingLines = new List<int>();
             for (var i = 0; i < lines.Length; i++)
             {
-                if (lines[i].Contains(cleanKeyword, StringComparison.OrdinalIgnoreCase))
+                if (searchTerms.Any(term => lines[i].Contains(term, StringComparison.OrdinalIgnoreCase)))
                 {
-                    var lineNumber = i + 1;
-                    ranges.Add((
-                        Math.Max(1, lineNumber - effectiveContextLines),
-                        Math.Min(totalLines, lineNumber + effectiveContextLines)));
+                    matchingLines.Add(i + 1);
                 }
             }
+
+            var selectedMatches = occurrence.HasValue
+                ? matchingLines.Skip(occurrence.Value - 1).Take(1).ToArray()
+                : matchingLines.Take(effectiveMaxMatches).ToArray();
+            var ranges = selectedMatches
+                .Select(lineNumber => (
+                    Math.Max(1, lineNumber - effectiveBeforeLines),
+                    Math.Min(totalLines, lineNumber + effectiveAfterLines)))
+                .ToArray();
 
             return BuildSlice(
                 lines,
                 ranges,
-                cleanKeyword,
+                searchTerms,
                 totalLines,
-                "keyword",
+                searchTerms.Length == 1 ? "keyword" : "keywords",
                 effectiveContextLines,
-                effectiveMaxLines);
+                effectiveMaxLines,
+                collapseOverlaps);
         }
 
         return BuildSlice(
             lines,
             [(1, totalLines)],
-            null,
+            [],
             totalLines,
             "full",
             effectiveContextLines,
-            totalLines);
+            totalLines,
+            true);
     }
 
     private static ModuleDefinitionSlice BuildSlice(
         string[] allLines,
         IReadOnlyList<(int Start, int End)> ranges,
-        string? keyword,
+        IReadOnlyList<string> keywords,
         int totalLines,
         string reason,
         int contextLines,
-        int maxLines)
+        int maxLines,
+        bool collapseOverlaps)
     {
-        var mergedRanges = MergeLineRanges(ranges);
+        var effectiveRanges = collapseOverlaps
+            ? MergeLineRanges(ranges)
+            : ranges.OrderBy(range => range.Start).ThenBy(range => range.End).ToArray();
         var selectedLines = new List<ModuleDefinitionLine>();
         var matchedLines = new List<int>();
         var truncated = false;
 
-        foreach (var range in mergedRanges)
+        foreach (var range in effectiveRanges)
         {
             for (var lineNumber = range.Start; lineNumber <= range.End; lineNumber++)
             {
@@ -3128,8 +5700,7 @@ public sealed class SqlMetadataService
 
                 var text = allLines[lineNumber - 1];
                 selectedLines.Add(new ModuleDefinitionLine(lineNumber, text));
-                if (!string.IsNullOrWhiteSpace(keyword)
-                    && text.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                if (keywords.Any(keyword => text.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
                 {
                     matchedLines.Add(lineNumber);
                 }
@@ -3466,6 +6037,32 @@ public sealed class SqlMetadataService
             .Trim();
     }
 
+    internal static string NormalizeSqlModuleTokens(string text, bool includeComments)
+    {
+        var comparable = NormalizeSqlModuleTextForComparison(text);
+        var parser = new TSql160Parser(initialQuotedIdentifiers: true);
+        IList<ParseError> errors;
+        var tokens = parser.GetTokenStream(new StringReader(comparable), out errors);
+        if (errors.Count > 0)
+        {
+            return comparable;
+        }
+
+        return string.Join(
+            "\n",
+            tokens
+                .Where(token => token.TokenType is not (TSqlTokenType.WhiteSpace or TSqlTokenType.EndOfFile or TSqlTokenType.Go))
+                .Where(token => includeComments
+                    || token.TokenType is not (TSqlTokenType.SingleLineComment or TSqlTokenType.MultilineComment))
+                .Select(token =>
+                {
+                    var textValue = token.TokenType is TSqlTokenType.AsciiStringLiteral or TSqlTokenType.UnicodeStringLiteral
+                        ? token.Text
+                        : token.Text.ToUpperInvariant();
+                    return $"{token.TokenType}:{textValue}";
+                }));
+    }
+
     internal static ModuleBodyDifference? FindFirstBodyDifference(string databaseDefinition, string fileText)
     {
         var databaseLines = BuildSqlModuleComparableLines(databaseDefinition);
@@ -3528,7 +6125,9 @@ public sealed class SqlMetadataService
             {
                 Text = SqlModuleCreateRegex.Replace(lines[i].Text, match =>
                 {
-                    var objectType = Regex.Replace(match.Groups[1].Value.ToUpperInvariant(), @"\s+", " ");
+                    var objectType = match.Groups[1].Value.StartsWith("PROC", StringComparison.OrdinalIgnoreCase)
+                        ? "PROCEDURE"
+                        : Regex.Replace(match.Groups[1].Value.ToUpperInvariant(), @"\s+", " ");
                     return $"CREATE {objectType}";
                 })
             };
@@ -4368,7 +6967,12 @@ public sealed class SqlMetadataService
             hint);
     }
 
-    private static int? NormalizeMaxLength(short maxLength, string dataType)
+    private static int? NormalizeMaxLengthBytes(short maxLength)
+    {
+        return maxLength < 0 ? -1 : maxLength;
+    }
+
+    private static int? NormalizeMaxLengthCharacters(short maxLength, string dataType)
     {
         if (maxLength < 0)
         {
@@ -4380,6 +6984,41 @@ public sealed class SqlMetadataService
                || dataType.Equals("sysname", StringComparison.OrdinalIgnoreCase)
             ? maxLength / 2
             : maxLength;
+    }
+
+    private static int? NormalizeResultMaxLengthCharacters(int? maxLength, string? systemTypeName)
+    {
+        if (maxLength is null or < 0)
+        {
+            return maxLength;
+        }
+
+        return systemTypeName is not null
+               && (systemTypeName.StartsWith("nvarchar", StringComparison.OrdinalIgnoreCase)
+                   || systemTypeName.StartsWith("nchar", StringComparison.OrdinalIgnoreCase)
+                   || systemTypeName.StartsWith("sysname", StringComparison.OrdinalIgnoreCase))
+            ? maxLength / 2
+            : maxLength;
+    }
+
+    internal static DescribeTablePreset BuildDescribeTablePreset(string? mode)
+    {
+        var normalized = string.IsNullOrWhiteSpace(mode)
+            ? "shape"
+            : mode.Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "shape" => new DescribeTablePreset(normalized, false, false, false, false, false),
+            "write_contract" => new DescribeTablePreset(normalized, false, true, true, true, false),
+            "keys" => new DescribeTablePreset(normalized, true, true, true, false, false),
+            "performance" => new DescribeTablePreset(normalized, true, false, false, false, false),
+            "full" => new DescribeTablePreset(normalized, true, true, true, true, true),
+            _ => throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Invalid describe_table mode.",
+                mode,
+                "Use shape, write_contract, keys, performance, or full.")
+        };
     }
 
     private static bool IsValidTextSearchTarget(TextSearchTargetOptions target)
@@ -5328,6 +7967,18 @@ public sealed class SqlMetadataService
         DateTime ModifyDate,
         string? Description);
 
+    internal sealed record ObjectResolutionCandidate(
+        string Schema,
+        string Name,
+        string Type,
+        string TypeDesc,
+        int Score,
+        double Similarity,
+        string[] Reasons,
+        string? PhysicalName,
+        string ResolutionKind,
+        string? Description);
+
     private sealed record StructureObjectResolution(
         DbObjectInfo Object,
         string RequestedSchema,
@@ -5335,6 +7986,28 @@ public sealed class SqlMetadataService
         string? MappedName,
         bool ResolvedFromPrefix,
         bool UsedFallback);
+
+    private sealed record DependencyEdge(
+        int FromObjectId,
+        string FromSchema,
+        string FromName,
+        string FromType,
+        int ToObjectId,
+        string ToSchema,
+        string ToName,
+        string ToType);
+
+    private sealed record DependencyGraphNode(
+        int ObjectId,
+        string Schema,
+        string Name,
+        string Type,
+        int Depth);
+
+    private sealed record ModuleTransactionSignal(
+        string Kind,
+        int LineNumber,
+        string Context);
 
     internal sealed record ModuleDefinitionSlice(
         string Definition,
@@ -5359,6 +8032,39 @@ public sealed class SqlMetadataService
         DateTime CreateDate,
         DateTime ModifyDate,
         string Definition);
+
+    private sealed record ValidationObject(
+        string Schema,
+        string Name,
+        string Type,
+        IReadOnlySet<string> Columns);
+
+    private sealed record ValidationTarget(
+        string Schema,
+        string Name,
+        string Type,
+        bool Exists,
+        ValidationParameter[] Parameters);
+
+    private sealed record ValidationParameter(string Name, string DataType);
+
+    private sealed record TsqlObjectValidation(
+        string Schema,
+        string Name,
+        string Kind,
+        string Status,
+        string? Type,
+        string[] Columns);
+
+    private sealed record TsqlTypeValidation(
+        string Schema,
+        string Name,
+        bool Exists,
+        bool? IsTableType);
+
+    private sealed record TsqlReferenceValidation(
+        TsqlObjectValidation[] Objects,
+        TsqlTypeValidation[] Types);
 
     private sealed record ModuleCompareDatabaseInfo(
         DateTime CreateDate,
@@ -5389,6 +8095,8 @@ public sealed class SqlMetadataService
         bool ExactMatch,
         bool NormalizedMatch,
         bool SqlNormalizedMatch,
+        bool BodyMatch,
+        bool SemanticMatch,
         string DifferenceKind,
         string[] IgnoredWrapperDifferences,
         ModuleBodyDifference? FirstBodyDifference,
@@ -5584,6 +8292,13 @@ public sealed class SqlMetadataService
         int? ErrorState,
         string? ErrorMessage);
 
+    private sealed record MetadataBatchItemResult(
+        int Index,
+        string Operation,
+        bool Ok,
+        object? Result,
+        object? Error);
+
     private sealed record TextSearchQueryColumn(string Column, string Kind, string Expression);
 
     private sealed record TextSearchLabelValue(string Column, string? Value);
@@ -5612,6 +8327,61 @@ public sealed class SqlMetadataService
         bool MatchedDescription,
         bool MatchedColumnName,
         bool MatchedColumnDescription);
+
+    internal sealed record DescribeTablePreset(
+        string Mode,
+        bool IncludeIndexes,
+        bool IncludeConstraints,
+        bool IncludeForeignKeys,
+        bool IncludeDefaults,
+        bool IncludeDescriptions);
+
+    private sealed record ColumnInfo(
+        int Ordinal,
+        string Name,
+        string DataType,
+        int? MaxLengthBytes,
+        int? MaxLengthCharacters,
+        byte Precision,
+        byte Scale,
+        bool Nullable,
+        bool Identity,
+        bool Computed,
+        string? ComputedDefinition,
+        string? DefaultConstraintName,
+        string? DefaultDefinition,
+        string? Description);
+
+    private sealed record ProfileColumnMetadata(
+        string DataType,
+        short MaxLength,
+        byte Precision,
+        byte Scale,
+        bool Nullable);
+
+    internal sealed record UsageModuleSource(
+        string Schema,
+        string Name,
+        string Type,
+        string TypeDesc,
+        string Definition,
+        DateTime ModifyDate);
+
+    internal sealed record UsageMatch(
+        string SourceKind,
+        string Schema,
+        string ObjectName,
+        string ObjectType,
+        string ObjectTypeDesc,
+        string MatchKind,
+        string MatchedText,
+        int? LineNumber,
+        int? ColumnNumber,
+        string Context,
+        double Confidence,
+        int? ColumnOrdinal);
+
+    private sealed record PaginationCursor(int Offset, string Fingerprint);
 
     private sealed record IndexRow(
         int IndexId,
@@ -5714,6 +8484,11 @@ internal static class ObjectTypeMapper
         return MapTypes(objectTypes, includeTriggers: true)
             .Where(type => type is "V" or "P" or "PC" or "FN" or "IF" or "TF" or "FS" or "FT" or "TR")
             .ToArray();
+    }
+
+    public static string[] MapAllTypes(string[]? objectTypes)
+    {
+        return MapTypes(objectTypes, includeTriggers: true);
     }
 
     public static string ToPublicType(string sqlType)

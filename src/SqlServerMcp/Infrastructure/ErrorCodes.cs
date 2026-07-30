@@ -11,6 +11,11 @@ public static class ErrorCodes
     public const string SqlLockTimeout = "SQL_LOCK_TIMEOUT";
     public const string SqlGuardRejected = "SQL_GUARD_REJECTED";
     public const string SqlParseFailed = "SQL_PARSE_FAILED";
+    public const string SqlInvalidObject = "SQL_INVALID_OBJECT";
+    public const string SqlInvalidColumn = "SQL_INVALID_COLUMN";
+    public const string SqlInvalidType = "SQL_INVALID_TYPE";
+    public const string SqlParameterMismatch = "SQL_PARAMETER_MISMATCH";
+    public const string SqlSyntaxError = "SQL_SYNTAX_ERROR";
     public const string ObjectNotFound = "OBJECT_NOT_FOUND";
     public const string ColumnNotFound = "COLUMN_NOT_FOUND";
     public const string ModuleDefinitionNotAvailable = "MODULE_DEFINITION_NOT_AVAILABLE";

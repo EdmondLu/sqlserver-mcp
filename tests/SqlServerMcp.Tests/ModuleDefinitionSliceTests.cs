@@ -86,4 +86,35 @@ public sealed class ModuleDefinitionSliceTests
 
         Assert.Equal(ErrorCodes.ConfigInvalid, ex.ErrorCode);
     }
+
+    [Fact]
+    public void BuildModuleDefinitionSlice_SupportsMultipleKeywordsAndOccurrence()
+    {
+        const string definition = """
+                                  line 1
+                                  UPDATE A SET value=1
+                                  line 3
+                                  INSERT INTO B(id) SELECT 1
+                                  line 5
+                                  UPDATE A SET value=2
+                                  """;
+
+        var slice = SqlMetadataService.BuildModuleDefinitionSlice(
+            definition,
+            null,
+            ["UPDATE A", "INSERT INTO"],
+            null,
+            null,
+            0,
+            0,
+            0,
+            10,
+            2,
+            true,
+            500);
+
+        Assert.Equal("keywords", slice.Reason);
+        Assert.Equal([4], slice.MatchedLines);
+        Assert.Equal("INSERT INTO B(id) SELECT 1", slice.Definition);
+    }
 }

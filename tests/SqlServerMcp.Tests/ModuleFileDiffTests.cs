@@ -151,6 +151,77 @@ public sealed class ModuleFileDiffTests
     }
 
     [Fact]
+    public void NormalizeSqlModuleTokens_DistinguishesCommentOnlyFromBodyChanges()
+    {
+        const string left = """
+                            CREATE PROCEDURE dbo.Sample
+                            AS
+                            -- old comment
+                            SELECT Value = 1;
+                            """;
+        const string right = """
+                             CREATE OR ALTER PROCEDURE dbo.Sample AS
+                             /* new comment */
+                             SELECT Value=1;
+                             GO
+                             """;
+        const string changed = """
+                               CREATE OR ALTER PROCEDURE dbo.Sample AS
+                               SELECT Value=2;
+                               """;
+
+        Assert.Equal(
+            SqlMetadataService.NormalizeSqlModuleTokens(left, includeComments: false),
+            SqlMetadataService.NormalizeSqlModuleTokens(right, includeComments: false));
+        Assert.NotEqual(
+            SqlMetadataService.NormalizeSqlModuleTokens(left, includeComments: true),
+            SqlMetadataService.NormalizeSqlModuleTokens(right, includeComments: true));
+        Assert.NotEqual(
+            SqlMetadataService.NormalizeSqlModuleTokens(left, includeComments: false),
+            SqlMetadataService.NormalizeSqlModuleTokens(changed, includeComments: false));
+    }
+
+    [Theory]
+    [InlineData(null, "shape", false, false)]
+    [InlineData("write_contract", "write_contract", false, true)]
+    [InlineData("performance", "performance", true, false)]
+    [InlineData("full", "full", true, true)]
+    public void BuildDescribeTablePreset_ReturnsExpectedIncludes(
+        string? input,
+        string expectedMode,
+        bool expectedIndexes,
+        bool expectedDefaults)
+    {
+        var preset = SqlMetadataService.BuildDescribeTablePreset(input);
+
+        Assert.Equal(expectedMode, preset.Mode);
+        Assert.Equal(expectedIndexes, preset.IncludeIndexes);
+        Assert.Equal(expectedDefaults, preset.IncludeDefaults);
+    }
+
+    [Theory]
+    [InlineData(true, true, true, true, "exact_match")]
+    [InlineData(false, true, true, true, "wrapper_only")]
+    [InlineData(false, false, true, true, "format_only")]
+    [InlineData(false, false, true, false, "comment_only")]
+    [InlineData(false, false, false, false, "body_changed")]
+    public void ClassifyModuleFileDifference_ReturnsThreeLayerClassification(
+        bool exactMatch,
+        bool bodyMatch,
+        bool semanticMatch,
+        bool formatAndCommentMatch,
+        string expected)
+    {
+        Assert.Equal(
+            expected,
+            SqlMetadataService.ClassifyModuleFileDifference(
+                exactMatch,
+                bodyMatch,
+                semanticMatch,
+                formatAndCommentMatch));
+    }
+
+    [Fact]
     public void FindFirstBodyDifference_ReturnsOriginalLineNumbersAfterWrapperNormalization()
     {
         const string databaseDefinition = """
