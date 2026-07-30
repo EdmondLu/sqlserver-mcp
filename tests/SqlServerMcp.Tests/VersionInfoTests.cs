@@ -11,6 +11,7 @@ public sealed class VersionInfoTests
 
         Assert.NotNull(expected);
         Assert.Equal(expected, SqlMetadataService.GetServerVersion());
+        Assert.Equal("2.0.0.0", expected);
         Assert.Matches(@"^\d+\.\d+\.\d+\.\d+$", SqlMetadataService.GetServerVersion());
     }
 }

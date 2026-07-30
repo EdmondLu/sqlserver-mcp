@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## 2.0.0 - 2026-07-30
+
+- Replaced JSON-in-text tool payloads with native MCP `structuredContent`, short compatibility text, MCP error signaling, and a uniform connection context.
+- Fixed `find_usage` underscore wildcard false positives by using literal search plus identifier-boundary analysis; added ranked match kinds, source locations, context, confidence, regex mode, and stable cursors.
+- Added no-execute/no-write `validate_tsql_script` and `validate_tsql_file` checks for syntax, variables, INSERT shapes, temp tables, object/column/type resolution, wrapper status, and dynamic SQL.
+- Added `get_callers`, `get_callees`, and `get_dependency_graph`, including confirmed dependency edges, static call locations, dynamic-SQL warnings, and caller transaction signals.
+- Added actionable SQL error codes/numbers/lines/suggestions for invalid objects, columns, types, parameters, and syntax.
+- Added three-level module comparison (`exactMatch`, `bodyMatch`, `semanticMatch`) and `exact_match` / `wrapper_only` / `format_only` / `comment_only` / `body_changed` classifications.
+- Added stable cursor metadata and executable `nextRequest` payloads to bounded searches and read-only query paging.
+- Added compact `describe_table` presets, multi-keyword definition slicing controls, summary-first SHOWPLAN output, and `resolve_object`.
+- Added ordered `compare_modules_to_files` deployment checks, including `target_missing` local-script validation.
+- Added `profile_column`, configured page/field consumer tools, rollback-only `run_readonly_batch`, parallel `batch_metadata`, and explicit byte/character length fields.
+
 ## 1.15.1 - 2026-06-30
 
 - Added top-level `serverVersion` to `health_check` so operators can confirm the published service version without a separate `initialize` probe.

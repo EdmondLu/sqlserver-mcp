@@ -10,10 +10,11 @@ A Windows-first, read-only [Model Context Protocol](https://modelcontextprotocol
 
 ## Highlights
 
-- 21 focused tools for connection checks, object discovery, schema inspection, dependency analysis, SQL module search, read-only queries, and estimated query plans.
+- 35 focused tools for connection checks, object resolution, schema inspection, dependency/call-graph analysis, deployment validation, guarded diagnostics, and estimated query plans.
 - Lazy database connections: startup registers tools but does not connect to SQL Server or scan the database.
 - Credentials are read from Windows Credential Manager and are never stored in the JSON config.
-- A ScriptDom-based guard accepts one `SELECT` or `WITH` query and rejects writes, DDL, execution, cross-database references, server-level DMVs, linked-server access, and bulk/external rowsets, while allowing selected read-only metadata functions.
+- A ScriptDom-based guard accepts one `SELECT`/`WITH` query, or a tightly controlled diagnostic batch limited to variables, local `#temp` tables, temp-table inserts, and a final `SELECT`.
+- Every tool returns native MCP `structuredContent` plus a short compatibility text summary and a connection context containing server, database, read-only state, login, timestamp, elapsed time, and isolation level.
 - Result row, payload, text-length, lock-wait, command, and connection limits are configurable.
 - Bounded tools include a `resultInfo` block that summarizes returned rows/items, limits, truncation reasons, and narrowing hints.
 - MCP protocol output stays on stdout; application logs are written to files.
@@ -100,32 +101,48 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `test_connection` | Validate the connection and current SQL identity |
 | `health_check` | Check serverVersion, config, runtime paths, connection, and permissions |
 | `find_objects` | Search tables, views, procedures, and functions |
-| `describe_table` | Inspect columns, indexes, constraints, and foreign keys |
+| `resolve_object` | Resolve exact and similar object names, including legacy view-to-table mappings |
+| `describe_table` | Inspect compact `shape`, `write_contract`, `keys`, `performance`, or `full` metadata |
 | `get_object_overview` | Return compact metadata and dependency context |
 | `find_column` | Find tables and views containing a column |
+| `profile_column` | Profile NULL/empty values, lengths, format quality, limit saturation, and samples |
 | `get_indexes` | Inspect index metadata |
 | `get_constraints` | Inspect key, unique, default, and check constraints |
 | `get_foreign_keys` | Inspect incoming and outgoing foreign keys |
 | `search_sql_modules` | Search SQL module definitions with next-step compare hints |
 | `get_module_definition` | Read a module definition, optionally by keyword or line range |
+| `validate_tsql_script` | Parse and metadata-check T-SQL without execution or database writes |
+| `validate_tsql_file` | Validate a local `.sql` file without executing it |
 | `compare_module_to_file` | Compare a database module definition with a known local file |
 | `compare_module_to_repo` | Auto-discover matching repository `.sql` files and compare the best unambiguous candidate with the database module |
+| `compare_modules_to_files` | Validate and compare an ordered deployment set, including missing targets |
 | `analyze_module_temp_tables` | Analyze local temp table creation, usage, multiline statements, and column flow inside a module |
 | `get_dependencies` | Find incoming and outgoing dependencies |
-| `find_usage` | Find object, column, or token usage |
+| `get_callers` | Find confirmed/static/dynamic callers and caller transaction signals |
+| `get_callees` | Find confirmed/static/dynamic callees |
+| `get_dependency_graph` | Build a bounded confirmed dependency graph |
+| `find_usage` | Rank literal identifier/text/regex usage with source location and confidence |
 | `search_config_text` | Search configured application/configuration text and locator metadata with match-column and audit metadata |
+| `find_field_consumers` | Combine column, module, and configured page/low-code consumers |
+| `find_page_by_table` | Find configured pages that reference a table or view |
+| `find_page_by_save_procedure` | Find configured pages that reference a save procedure |
 | `run_readonly_query` | Run one guarded read-only query with optional named parameters |
+| `run_readonly_batch` | Run a rollback-only diagnostic batch using local `#temp` state |
 | `describe_query_result` | Describe guarded query result columns without executing the query, optionally applying explicit UI placeholder replacements |
-| `explain_query_plan` | Return estimated SHOWPLAN XML plus statement, memory, warning, and risk summaries without executing the query |
+| `explain_query_plan` | Return an estimated-plan summary, with raw XML only when requested |
+| `explain_query_plan_summary` | Return only the compact estimated-plan summary |
+| `batch_metadata` | Run independent metadata requests in parallel with per-item errors |
 | `reload_connection` | Clear cached credentials and SQL connection pools |
 
-Search, definition-slice, configuration-text, usage, and read-only query tools expose `resultInfo` for consistent returned-count, limit, truncation, reason, and hint metadata.
+Bounded search/query tools expose stable `cursor`, `nextCursor`, `hasMore`, and executable `nextRequest` metadata where paging is supported. `find_usage` performs literal matching rather than SQL `LIKE`, so `_` in procedure and column names is never treated as a wildcard.
 
-Module/file comparison returns a readable top-level summary, `changedLineSummary`, `differenceKind`, `firstBodyDifference`, ignored wrapper-difference labels, and multi-hunk diffs with truncation metadata. Use `diffMode=summary` for ranges only, `compact` for the default focused diff, or `full` with larger `maxHunks` / `maxDiffLinesPerSide` caps. Repository comparison accepts per-call `excludePatterns`, merges them with `compare.repoExcludePatterns` defaults such as `backup/**`, and returns `suggestedPatterns` for ambiguous candidates. It reports `sqlNormalizedMatch` and SQL-normalized hashes to ignore common deployment-script wrapper differences such as `CREATE OR ALTER`, leading `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`, and trailing `GO`, while `firstBodyDifference` maps the first SQL-normalized body change back to database and file line numbers. When a body difference exists, `nextActions` points directly to the database and local file lines to inspect.
+Module/file comparison now reports `exactMatch`, `bodyMatch`, and `semanticMatch`, with `differenceKind` values `exact_match`, `wrapper_only`, `format_only`, `comment_only`, and `body_changed`. `CREATE`/`CREATE OR ALTER`, BOMs, leading/trailing blank lines, session `SET` wrappers, and trailing `GO` do not change `bodyMatch`. Ordered deployment-set comparison also reports `target_missing` and `local_missing`, and validates a missing target's local script before deployment.
 
 `describe_query_result` accepts optional `templateValues` for UI SQL placeholders, for example `{ "0": "1=1" }` replaces `{0}` before describing columns. Replacements are raw SQL fragments, and the final SQL is still parsed by the read-only guard.
 
 Structure tools recognize the legacy view prefixes `vwp_`, `vwpr_`, `vwt_`, and `vwtr_`, and try the corresponding unprefixed physical table first.
+
+Column metadata uses `maxLengthBytes` and `maxLengthCharacters` explicitly. This avoids interpreting SQL Server's byte-based `sys.columns.max_length` as a character count for `nvarchar`/`nchar`.
 
 ## Build
 

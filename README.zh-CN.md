@@ -6,10 +6,11 @@
 
 ## 特性
 
-- 提供 21 个固定工具，覆盖连接检查、对象搜索、结构查看、依赖分析、SQL 模块搜索、只读查询和预估执行计划。
+- 提供 35 个固定工具，覆盖连接检查、对象解析、结构查看、调用图、部署前校验、安全诊断和预估执行计划。
 - 启动时只注册工具，不连接数据库，也不扫描全库；首次数据库调用时才建立连接。
 - SQL 用户名和密码从 Windows Credential Manager 读取，不写入 JSON 配置。
-- 基于 ScriptDom 的只读 Guard 只接受单条 `SELECT` 或 `WITH` 查询，并拒绝写操作、DDL、执行语句、跨库引用、服务器级 DMV、链接服务器和外部数据源，同时允许经过白名单确认的只读元数据函数。
+- 基于 ScriptDom 的只读 Guard 接受单条 `SELECT` / `WITH`，或仅包含变量、本地 `#temp`、向临时表插入和最终 `SELECT` 的受控诊断批次。
+- 所有工具都返回原生 MCP `structuredContent` 和精简兼容文本，并统一附带服务器、数据库、只读状态、登录、时间、耗时和隔离级别。
 - 可配置返回行数、结果大小、文本长度、锁等待、命令和连接超时。
 - 受限制或可能截断的工具会返回统一 `resultInfo`，说明已返回数量、限制、截断原因和缩小范围建议。
 - stdout 只承载 MCP 协议，应用日志写入文件。
@@ -70,28 +71,34 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 ## 工具
 
 - `test_connection`、`health_check`
-- `find_objects`、`find_column`、`find_usage`
+- `find_objects`、`resolve_object`、`find_column`、`profile_column`、`find_usage`
 - `describe_table`、`get_object_overview`
 - `get_indexes`、`get_constraints`、`get_foreign_keys`
-- `search_sql_modules`、`get_module_definition`、`compare_module_to_file`、`compare_module_to_repo`、`analyze_module_temp_tables`、`get_dependencies`
-- `search_config_text`、`run_readonly_query`、`describe_query_result`、`explain_query_plan`
+- `search_sql_modules`、`get_module_definition`、`validate_tsql_script`、`validate_tsql_file`
+- `compare_module_to_file`、`compare_module_to_repo`、`compare_modules_to_files`、`analyze_module_temp_tables`
+- `get_dependencies`、`get_callers`、`get_callees`、`get_dependency_graph`
+- `search_config_text`、`find_field_consumers`、`find_page_by_table`、`find_page_by_save_procedure`
+- `run_readonly_query`、`run_readonly_batch`、`describe_query_result`
+- `explain_query_plan`、`explain_query_plan_summary`、`batch_metadata`
 - `reload_connection`
 
 `health_check` 顶层返回 `serverVersion`，可直接确认当前发布到运行目录的服务端版本。
 
-`explain_query_plan` 返回原始 SHOWPLAN XML，同时附带语句、内存授予、warning、扫描、缺失索引、隐式转换、排序、hash、lookup、并行等结构化摘要。
+`explain_query_plan` 默认只返回语句、内存授予、warning、扫描、缺失索引、隐式转换、排序、hash、lookup、并行等摘要；仅在 `includeXml=true` 时返回原始 SHOWPLAN XML。
 
 `analyze_module_temp_tables` 会分析模块内本地临时表的创建、读写、JOIN、跨行 INSERT/SELECT INTO/UPDATE 和字段流转摘要。
 
 `compare_module_to_file` 适合已知道本地 SQL 文件路径时确认“仓库 SQL 是否已执行到数据库”；`compare_module_to_repo` 可按对象名在本地仓库/目录下自动发现 `.sql` 候选文件，唯一高分候选会直接比较，并列候选会返回列表让调用方收窄路径。
 
-模块/文件对比会返回顶层可读摘要、`changedLineSummary`、`differenceKind`、`firstBodyDifference`、被忽略的脚本包装差异标签，以及带截断信息的多 hunk diff。`diffMode=summary` 只返回差异范围，`compact` 是默认紧凑输出，`full` 可配合更大的 `maxHunks` / `maxDiffLinesPerSide` 查看更多行；仓库对比支持调用参数 `excludePatterns`，并会和配置项 `compare.repoExcludePatterns` 合并，用于默认排除 `backup/**`、`domain2/**` 等历史目录，候选并列时返回 `suggestedPatterns` 便于收窄。工具同时返回 `sqlNormalizedMatch` 和 SQL 归一化 hash，用于忽略常见部署脚本包装差异，例如 `CREATE OR ALTER`、开头 `SET ANSI_NULLS` / `SET QUOTED_IDENTIFIER`、结尾 `GO`；`firstBodyDifference` 会把第一处 SQL 归一化后的正文差异映射回数据库和本地文件行号，存在正文差异时 `nextActions` 会直接提示要查看的数据库行和本地文件行。
+模块/文件对比明确返回 `exactMatch`、`bodyMatch`、`semanticMatch`；`differenceKind` 使用 `exact_match`、`wrapper_only`、`format_only`、`comment_only`、`body_changed`。`CREATE` / `CREATE OR ALTER`、BOM、首尾空行、会话 `SET` 和尾部 `GO` 不影响 `bodyMatch`。批量部署比较还返回 `target_missing`、`local_missing`，目标尚未部署时仍会校验本地语法、引用对象和可部署状态。
 
-搜索、模块定义切片、配置文本搜索、用法搜索和只读查询工具都会返回 `resultInfo`，用于统一判断结果是否被限制、为什么被截断以及下一步该如何缩小范围。
+大结果搜索和只读查询会返回 `cursor`、`nextCursor`、`hasMore` 和可直接续查的 `nextRequest`。`find_usage` 使用字面量搜索，不再让过程名或字段名中的 `_` 进入 SQL `LIKE` 通配语义；每个命中都带 `matchKind`、`matchedText`、行列、上下文和置信度。
 
 `describe_query_result` 可显式传入 `templateValues` 描述 UI SQL 模板，例如 `{ "0": "1=1" }` 会先把 `{0}` 替换为 `1=1`，再推断结果列。替换值按 SQL 片段处理，最终 SQL 仍会经过只读 Guard。
 
 结构工具会识别 `vwp_`、`vwpr_`、`vwt_`、`vwtr_` 这四种历史视图前缀，并优先尝试对应的无前缀物理表。
+
+字段长度明确区分 `maxLengthBytes` 和 `maxLengthCharacters`，避免把 `nvarchar` / `nchar` 的 SQL Server 字节长度误当成字符长度。
 
 ## 构建与测试
 

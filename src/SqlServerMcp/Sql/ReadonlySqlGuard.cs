@@ -33,6 +33,61 @@ public sealed class ReadonlySqlGuard
         ValidateReadonlySelect(sql, "Only one read-only SELECT or WITH CTE query can be explained.");
     }
 
+    public void ValidateReadonlyBatch(string sql)
+    {
+        if (string.IsNullOrWhiteSpace(sql))
+        {
+            throw new SqlMcpException(ErrorCodes.SqlParseFailed, "SQL batch is required.");
+        }
+
+        var parser = new TSql180Parser(initialQuotedIdentifiers: false);
+        var fragment = parser.Parse(new StringReader(sql), out var errors);
+        if (errors.Count > 0)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.SqlParseFailed,
+                "SQL batch parse failed.",
+                string.Join("; ", errors.Select(AggregateParseError)),
+                "Use DECLARE, CREATE TABLE #temp, INSERT #temp SELECT, and a final SELECT.");
+        }
+
+        if (fragment is not TSqlScript script)
+        {
+            throw new SqlMcpException(ErrorCodes.SqlParseFailed, "SQL did not parse as a T-SQL script.");
+        }
+
+        var statements = script.Batches.SelectMany(batch => batch.Statements).ToArray();
+        if (statements.Length == 0 || statements.Length > 50)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.SqlGuardRejected,
+                "SQL batch was rejected by read-only guard.",
+                $"Statement count {statements.Length} is outside the allowed range 1..50.");
+        }
+
+        if (statements[^1] is not SelectStatement)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.SqlGuardRejected,
+                "SQL batch was rejected by read-only guard.",
+                "The final statement must be SELECT.");
+        }
+
+        var batchVisitor = new ReadonlyBatchVisitor();
+        fragment.Accept(batchVisitor);
+        var objectVisitor = new GuardVisitor(_options.Security);
+        fragment.Accept(objectVisitor);
+        var allErrors = batchVisitor.Errors.Concat(objectVisitor.Errors).Distinct().ToArray();
+        if (allErrors.Length > 0)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.SqlGuardRejected,
+                "SQL batch was rejected by read-only guard.",
+                string.Join("; ", allErrors),
+                "Only DECLARE, CREATE TABLE #temp, INSERT #temp SELECT, and a final SELECT are allowed.");
+        }
+    }
+
     private void ValidateReadonlySelect(string sql, string parseHint)
     {
         if (string.IsNullOrWhiteSpace(sql))
@@ -217,6 +272,58 @@ public sealed class ReadonlySqlGuard
         private void RejectExternalDataSource(string feature)
         {
             Errors.Add($"External data source feature '{feature}' is not allowed.");
+        }
+    }
+
+    private sealed class ReadonlyBatchVisitor : TSqlFragmentVisitor
+    {
+        public List<string> Errors { get; } = [];
+
+        public override void Visit(TSqlStatement node)
+        {
+            if (node is not (DeclareVariableStatement or CreateTableStatement or InsertStatement or SelectStatement))
+            {
+                Errors.Add($"{node.GetType().Name} statements are not allowed in a read-only batch.");
+            }
+
+            base.Visit(node);
+        }
+
+        public override void ExplicitVisit(CreateTableStatement node)
+        {
+            if (!IsTempObject(node.SchemaObjectName))
+            {
+                Errors.Add("CREATE TABLE is allowed only for local #temp tables.");
+            }
+
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(InsertSpecification node)
+        {
+            if (node.Target is not NamedTableReference namedTarget || !IsTempObject(namedTarget.SchemaObject))
+            {
+                Errors.Add("INSERT is allowed only when the target is a local #temp table.");
+            }
+
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(SelectStatement node)
+        {
+            if (node.Into is not null && !IsTempObject(node.Into))
+            {
+                Errors.Add("SELECT INTO is allowed only for a local #temp table.");
+            }
+
+            base.ExplicitVisit(node);
+        }
+
+        private static bool IsTempObject(SchemaObjectName? name)
+        {
+            return name?.BaseIdentifier?.Value.StartsWith('#') == true
+                   && name.ServerIdentifier is null
+                   && name.DatabaseIdentifier is null;
         }
     }
 }

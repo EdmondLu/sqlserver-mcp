@@ -18,6 +18,8 @@ public sealed class SqlConnectionFactory
 
     public int CredentialReadCount { get; private set; }
 
+    public string? CachedUserName { get; private set; }
+
     public async Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
         var connectionString = await GetConnectionStringAsync(cancellationToken);
@@ -57,6 +59,7 @@ public sealed class SqlConnectionFactory
 
             var credential = _credentialReader.ReadGenericCredential(_options.CredentialTarget);
             CredentialReadCount++;
+            CachedUserName = credential.UserName;
 
             var builder = new SqlConnectionStringBuilder
             {
@@ -88,6 +91,7 @@ public sealed class SqlConnectionFactory
     public void Reload()
     {
         _cachedConnectionString = null;
+        CachedUserName = null;
         SqlConnection.ClearAllPools();
     }
 }

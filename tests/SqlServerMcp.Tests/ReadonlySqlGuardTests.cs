@@ -51,6 +51,35 @@ public sealed class ReadonlySqlGuardTests
         Assert.Equal(ErrorCodes.SqlGuardRejected, ex.ErrorCode);
     }
 
+    [Fact]
+    public void ValidateReadonlyBatch_AllowsOnlyTempWritesAndFinalSelect()
+    {
+        var guard = new ReadonlySqlGuard(CreateOptions());
+
+        guard.ValidateReadonlyBatch(
+            """
+            DECLARE @minimum INT = 1;
+            CREATE TABLE #items (id INT NOT NULL);
+            INSERT INTO #items (id)
+            SELECT A.id FROM dbo.TableA A WHERE A.id >= @minimum;
+            SELECT id FROM #items ORDER BY id;
+            """);
+    }
+
+    [Theory]
+    [InlineData("INSERT INTO dbo.TableA(id) SELECT 1; SELECT 1;")]
+    [InlineData("EXEC dbo.SomeProcedure; SELECT 1;")]
+    [InlineData("CREATE TABLE dbo.RealTable(id INT); SELECT 1;")]
+    [InlineData("UPDATE #items SET id=2; SELECT 1;")]
+    public void ValidateReadonlyBatch_RejectsBusinessWritesAndUnsupportedStatements(string sql)
+    {
+        var guard = new ReadonlySqlGuard(CreateOptions());
+
+        var ex = Assert.Throws<SqlMcpException>(() => guard.ValidateReadonlyBatch(sql));
+
+        Assert.Contains(ex.ErrorCode, new[] { ErrorCodes.SqlGuardRejected, ErrorCodes.SqlParseFailed });
+    }
+
     private static SqlServerMcpOptions CreateOptions()
     {
         return new SqlServerMcpOptions
