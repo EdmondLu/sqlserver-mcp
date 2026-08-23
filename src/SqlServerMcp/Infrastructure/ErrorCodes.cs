@@ -4,6 +4,7 @@ public static class ErrorCodes
 {
     public const string ConfigNotFound = "CONFIG_NOT_FOUND";
     public const string ConfigInvalid = "CONFIG_INVALID";
+    public const string LocalMissing = "LOCAL_MISSING";
     public const string CredentialNotFound = "CREDENTIAL_NOT_FOUND";
     public const string CredentialReadFailed = "CREDENTIAL_READ_FAILED";
     public const string SqlConnectionFailed = "SQL_CONNECTION_FAILED";
@@ -21,6 +22,7 @@ public static class ErrorCodes
     public const string ModuleDefinitionNotAvailable = "MODULE_DEFINITION_NOT_AVAILABLE";
     public const string ViewDefinitionPermissionRequired = "VIEW_DEFINITION_PERMISSION_REQUIRED";
     public const string ShowplanPermissionRequired = "SHOWPLAN_PERMISSION_REQUIRED";
+    public const string SqlServerPermissionRequired = "SQL_SERVER_PERMISSION_REQUIRED";
     public const string ResultTooLarge = "RESULT_TOO_LARGE";
     public const string UnknownError = "UNKNOWN_ERROR";
 }

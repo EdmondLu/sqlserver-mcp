@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## 2.3.0 - 2026-08-23
+
+- Split `health_check` server-level DMV diagnostics into SQL Server effective permissions, MCP policy, effective access, and explicit blocker codes; added `mcpServerVersion`, `sqlServerProductVersion`, `sqlServerProductLevel`, and `sqlServerEdition` while retaining `serverVersion` as a documented compatibility alias. Permission guidance now separates explanations from never-executed administrator SQL, safely escapes identifiers, and uses database users for database grants and logins for server grants.
+- Classified SQL Server error 300 as `SQL_SERVER_PERMISSION_REQUIRED`, with guidance that this is the SQL Server permission layer's final blocker even when the MCP policy permits the query.
+- Made `validate_tsql_script` and `validate_tsql_file` summary-first through `detailLevel=summary|full`; static validity is exposed as `staticValidationPassed`. Their existing `readyToDeploy` field, and the one on `compare_modules_to_files`, remains a deprecated legacy alias of that static result, while the new conservative `deploymentReady` field remains false for an existing un-compared or drifted target.
+- Added read-only `validate_deployment` to combine local file validation, target module comparison, drift detection, and deployment risk without executing the script or writing to SQL Server. Recognized metadata-permission failures now preserve static validation and return a conservative structured `targetComparison=inconclusive`; cancellation, connectivity, and unknown errors still propagate normally.
+- Disambiguated `OBJECT_DEFINITION=NULL` by also checking effective object-level `VIEW DEFINITION` and `IsEncrypted`: confirmed permission failures still receive database-user grant guidance, while encrypted or otherwise unavailable definitions return `MODULE_DEFINITION_NOT_AVAILABLE` without an incorrect `requiredPermission` and direct deployment validation to controlled source or approved artifacts.
+- Made module comparison report total, returned, and omitted hunk counts plus target/local affected identifiers and a high-severity production-regression risk even when compact diff line text is truncated.
+- Added ScriptDom transaction-safety diagnostics for DROP/DML/SELECT INTO/CREATE TABLE/EXECUTE operations in CATCH before `IF XACT_STATE() = -1 THROW;` or when that guard is missing entirely, where SQL error 3930 could hide the original exception; nested CATCH blocks are assessed independently.
+
+## 2.2.2 - 2026-08-13
+
+- Bound complete CTE, derived-table, and APPLY projections, including repeated CTE names scoped to their nearest definition; genuinely unresolved derived references are collapsed into one non-blocking `analysis_inconclusive` warning with counts and the first location.
+- Changed table comparison token budgeting to retain as many leading difference entries as fit, prioritize differences over full local/target models, and report the remaining `omittedDifferenceCount` precisely.
+
+## 2.2.1 - 2026-08-10
+
+- Normalized table expressions through ScriptDom so comments, redundant parentheses, quoted identifiers, numeric formats, reordered Boolean terms, and SQL Server's `IN`-to-`OR` check-constraint expansion compare semantically.
+- Fixed `DELETE alias FROM schema.table alias` validation so the modification target alias is not reported as a missing `schema.alias` object.
+- Made any locally inconclusive deployment item keep the aggregate state `inconclusive`; missing local files now use `local_missing`/`LOCAL_MISSING` instead of `CONFIG_INVALID` or a false `not_deployed` conclusion.
+- Made `compare_table_to_file` summary-first and bounded with `includeDetails`, `fields`, and `maxTotalTokens`; optional `includeDescriptions` compares table and column `MS_Description` values.
+
+## 2.2.0 - 2026-08-10
+
+- Added `verify_deployment_set` to verify table scripts, SQL module files, and allow-listed UI/configuration patch files in one call with `deployed`, `not_deployed`, `partially_deployed`, `definition_mismatch`, and `inconclusive` states; differences-only output is the default.
+- Added `compare_table_to_file`, which parses effective `CREATE TABLE`/`ALTER TABLE`/index structure and compares columns, indexes, key/default/check constraints, and outgoing foreign keys without executing the file.
+- Added `verify_config_patch_file` for parameterized read-only verification of allow-listed literal and `REPLACE(column, old, new)` configuration UPDATE patches.
+- Made `compare_modules_to_files` summary-first and bounded through `onlyMismatches`, `includeDiff`, `maxTotalTokens`, and `fields`; deployment equivalence and static validation are now separate states.
+- Classified caller-provided temporary tables as non-blocking `external_temp_table_contract` references with explicit warnings.
+- Forwarded operation-specific parameters through `batch_metadata`, including full `describe_table` presets/include overrides and definition/compare controls.
+
 ## 2.1.0 - 2026-07-30
 
 - Made `maxLengthCharacters` null for numeric, binary, date/time, GUID, and other non-character types while preserving `maxLengthBytes`.

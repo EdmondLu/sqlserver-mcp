@@ -9,6 +9,7 @@ public sealed class SqlErrorClassificationTests
     [InlineData(208, ErrorCodes.SqlInvalidObject)]
     [InlineData(207, ErrorCodes.SqlInvalidColumn)]
     [InlineData(2715, ErrorCodes.SqlInvalidType)]
+    [InlineData(300, ErrorCodes.SqlServerPermissionRequired)]
     [InlineData(8144, ErrorCodes.SqlParameterMismatch)]
     [InlineData(102, ErrorCodes.SqlSyntaxError)]
     [InlineData(50000, ErrorCodes.UnknownError)]

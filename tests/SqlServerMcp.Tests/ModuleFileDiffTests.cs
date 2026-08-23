@@ -89,6 +89,46 @@ public sealed class ModuleFileDiffTests
     }
 
     [Fact]
+    public void BuildLineDiff_TruncatedCompactOutputStillReportsCompleteDeploymentRisk()
+    {
+        var databaseLines = new List<string> { "CREATE PROCEDURE dbo.Sample", "AS" };
+        var fileLines = new List<string> { "CREATE OR ALTER PROCEDURE dbo.Sample", "AS" };
+        for (var index = 1; index <= 12; index++)
+        {
+            databaseLines.Add($"SELECT ProductionOnly{index} = {index};");
+            fileLines.Add($"SELECT LocalOnly{index} = {index};");
+            databaseLines.Add($"SELECT Stable{index} = {index};");
+            fileLines.Add($"SELECT Stable{index} = {index};");
+        }
+
+        var databaseDefinition = string.Join('\n', databaseLines);
+        var fileText = string.Join('\n', fileLines);
+        var diff = SqlMetadataService.BuildLineDiff(
+            databaseDefinition,
+            fileText,
+            contextLines: 0,
+            diffMode: "compact",
+            maxHunks: 1,
+            maxDiffLinesPerSide: 1);
+        var risk = SqlMetadataService.BuildModuleDeploymentRisk(
+            databaseDefinition,
+            fileText,
+            "body_changed",
+            diff);
+
+        Assert.True(diff.Truncated);
+        Assert.True(diff.TotalHunkCount > diff.ReturnedHunkCount);
+        Assert.Equal(diff.TotalHunkCount - diff.ReturnedHunkCount, diff.OmittedHunkCount);
+        Assert.Equal(diff.TotalHunkCount, risk.TotalHunkCount);
+        Assert.Equal(diff.OmittedHunkCount, risk.OmittedHunkCount);
+        Assert.Equal("high", risk.Level);
+        Assert.True(risk.PotentialProductionRegression);
+        Assert.Contains("ProductionOnly12", risk.TargetOnlyIdentifiers.Identifiers);
+        Assert.Contains("LocalOnly12", risk.LocalOnlyIdentifiers.Identifiers);
+        Assert.Contains("TARGET_LOGIC_MAY_BE_OVERWRITTEN", risk.ReasonCodes);
+    }
+
+    [Fact]
     public void BuildLineDiff_SplitsHeaderAndTrailingGoNoiseIntoSmallHunks()
     {
         const string databaseDefinition = """

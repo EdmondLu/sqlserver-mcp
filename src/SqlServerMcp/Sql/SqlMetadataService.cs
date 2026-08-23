@@ -37,6 +37,18 @@ public sealed class SqlMetadataService
     private static readonly Regex SqlSessionSetRegex = new(
         @"^\s*SET\s+(?:ANSI_NULLS|QUOTED_IDENTIFIER)\s+(?:ON|OFF)\s*;?\s*$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex SqlIdentifierCandidateRegex = new(
+        @"\[[^\]\r\n]+\]|[@#]?[\p{L}_][\p{L}\p{N}_$#@]*",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly HashSet<string> SqlIdentifierKeywords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ADD", "ALL", "ALTER", "AND", "AS", "ASC", "BEGIN", "BY", "CASE", "CATCH", "COMMIT", "CREATE",
+        "CROSS", "DECLARE", "DELETE", "DESC", "DISTINCT", "DROP", "ELSE", "END", "EXEC", "EXECUTE", "EXISTS",
+        "FROM", "FULL", "FUNCTION", "GROUP", "HAVING", "IF", "IN", "INNER", "INSERT", "INTO", "IS", "JOIN",
+        "LEFT", "MERGE", "NOT", "NULL", "ON", "OR", "ORDER", "OUTER", "PROCEDURE", "RETURN", "RIGHT", "ROLLBACK",
+        "SELECT", "SET", "TABLE", "THEN", "THROW", "TOP", "TRAN", "TRANSACTION", "TRIGGER", "TRUNCATE", "TRY",
+        "UNION", "UPDATE", "VALUES", "VIEW", "WHEN", "WHERE", "WITH"
+    };
     private static readonly string[] DefaultRepoComparePatterns = ["**/*.sql"];
     private static readonly string[] ModuleSearchNextActions =
     [
@@ -136,6 +148,9 @@ public sealed class SqlMetadataService
         object? permissions = null;
         object? textSearchValidation = null;
         object? error = null;
+        string? sqlServerProductVersion = null;
+        string? sqlServerProductLevel = null;
+        string? sqlServerEdition = null;
 
         try
         {
@@ -145,9 +160,14 @@ public sealed class SqlMetadataService
                                    login_name=SUSER_SNAME(),
                                    user_name=USER_NAME(),
                                    server_name=@@SERVERNAME,
+                                   sql_server_product_version=CONVERT(NVARCHAR(128), SERVERPROPERTY(N'ProductVersion')),
+                                   sql_server_product_level=CONVERT(NVARCHAR(128), SERVERPROPERTY(N'ProductLevel')),
+                                   sql_server_edition=CONVERT(NVARCHAR(256), SERVERPROPERTY(N'Edition')),
                                    has_select=HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'SELECT'),
                                    has_view_definition=HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DEFINITION'),
                                    has_showplan=HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'SHOWPLAN'),
+                                   has_view_server_performance_state=HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER PERFORMANCE STATE'),
+                                   has_view_server_state=HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE'),
                                    is_db_datareader=IS_ROLEMEMBER(N'db_datareader'),
                                    is_db_datawriter=IS_ROLEMEMBER(N'db_datawriter');
                                """;
@@ -161,23 +181,47 @@ public sealed class SqlMetadataService
                     loginName = reader.GetString("login_name"),
                     userName = reader.GetString("user_name"),
                     serverName = reader.GetString("server_name"),
+                    sqlServerProductVersion = reader.GetNullableString("sql_server_product_version"),
+                    sqlServerProductLevel = reader.GetNullableString("sql_server_product_level"),
+                    sqlServerEdition = reader.GetNullableString("sql_server_edition"),
                     hasSelect = reader.GetNullableInt32("has_select") == 1,
                     hasViewDefinition = reader.GetNullableInt32("has_view_definition") == 1,
                     hasShowplan = reader.GetNullableInt32("has_showplan") == 1,
+                    hasViewServerPerformanceState = ReadNullablePermission(reader.GetNullableInt32("has_view_server_performance_state")),
+                    hasViewServerState = ReadNullablePermission(reader.GetNullableInt32("has_view_server_state")),
                     isDbDatareader = reader.GetNullableInt32("is_db_datareader") == 1,
                     isDbDatawriter = reader.GetNullableInt32("is_db_datawriter") == 1
                 },
                 cancellationToken);
 
             var row = rows.Single();
+            sqlServerProductVersion = row.sqlServerProductVersion;
+            sqlServerProductLevel = row.sqlServerProductLevel;
+            sqlServerEdition = row.sqlServerEdition;
             connection = new
             {
                 ok = true,
                 row.databaseName,
                 row.loginName,
                 row.userName,
-                row.serverName
+                row.serverName,
+                row.sqlServerProductVersion,
+                row.sqlServerProductLevel,
+                row.sqlServerEdition
             };
+            var serverLevelDmvAccess = BuildServerLevelDmvAccess(
+                row.sqlServerProductVersion,
+                row.hasViewServerPerformanceState,
+                row.hasViewServerState,
+                _options.Security.AllowDmvQueries,
+                _options.Security.AllowServerLevelDmv);
+            var permissionGuidance = BuildHealthPermissionGuidance(
+                row.databaseName,
+                row.loginName,
+                row.userName,
+                row.hasViewDefinition,
+                row.hasShowplan,
+                serverLevelDmvAccess);
             permissions = new
             {
                 row.hasSelect,
@@ -185,11 +229,13 @@ public sealed class SqlMetadataService
                 row.hasShowplan,
                 row.isDbDatareader,
                 row.isDbDatawriter,
-                recommendations = new[]
-                {
-                    row.hasViewDefinition ? null : $"GRANT VIEW DEFINITION TO {row.userName};",
-                    row.hasShowplan ? null : $"GRANT SHOWPLAN TO {row.userName};"
-                }.OfType<string>().ToArray()
+                sqlServerEffectivePermissions = serverLevelDmvAccess.SqlServer,
+                mcpPolicy = serverLevelDmvAccess.McpPolicy,
+                serverLevelDmvAccess,
+                recommendations = permissionGuidance.Recommendations
+                    .Concat(serverLevelDmvAccess.Recommendations)
+                    .ToArray(),
+                permissionGuidance
             };
 
             try
@@ -229,10 +275,16 @@ public sealed class SqlMetadataService
         }
 
         stopwatch.Stop();
+        var mcpServerVersion = GetServerVersion();
         return new
         {
             ok = error is null,
-            serverVersion = GetServerVersion(),
+            mcpServerVersion,
+            serverVersion = mcpServerVersion,
+            serverVersionSemantics = "compatibility_alias_of_mcpServerVersion",
+            sqlServerProductVersion,
+            sqlServerProductLevel,
+            sqlServerEdition,
             config = new
             {
                 configPath = _options.ConfigPath,
@@ -274,6 +326,145 @@ public sealed class SqlMetadataService
             error,
             elapsedMs = stopwatch.ElapsedMilliseconds
         };
+    }
+
+    internal static ServerLevelDmvAccess BuildServerLevelDmvAccess(
+        string? sqlServerProductVersion,
+        bool? hasViewServerPerformanceState,
+        bool? hasViewServerState,
+        bool allowDmvQueries,
+        bool allowServerLevelDmv)
+    {
+        var majorVersion = int.TryParse(
+            sqlServerProductVersion?.Split('.', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(),
+            NumberStyles.Integer,
+            CultureInfo.InvariantCulture,
+            out var parsedMajorVersion)
+            ? parsedMajorVersion
+            : (int?)null;
+        var requiredPermission = majorVersion is >= 16
+            ? "VIEW SERVER PERFORMANCE STATE"
+            : "VIEW SERVER STATE";
+        var hasRequiredPermission = majorVersion is >= 16
+            ? hasViewServerPerformanceState
+            : hasViewServerState;
+        var policyAllowed = allowDmvQueries && allowServerLevelDmv;
+        var blockedBy = new List<string>();
+        var recommendations = new List<string>();
+
+        if (hasRequiredPermission is not true)
+        {
+            blockedBy.Add(hasRequiredPermission is null
+                ? "SQL_SERVER_PERMISSION_UNKNOWN"
+                : "SQL_SERVER_PERMISSION");
+            recommendations.Add(
+                hasRequiredPermission is null
+                    ? $"SQL Server effective permission could not be determined: {requiredPermission}. Verify it before relying on server-level DMV access."
+                    : $"SQL Server permission missing: {requiredPermission}. Wrapper views over server-level DMVs can fail with SQL error 300 even when ordinary SELECT succeeds.");
+        }
+
+        if (!policyAllowed)
+        {
+            blockedBy.Add("MCP_POLICY");
+            recommendations.Add(
+                !allowDmvQueries
+                    ? "MCP policy blocks DMV access: security.allowDmvQueries=false."
+                    : "MCP policy blocks direct server-level DMV access: security.allowServerLevelDmv=false.");
+        }
+
+        return new ServerLevelDmvAccess(
+            new ServerLevelDmvSqlPermissions(
+                requiredPermission,
+                hasRequiredPermission,
+                hasViewServerPerformanceState,
+                hasViewServerState),
+            new ServerLevelDmvMcpPolicy(
+                allowDmvQueries,
+                allowServerLevelDmv,
+                policyAllowed),
+            hasRequiredPermission is true && policyAllowed,
+            blockedBy.ToArray(),
+            recommendations.ToArray(),
+            "MCP policy and SQL Server permissions are independent. A wrapper view can pass MCP text guards but still be rejected by SQL Server for an underlying server-level DMV.");
+    }
+
+    private static bool? ReadNullablePermission(int? value) => value switch
+    {
+        1 => true,
+        0 => false,
+        _ => null
+    };
+
+    internal static string QuoteSqlIdentifier(string identifier)
+    {
+        if (string.IsNullOrWhiteSpace(identifier))
+        {
+            throw new ArgumentException("SQL identifier is required.", nameof(identifier));
+        }
+
+        return $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
+    }
+
+    internal static HealthPermissionGuidance BuildHealthPermissionGuidance(
+        string databaseName,
+        string loginName,
+        string userName,
+        bool hasViewDefinition,
+        bool hasShowplan,
+        ServerLevelDmvAccess serverLevelDmvAccess)
+    {
+        var recommendations = new List<string>();
+        var adminSql = new List<HealthAdminSqlSuggestion>();
+        var quotedDatabase = QuoteSqlIdentifier(databaseName);
+        var quotedUser = QuoteSqlIdentifier(userName);
+        var quotedLogin = QuoteSqlIdentifier(loginName);
+
+        if (!hasViewDefinition)
+        {
+            recommendations.Add(
+                $"Database user '{userName}' is missing VIEW DEFINITION in database '{databaseName}'. Ask an authorized database administrator to review the suggested admin SQL.");
+            adminSql.Add(new HealthAdminSqlSuggestion(
+                "database",
+                "database_user",
+                userName,
+                "VIEW DEFINITION",
+                "Suggested database-level grant for an authorized administrator to review.",
+                $"USE {quotedDatabase}; GRANT VIEW DEFINITION TO {quotedUser};",
+                SuggestionOnly: true));
+        }
+
+        if (!hasShowplan)
+        {
+            recommendations.Add(
+                $"Database user '{userName}' is missing SHOWPLAN in database '{databaseName}'. Ask an authorized database administrator to review the suggested admin SQL.");
+            adminSql.Add(new HealthAdminSqlSuggestion(
+                "database",
+                "database_user",
+                userName,
+                "SHOWPLAN",
+                "Suggested database-level grant for an authorized administrator to review.",
+                $"USE {quotedDatabase}; GRANT SHOWPLAN TO {quotedUser};",
+                SuggestionOnly: true));
+        }
+
+        if (serverLevelDmvAccess.SqlServer.HasRequiredPermission is false)
+        {
+            var requiredPermission = serverLevelDmvAccess.SqlServer.RequiredPermission;
+            adminSql.Add(new HealthAdminSqlSuggestion(
+                "server",
+                "login",
+                loginName,
+                requiredPermission,
+                "Suggested server-level grant for an authorized administrator to review.",
+                $"GRANT {requiredPermission} TO {quotedLogin};",
+                SuggestionOnly: true));
+        }
+
+        return new HealthPermissionGuidance(
+            recommendations.ToArray(),
+            adminSql.ToArray(),
+            "The SQL statements are suggestions for an authorized administrator. health_check is read-only and never executes them.",
+            AutomaticallyExecuted: false);
     }
 
     internal static string GetServerVersion()
@@ -1189,31 +1380,188 @@ public sealed class SqlMetadataService
 
     public async Task<object> ValidateTsqlFileAsync(
         string filePath,
+        string? detailLevel,
         CancellationToken cancellationToken)
     {
         var file = GetReadableCompareFile(filePath);
         var script = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
-        return await ValidateTsqlScriptAsync(script, file.FullName, cancellationToken);
+        return await ValidateTsqlScriptAsync(script, file.FullName, detailLevel, cancellationToken);
     }
 
     public async Task<object> ValidateTsqlScriptAsync(
         string script,
         string? sourceName,
+        string? detailLevel,
         CancellationToken cancellationToken)
     {
         return await ValidateTsqlScriptCoreAsync(
             script,
             sourceName,
             plannedModules: null,
+            detailLevel,
             cancellationToken);
+    }
+
+    public async Task<object> ValidateDeploymentAsync(
+        string filePath,
+        string? detailLevel,
+        string? diffMode,
+        bool includeDiff,
+        CancellationToken cancellationToken)
+    {
+        var file = GetReadableCompareFile(filePath);
+        var script = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
+        var analysis = TsqlScriptAnalyzer.Analyze(script);
+        var validation = await ValidateTsqlScriptCoreAsync(
+            script,
+            file.FullName,
+            plannedModules: null,
+            detailLevel,
+            cancellationToken);
+        var validationElement = JsonSerializer.SerializeToElement(validation, JsonResponse.Options);
+        var staticValidationPassed = validationElement.GetProperty("staticValidationPassed").GetBoolean();
+        if (analysis.Module is null)
+        {
+            var notApplicable = EvaluateDeploymentReadiness(staticValidationPassed, "not_applicable");
+            var readyToDeployContract = BuildReadyToDeployContract(
+                staticValidationPassed,
+                notApplicable.DeploymentReady,
+                preserveLegacyStaticSemantics: false);
+            return new
+            {
+                validation,
+                module = (object?)null,
+                targetComparison = new
+                {
+                    state = notApplicable.TargetComparisonState,
+                    compared = notApplicable.TargetCompared
+                },
+                staticValidationPassed,
+                targetDriftDetected = notApplicable.TargetDriftDetected,
+                deploymentReady = notApplicable.DeploymentReady,
+                readyToDeploy = readyToDeployContract.ReadyToDeploy,
+                readyToDeploySemantics = readyToDeployContract.Semantics,
+                readyToDeployDeprecated = readyToDeployContract.Deprecated,
+                deploymentAssessment = notApplicable,
+                nextActions = new[] { "Pass a CREATE OR ALTER procedure, function, view, or trigger file so a target module can be identified and compared." }
+            };
+        }
+
+        var diffOptions = BuildDiffOutputOptions(
+            contextLines: 3,
+            diffMode: string.IsNullOrWhiteSpace(diffMode) ? "summary" : diffMode,
+            maxHunks: null,
+            maxDiffLinesPerSide: null);
+        try
+        {
+            var databaseModule = await GetModuleDefinitionCoreAsync(
+                analysis.Module.Schema,
+                analysis.Module.Name,
+                cancellationToken);
+            var comparison = await BuildModuleFileComparisonAsync(
+                databaseModule,
+                file,
+                diffOptions,
+                cancellationToken);
+            var matched = comparison.DifferenceKind is "exact_match" or "wrapper_only" or "format_only" or "comment_only";
+            var state = matched ? "equivalent" : "definition_mismatch";
+            var deploymentAssessment = EvaluateDeploymentReadiness(staticValidationPassed, state);
+            var readyToDeployContract = BuildReadyToDeployContract(
+                staticValidationPassed,
+                deploymentAssessment.DeploymentReady,
+                preserveLegacyStaticSemantics: false);
+            return new
+            {
+                validation,
+                module = analysis.Module,
+                targetComparison = new
+                {
+                    state,
+                    compared = true,
+                    matched,
+                    comparison.DifferenceKind,
+                    comparison.Summary,
+                    comparison.ChangedLineSummary,
+                    comparison.FirstBodyDifference,
+                    comparison.DeploymentRisk,
+                    diff = new
+                    {
+                        comparison.Diff.Mode,
+                        comparison.Diff.Truncated,
+                        comparison.Diff.TotalHunkCount,
+                        comparison.Diff.ReturnedHunkCount,
+                        comparison.Diff.OmittedHunkCount,
+                        hunks = includeDiff ? comparison.Diff.Hunks : null
+                    },
+                    comparison = includeDiff ? comparison : null
+                },
+                staticValidationPassed,
+                targetDriftDetected = deploymentAssessment.TargetDriftDetected,
+                deploymentReady = deploymentAssessment.DeploymentReady,
+                readyToDeploy = readyToDeployContract.ReadyToDeploy,
+                readyToDeploySemantics = readyToDeployContract.Semantics,
+                readyToDeployDeprecated = readyToDeployContract.Deprecated,
+                deploymentAssessment,
+                deploymentRisk = comparison.DeploymentRisk,
+                nextActions = comparison.NextActions
+            };
+        }
+        catch (SqlMcpException ex) when (ex.ErrorCode == ErrorCodes.ObjectNotFound)
+        {
+            var targetMissing = EvaluateDeploymentReadiness(staticValidationPassed, "target_missing");
+            var readyToDeployContract = BuildReadyToDeployContract(
+                staticValidationPassed,
+                targetMissing.DeploymentReady,
+                preserveLegacyStaticSemantics: false);
+            return new
+            {
+                validation,
+                module = analysis.Module,
+                targetComparison = new
+                {
+                    state = targetMissing.TargetComparisonState,
+                    compared = targetMissing.TargetCompared,
+                    matched = false
+                },
+                staticValidationPassed,
+                targetDriftDetected = false,
+                deploymentReady = targetMissing.DeploymentReady,
+                readyToDeploy = readyToDeployContract.ReadyToDeploy,
+                readyToDeploySemantics = readyToDeployContract.Semantics,
+                readyToDeployDeprecated = readyToDeployContract.Deprecated,
+                deploymentAssessment = targetMissing,
+                deploymentRisk = (object?)null,
+                nextActions = targetMissing.DeploymentReady
+                    ? new[] { "The target module is missing and the local file passed static validation; review and deploy it through your normal controlled deployment process." }
+                    : new[] { "Fix static validation errors before deploying the missing target module." }
+            };
+        }
+        catch (SqlMcpException ex) when (ClassifyTargetComparisonFailure(ex) is not null)
+        {
+            return BuildInconclusiveDeploymentResult(
+                validation,
+                analysis.Module,
+                staticValidationPassed,
+                ClassifyTargetComparisonFailure(ex)!);
+        }
+        catch (SqlException ex) when (ClassifyTargetComparisonFailure(ex) is not null)
+        {
+            return BuildInconclusiveDeploymentResult(
+                validation,
+                analysis.Module,
+                staticValidationPassed,
+                ClassifyTargetComparisonFailure(ex)!);
+        }
     }
 
     private async Task<object> ValidateTsqlScriptCoreAsync(
         string script,
         string? sourceName,
         IReadOnlySet<string>? plannedModules,
+        string? detailLevel,
         CancellationToken cancellationToken)
     {
+        var normalizedDetailLevel = NormalizeValidationDetailLevel(detailLevel);
         if (string.IsNullOrWhiteSpace(script))
         {
             throw new SqlMcpException(ErrorCodes.ConfigInvalid, "script is required.");
@@ -1244,52 +1592,313 @@ public sealed class SqlMetadataService
         }
         var errorCount = diagnostics.Count(diagnostic => diagnostic.Severity == "error");
         var warningCount = diagnostics.Count(diagnostic => diagnostic.Severity == "warning");
-        var readyToDeploy = analysis.SyntaxValid
-                            && errorCount == 0
-                            && (analysis.Module is null || analysis.HasCreateOrAlter);
+        var warningCategories = diagnostics
+            .Where(diagnostic => diagnostic.Severity == "warning")
+            .Select(diagnostic => diagnostic.Category)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(category => category, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var referencedObjectsValid = referenceValidation.Objects.All(reference => reference.Status is "resolved" or "external_unverified" or "local_deployment_set" or "external_temp_table_contract");
+        var referencedTypesValid = referenceValidation.Types.All(reference => reference.Exists);
+        var staticValidationPassed = analysis.SyntaxValid
+                                     && errorCount == 0
+                                     && (analysis.Module is null || analysis.HasCreateOrAlter);
+        var targetComparisonState = analysis.Module is null
+            ? "not_applicable"
+            : target is { Exists: false } ? "target_missing" : "not_compared";
+        var deploymentAssessment = EvaluateDeploymentReadiness(staticValidationPassed, targetComparisonState);
+        var readyToDeployContract = BuildReadyToDeployContract(
+            staticValidationPassed,
+            deploymentAssessment.DeploymentReady,
+            preserveLegacyStaticSemantics: true);
         stopwatch.Stop();
 
-        return new
+        var targetResult = target is null
+            ? null
+            : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["schema"] = target.Schema,
+                ["name"] = target.Name,
+                ["type"] = target.Type,
+                ["exists"] = target.Exists,
+                ["status"] = target.Exists ? "target_exists" : "target_missing",
+                ["parameterCount"] = target.Parameters.Length,
+                ["parameters"] = target.Parameters
+            };
+        var result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
         {
-            ok = errorCount == 0,
-            validationMode = "static_parse_and_metadata_no_execute",
-            executed = false,
-            databaseWritten = false,
-            source = sourceName,
-            scriptLength = script.Length,
-            scriptSha256 = ComputeSha256Hex(script),
-            syntaxValid = analysis.SyntaxValid,
-            wrapper = new
+            ["ok"] = errorCount == 0,
+            ["validationMode"] = "static_parse_and_metadata_no_execute",
+            ["executed"] = false,
+            ["databaseWritten"] = false,
+            ["source"] = sourceName,
+            ["scriptLength"] = script.Length,
+            ["scriptSha256"] = ComputeSha256Hex(script),
+            ["syntaxValid"] = analysis.SyntaxValid,
+            ["wrapper"] = new
             {
                 hasCreateOrAlter = analysis.HasCreateOrAlter,
                 module = analysis.Module
             },
-            target = target is null
-                ? null
-                : new
-                {
-                    target.Schema,
-                    target.Name,
-                    target.Type,
-                    target.Exists,
-                    status = target.Exists ? "target_exists" : "target_missing",
-                    parameters = target.Parameters
-                },
-            localSyntaxValid = analysis.SyntaxValid,
-            referencedObjectsValid = referenceValidation.Objects.All(reference => reference.Status is "resolved" or "external_unverified" or "local_deployment_set"),
-            referencedTypesValid = referenceValidation.Types.All(reference => reference.Exists),
-            readyToDeploy,
-            errorCount,
-            warningCount,
-            diagnostics = diagnostics
+            ["target"] = targetResult,
+            ["localSyntaxValid"] = analysis.SyntaxValid,
+            ["referencedObjectsValid"] = referencedObjectsValid,
+            ["referencedTypesValid"] = referencedTypesValid,
+            ["metadataValid"] = referencedObjectsValid && referencedTypesValid,
+            ["staticValidationPassed"] = staticValidationPassed,
+            ["legacyStaticReadyToDeploy"] = staticValidationPassed,
+            ["deploymentReady"] = deploymentAssessment.DeploymentReady,
+            ["readyToDeploy"] = readyToDeployContract.ReadyToDeploy,
+            ["readyToDeploySemantics"] = readyToDeployContract.Semantics,
+            ["readyToDeployDeprecated"] = readyToDeployContract.Deprecated,
+            ["deploymentAssessment"] = deploymentAssessment,
+            ["staticValidationState"] = errorCount > 0 ? "error" : warningCount > 0 ? "warning" : "valid",
+            ["warnings"] = warningCategories,
+            ["errorCount"] = errorCount,
+            ["warningCount"] = warningCount,
+            ["diagnosticCount"] = diagnostics.Count,
+            ["diagnostics"] = diagnostics
                 .OrderBy(diagnostic => diagnostic.Line ?? int.MaxValue)
                 .ThenBy(diagnostic => diagnostic.Column ?? int.MaxValue)
                 .ThenBy(diagnostic => diagnostic.Category, StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
-            references = referenceValidation,
-            tempTables = analysis.TempTables,
-            tableVariables = analysis.TableVariables,
-            elapsedMs = stopwatch.ElapsedMilliseconds
+            ["referenceSummary"] = new
+            {
+                objectCount = referenceValidation.Objects.Length,
+                objectStatusCounts = referenceValidation.Objects
+                    .GroupBy(reference => reference.Status, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase),
+                typeCount = referenceValidation.Types.Length,
+                missingTypeCount = referenceValidation.Types.Count(reference => !reference.Exists)
+            },
+            ["temporaryObjectSummary"] = new
+            {
+                tempTableCount = analysis.TempTables.Length,
+                externalTempTableCount = analysis.ExternalTempTables.Length,
+                tableVariableCount = analysis.TableVariables.Length
+            },
+            ["references"] = referenceValidation,
+            ["tempTables"] = analysis.TempTables,
+            ["externalTempTables"] = analysis.ExternalTempTables,
+            ["tableVariables"] = analysis.TableVariables,
+            ["elapsedMs"] = stopwatch.ElapsedMilliseconds
+        };
+
+        return FinalizeTsqlValidationResult(result, normalizedDetailLevel);
+    }
+
+    internal static Dictionary<string, object?> FinalizeTsqlValidationResult(
+        Dictionary<string, object?> result,
+        string? detailLevel)
+    {
+        var normalizedDetailLevel = NormalizeValidationDetailLevel(detailLevel);
+        var projected = new Dictionary<string, object?>(result, StringComparer.OrdinalIgnoreCase)
+        {
+            ["detailLevel"] = normalizedDetailLevel,
+            ["detailsIncluded"] = normalizedDetailLevel == "full"
+        };
+        if (normalizedDetailLevel == "full")
+        {
+            return projected;
+        }
+
+        projected.Remove("references");
+        projected.Remove("tempTables");
+        projected.Remove("externalTempTables");
+        projected.Remove("tableVariables");
+        if (projected.TryGetValue("target", out var targetValue)
+            && targetValue is Dictionary<string, object?> target)
+        {
+            var targetSummary = new Dictionary<string, object?>(target, StringComparer.OrdinalIgnoreCase);
+            targetSummary.Remove("parameters");
+            projected["target"] = targetSummary;
+        }
+
+        return projected;
+    }
+
+    private static string NormalizeValidationDetailLevel(string? detailLevel)
+    {
+        var normalized = string.IsNullOrWhiteSpace(detailLevel)
+            ? "summary"
+            : detailLevel.Trim().ToLowerInvariant();
+        if (normalized is not ("summary" or "full"))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Invalid validation detailLevel.",
+                detailLevel,
+                "Use detailLevel 'summary' or 'full'.");
+        }
+
+        return normalized;
+    }
+
+    internal static DeploymentReadiness EvaluateDeploymentReadiness(
+        bool staticValidationPassed,
+        string targetComparisonState)
+    {
+        var normalizedState = string.IsNullOrWhiteSpace(targetComparisonState)
+            ? "inconclusive"
+            : targetComparisonState.Trim().ToLowerInvariant();
+        var targetCompared = normalizedState is "equivalent" or "definition_mismatch" or "target_missing";
+        var targetDriftDetected = normalizedState == "definition_mismatch";
+        var deploymentReady = staticValidationPassed
+                              && normalizedState is "equivalent" or "target_missing";
+        var reasonCodes = new List<string>();
+        if (!staticValidationPassed)
+        {
+            reasonCodes.Add("STATIC_VALIDATION_FAILED");
+        }
+
+        switch (normalizedState)
+        {
+            case "definition_mismatch":
+                reasonCodes.Add("TARGET_DRIFT_DETECTED");
+                reasonCodes.Add("TARGET_LOGIC_MAY_BE_OVERWRITTEN");
+                break;
+            case "not_compared":
+                reasonCodes.Add("TARGET_NOT_COMPARED");
+                break;
+            case "not_applicable":
+                reasonCodes.Add("MODULE_TARGET_NOT_IDENTIFIED");
+                break;
+            case "inconclusive":
+                reasonCodes.Add("TARGET_COMPARISON_INCONCLUSIVE");
+                break;
+        }
+
+        return new DeploymentReadiness(
+            normalizedState,
+            targetCompared,
+            targetDriftDetected,
+            deploymentReady,
+            deploymentReady ? "none" : targetDriftDetected ? "high" : "unknown",
+            reasonCodes.ToArray());
+    }
+
+    internal static ReadyToDeployContract BuildReadyToDeployContract(
+        bool staticValidationPassed,
+        bool deploymentReady,
+        bool preserveLegacyStaticSemantics)
+    {
+        return preserveLegacyStaticSemantics
+            ? new ReadyToDeployContract(
+                staticValidationPassed,
+                "legacy_alias_of_staticValidationPassed",
+                Deprecated: true)
+            : new ReadyToDeployContract(
+                deploymentReady,
+                "conservative_alias_of_deploymentReady",
+                Deprecated: false);
+    }
+
+    internal static TargetComparisonFailure? ClassifyTargetComparisonFailure(SqlMcpException exception)
+    {
+        return exception.ErrorCode switch
+        {
+            ErrorCodes.ViewDefinitionPermissionRequired =>
+                new TargetComparisonFailure(
+                    exception.ErrorCode,
+                    exception.Message,
+                    exception.Detail,
+                    exception.Hint ?? "Ask an authorized database administrator to review VIEW DEFINITION for the database user.",
+                    "VIEW DEFINITION"),
+            ErrorCodes.ModuleDefinitionNotAvailable =>
+                new TargetComparisonFailure(
+                    exception.ErrorCode,
+                    exception.Message,
+                    exception.Detail,
+                    exception.Hint ?? "The module may be encrypted or otherwise unavailable. Compare it with controlled source control or the approved deployment artifact.",
+                    null),
+            ErrorCodes.SqlServerPermissionRequired =>
+                new TargetComparisonFailure(
+                    exception.ErrorCode,
+                    exception.Message,
+                    exception.Detail,
+                    exception.Hint ?? "Ask an authorized administrator to review the SQL Server metadata permission reported by SQL Server.",
+                    InferRequiredPermission(exception.Message)),
+            _ => null
+        };
+    }
+
+    private static TargetComparisonFailure? ClassifyTargetComparisonFailure(SqlException exception)
+    {
+        if (exception.Number is not (229 or 230 or 297 or 300))
+        {
+            return null;
+        }
+
+        return new TargetComparisonFailure(
+            ErrorCodes.SqlServerPermissionRequired,
+            "SQL Server denied read-only metadata access while comparing the target module.",
+            exception.Message,
+            "Ask an authorized administrator to review the reported metadata permission. The MCP does not execute GRANT statements.",
+            InferRequiredPermission(exception.Message));
+    }
+
+    private static string? InferRequiredPermission(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return null;
+        }
+
+        if (message.Contains("VIEW SERVER PERFORMANCE STATE", StringComparison.OrdinalIgnoreCase))
+        {
+            return "VIEW SERVER PERFORMANCE STATE";
+        }
+
+        if (message.Contains("VIEW SERVER STATE", StringComparison.OrdinalIgnoreCase))
+        {
+            return "VIEW SERVER STATE";
+        }
+
+        return message.Contains("VIEW DEFINITION", StringComparison.OrdinalIgnoreCase)
+            ? "VIEW DEFINITION"
+            : null;
+    }
+
+    internal static Dictionary<string, object?> BuildInconclusiveDeploymentResult(
+        object validation,
+        object module,
+        bool staticValidationPassed,
+        TargetComparisonFailure failure)
+    {
+        var deploymentAssessment = EvaluateDeploymentReadiness(staticValidationPassed, "inconclusive");
+        var readyToDeployContract = BuildReadyToDeployContract(
+            staticValidationPassed,
+            deploymentAssessment.DeploymentReady,
+            preserveLegacyStaticSemantics: false);
+        return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["validation"] = validation,
+            ["module"] = module,
+            ["targetComparison"] = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["state"] = deploymentAssessment.TargetComparisonState,
+                ["compared"] = false,
+                ["matched"] = false,
+                ["errorCode"] = failure.ErrorCode,
+                ["message"] = failure.Message,
+                ["detail"] = failure.Detail,
+                ["hint"] = failure.Hint,
+                ["requiredPermission"] = failure.RequiredPermission
+            },
+            ["staticValidationPassed"] = staticValidationPassed,
+            ["targetDriftDetected"] = false,
+            ["deploymentReady"] = deploymentAssessment.DeploymentReady,
+            ["readyToDeploy"] = readyToDeployContract.ReadyToDeploy,
+            ["readyToDeploySemantics"] = readyToDeployContract.Semantics,
+            ["readyToDeployDeprecated"] = readyToDeployContract.Deprecated,
+            ["deploymentAssessment"] = deploymentAssessment,
+            ["deploymentRisk"] = null,
+            ["nextActions"] = new[]
+            {
+                "Keep deployment blocked until the target definition can be compared.",
+                failure.Hint
+            }
         };
     }
 
@@ -1386,6 +1995,13 @@ public sealed class SqlMetadataService
             reference.Kind,
             "external_unverified",
             null,
+            [])));
+        objectResults.AddRange(analysis.ExternalTempTables.Select(reference => new TsqlObjectValidation(
+            string.Empty,
+            reference.Name,
+            "temporary_table",
+            "external_temp_table_contract",
+            "temporary_table_contract",
             [])));
 
         foreach (var column in analysis.ColumnReferences.Where(reference => reference.Identifiers.Length >= 2))
@@ -1660,6 +2276,112 @@ public sealed class SqlMetadataService
                 .Where(value => !string.IsNullOrWhiteSpace(value)));
     }
 
+    public async Task<object> CompareTableToFileAsync(
+        string schema,
+        string name,
+        string filePath,
+        bool includeDetails,
+        bool includeDescriptions,
+        int? maxTotalTokens,
+        string[]? fields,
+        CancellationToken cancellationToken)
+    {
+        var file = GetReadableCompareFile(filePath);
+        var script = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
+        var analysis = TableScriptAnalyzer.Analyze(script, schema, name);
+        var staticValidationState = analysis.Diagnostics.Any(diagnostic => diagnostic.Severity == "error")
+            ? "error"
+            : analysis.Diagnostics.Any(diagnostic => diagnostic.Severity == "warning") ? "warning" : "valid";
+        var warnings = analysis.Diagnostics
+            .Where(diagnostic => diagnostic.Severity == "warning")
+            .Select(diagnostic => diagnostic.Category)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(category => category, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (analysis.Table is null)
+        {
+            var invalid = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["schema"] = schema,
+                ["name"] = name,
+                ["filePath"] = file.FullName,
+                ["status"] = "local_invalid",
+                ["deploymentState"] = "inconclusive",
+                ["equivalent"] = false,
+                ["staticValidationState"] = staticValidationState,
+                ["warnings"] = warnings,
+                ["descriptionsCompared"] = includeDescriptions,
+                ["differenceCount"] = 0,
+                ["differenceSummary"] = new Dictionary<string, int>(),
+                ["diagnosticCount"] = analysis.Diagnostics.Length
+            };
+            if (includeDetails)
+            {
+                invalid["analysis"] = analysis;
+            }
+
+            return FinalizeTableComparisonResult(invalid, includeDetails, fields, maxTotalTokens);
+        }
+
+        try
+        {
+            var actual = await LoadTableSchemaModelAsync(schema, name, cancellationToken);
+            var comparison = TableScriptAnalyzer.Compare(analysis.Table, actual, includeDescriptions);
+            var result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["schema"] = actual.Schema,
+                ["name"] = actual.Name,
+                ["filePath"] = file.FullName,
+                ["status"] = comparison.Equivalent ? "equivalent" : "definition_mismatch",
+                ["deploymentState"] = comparison.Equivalent ? "equivalent" : "definition_mismatch",
+                ["equivalent"] = comparison.Equivalent,
+                ["staticValidationState"] = staticValidationState,
+                ["warnings"] = warnings,
+                ["descriptionsCompared"] = includeDescriptions,
+                ["differenceCount"] = comparison.Differences.Length,
+                ["differenceSummary"] = comparison.Differences
+                    .GroupBy(difference => difference.Section, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase),
+                ["diagnosticCount"] = analysis.Diagnostics.Length
+            };
+            if (includeDetails)
+            {
+                result["local"] = analysis.Table;
+                result["target"] = actual;
+                result["differences"] = comparison.Differences;
+                result["diagnostics"] = analysis.Diagnostics;
+            }
+
+            return FinalizeTableComparisonResult(result, includeDetails, fields, maxTotalTokens);
+        }
+        catch (SqlMcpException ex) when (ex.ErrorCode == ErrorCodes.ObjectNotFound)
+        {
+            var missing = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["schema"] = schema,
+                ["name"] = name,
+                ["filePath"] = file.FullName,
+                ["status"] = "target_missing",
+                ["deploymentState"] = "not_deployed",
+                ["equivalent"] = false,
+                ["staticValidationState"] = staticValidationState,
+                ["warnings"] = warnings,
+                ["descriptionsCompared"] = includeDescriptions,
+                ["differenceCount"] = 0,
+                ["differenceSummary"] = new Dictionary<string, int>(),
+                ["diagnosticCount"] = analysis.Diagnostics.Length
+            };
+            if (includeDetails)
+            {
+                missing["local"] = analysis.Table;
+                missing["diagnostics"] = analysis.Diagnostics;
+            }
+
+            return FinalizeTableComparisonResult(missing, includeDetails, fields, maxTotalTokens);
+        }
+    }
+
     public async Task<object> CompareModuleToFileAsync(
         string schema,
         string name,
@@ -1735,6 +2457,8 @@ public sealed class SqlMetadataService
             bodyMatch = comparison.BodyMatch,
             semanticMatch = comparison.SemanticMatch,
             differenceKind = comparison.DifferenceKind,
+            targetDriftDetected = comparison.DifferenceKind == "body_changed",
+            deploymentRisk = comparison.DeploymentRisk,
             firstBodyDifference = comparison.FirstBodyDifference,
             changedLineSummary = comparison.ChangedLineSummary,
             nextActions = comparison.NextActions
@@ -1744,6 +2468,10 @@ public sealed class SqlMetadataService
     public async Task<object> CompareModulesToFilesAsync(
         DeploymentModuleInput[] modules,
         string? diffMode,
+        bool onlyMismatches,
+        bool? includeDiff,
+        int? maxTotalTokens,
+        string[]? fields,
         CancellationToken cancellationToken)
     {
         if (modules is null || modules.Length == 0)
@@ -1765,11 +2493,12 @@ public sealed class SqlMetadataService
             diffMode: string.IsNullOrWhiteSpace(diffMode) ? "summary" : diffMode,
             maxHunks: null,
             maxDiffLinesPerSide: null);
+        var effectiveIncludeDiff = includeDiff ?? !diffOptions.Mode.Equals("summary", StringComparison.OrdinalIgnoreCase);
         var plannedModules = modules
             .Where(module => !string.IsNullOrWhiteSpace(module.Schema) && !string.IsNullOrWhiteSpace(module.Name))
             .Select(module => BuildTargetKey(module.Schema, module.Name))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var items = new List<object>();
+        var items = new List<Dictionary<string, object?>>();
         for (var i = 0; i < modules.Length; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1778,14 +2507,19 @@ public sealed class SqlMetadataService
                 || string.IsNullOrWhiteSpace(moduleInput.Name)
                 || string.IsNullOrWhiteSpace(moduleInput.FilePath))
             {
-                items.Add(new
+                items.Add(new Dictionary<string, object?>
                 {
-                    deploymentOrder = i + 1,
-                    moduleInput.Schema,
-                    moduleInput.Name,
-                    filePath = moduleInput.FilePath,
-                    status = "local_missing",
-                    error = "schema, name, and filePath are required."
+                    ["deploymentOrder"] = i + 1,
+                    ["schema"] = moduleInput.Schema,
+                    ["name"] = moduleInput.Name,
+                    ["filePath"] = moduleInput.FilePath,
+                    ["status"] = "local_invalid",
+                    ["deploymentState"] = "inconclusive",
+                    ["matched"] = false,
+                    ["staticValidationState"] = "error",
+                    ["warnings"] = Array.Empty<string>(),
+                    ["errorCode"] = ErrorCodes.ConfigInvalid,
+                    ["error"] = "schema, name, and filePath are required."
                 });
                 continue;
             }
@@ -1797,15 +2531,20 @@ public sealed class SqlMetadataService
             }
             catch (SqlMcpException ex)
             {
-                items.Add(new
+                var localMissing = ex.ErrorCode == ErrorCodes.LocalMissing;
+                items.Add(new Dictionary<string, object?>
                 {
-                    deploymentOrder = i + 1,
-                    moduleInput.Schema,
-                    moduleInput.Name,
-                    filePath = moduleInput.FilePath,
-                    status = "local_missing",
-                    errorCode = ex.ErrorCode,
-                    error = ex.Message
+                    ["deploymentOrder"] = i + 1,
+                    ["schema"] = moduleInput.Schema,
+                    ["name"] = moduleInput.Name,
+                    ["filePath"] = moduleInput.FilePath,
+                    ["status"] = localMissing ? "local_missing" : "local_invalid",
+                    ["deploymentState"] = "inconclusive",
+                    ["matched"] = false,
+                    ["staticValidationState"] = "error",
+                    ["warnings"] = Array.Empty<string>(),
+                    ["errorCode"] = ex.ErrorCode,
+                    ["error"] = ex.Message
                 });
                 continue;
             }
@@ -1815,11 +2554,17 @@ public sealed class SqlMetadataService
                 script,
                 file.FullName,
                 plannedModules,
+                detailLevel: "summary",
                 cancellationToken);
             var validation = JsonSerializer.SerializeToElement(validationObject, JsonResponse.Options);
             var localSyntaxValid = validation.GetProperty("localSyntaxValid").GetBoolean();
             var referencedObjectsValid = validation.GetProperty("referencedObjectsValid").GetBoolean();
-            var readyToDeploy = validation.GetProperty("readyToDeploy").GetBoolean();
+            var staticValidationPassed = validation.GetProperty("staticValidationPassed").GetBoolean();
+            var staticValidationState = validation.GetProperty("staticValidationState").GetString() ?? "valid";
+            var warnings = validation.GetProperty("warnings").EnumerateArray()
+                .Select(value => value.GetString())
+                .OfType<string>()
+                .ToArray();
             try
             {
                 var databaseModule = await GetModuleDefinitionCoreAsync(
@@ -1831,69 +2576,307 @@ public sealed class SqlMetadataService
                     file,
                     diffOptions,
                     cancellationToken);
-                items.Add(new
+                var matched = comparison.DifferenceKind is "exact_match" or "wrapper_only" or "format_only" or "comment_only";
+                var deploymentAssessment = EvaluateDeploymentReadiness(
+                    staticValidationPassed,
+                    matched ? "equivalent" : "definition_mismatch");
+                var readyToDeployContract = BuildReadyToDeployContract(
+                    staticValidationPassed,
+                    deploymentAssessment.DeploymentReady,
+                    preserveLegacyStaticSemantics: true);
+                var item = new Dictionary<string, object?>
                 {
-                    deploymentOrder = i + 1,
-                    schema = databaseModule.Schema,
-                    name = databaseModule.Name,
-                    filePath = file.FullName,
-                    status = comparison.DifferenceKind,
-                    matched = comparison.DifferenceKind is "exact_match" or "wrapper_only" or "format_only" or "comment_only",
-                    localSyntaxValid,
-                    referencedObjectsValid,
-                    readyToDeploy,
-                    comparison
-                });
+                    ["deploymentOrder"] = i + 1,
+                    ["schema"] = databaseModule.Schema,
+                    ["name"] = databaseModule.Name,
+                    ["filePath"] = file.FullName,
+                    ["status"] = comparison.DifferenceKind,
+                    ["deploymentState"] = matched ? "equivalent" : "definition_mismatch",
+                    ["matched"] = matched,
+                    ["localSyntaxValid"] = localSyntaxValid,
+                    ["referencedObjectsValid"] = referencedObjectsValid,
+                    ["staticValidationPassed"] = staticValidationPassed,
+                    ["deploymentReady"] = deploymentAssessment.DeploymentReady,
+                    ["readyToDeploy"] = readyToDeployContract.ReadyToDeploy,
+                    ["readyToDeploySemantics"] = readyToDeployContract.Semantics,
+                    ["readyToDeployDeprecated"] = readyToDeployContract.Deprecated,
+                    ["targetDriftDetected"] = deploymentAssessment.TargetDriftDetected,
+                    ["deploymentRisk"] = comparison.DeploymentRisk,
+                    ["staticValidationState"] = staticValidationState,
+                    ["warnings"] = warnings,
+                    ["summary"] = comparison.Summary
+                };
+                if (effectiveIncludeDiff)
+                {
+                    item["comparison"] = comparison;
+                    item["diff"] = comparison.Diff;
+                }
+
+                items.Add(item);
             }
             catch (SqlMcpException ex) when (ex.ErrorCode == ErrorCodes.ObjectNotFound)
             {
-                items.Add(new
+                var deploymentAssessment = EvaluateDeploymentReadiness(staticValidationPassed, "target_missing");
+                var readyToDeployContract = BuildReadyToDeployContract(
+                    staticValidationPassed,
+                    deploymentAssessment.DeploymentReady,
+                    preserveLegacyStaticSemantics: true);
+                var item = new Dictionary<string, object?>
                 {
-                    deploymentOrder = i + 1,
-                    schema = moduleInput.Schema,
-                    name = moduleInput.Name,
-                    filePath = file.FullName,
-                    status = "target_missing",
-                    matched = false,
-                    localSyntaxValid,
-                    referencedObjectsValid,
-                    readyToDeploy,
-                    validation = validationObject
-                });
+                    ["deploymentOrder"] = i + 1,
+                    ["schema"] = moduleInput.Schema,
+                    ["name"] = moduleInput.Name,
+                    ["filePath"] = file.FullName,
+                    ["status"] = "target_missing",
+                    ["deploymentState"] = "not_deployed",
+                    ["matched"] = false,
+                    ["localSyntaxValid"] = localSyntaxValid,
+                    ["referencedObjectsValid"] = referencedObjectsValid,
+                    ["staticValidationPassed"] = staticValidationPassed,
+                    ["deploymentReady"] = deploymentAssessment.DeploymentReady,
+                    ["readyToDeploy"] = readyToDeployContract.ReadyToDeploy,
+                    ["readyToDeploySemantics"] = readyToDeployContract.Semantics,
+                    ["readyToDeployDeprecated"] = readyToDeployContract.Deprecated,
+                    ["targetDriftDetected"] = false,
+                    ["staticValidationState"] = staticValidationState,
+                    ["warnings"] = warnings
+                };
+                if (effectiveIncludeDiff)
+                {
+                    item["validation"] = validationObject;
+                }
+
+                items.Add(item);
             }
             catch (SqlMcpException ex)
             {
-                items.Add(new
+                var readyToDeployContract = BuildReadyToDeployContract(
+                    staticValidationPassed,
+                    deploymentReady: false,
+                    preserveLegacyStaticSemantics: true);
+                items.Add(new Dictionary<string, object?>
                 {
-                    deploymentOrder = i + 1,
-                    schema = moduleInput.Schema,
-                    name = moduleInput.Name,
-                    filePath = file.FullName,
-                    status = "error",
-                    matched = false,
-                    localSyntaxValid,
-                    referencedObjectsValid,
-                    readyToDeploy = false,
-                    errorCode = ex.ErrorCode,
-                    error = ex.Message
+                    ["deploymentOrder"] = i + 1,
+                    ["schema"] = moduleInput.Schema,
+                    ["name"] = moduleInput.Name,
+                    ["filePath"] = file.FullName,
+                    ["status"] = "error",
+                    ["deploymentState"] = "inconclusive",
+                    ["matched"] = false,
+                    ["localSyntaxValid"] = localSyntaxValid,
+                    ["referencedObjectsValid"] = referencedObjectsValid,
+                    ["staticValidationPassed"] = staticValidationPassed,
+                    ["deploymentReady"] = false,
+                    ["readyToDeploy"] = readyToDeployContract.ReadyToDeploy,
+                    ["readyToDeploySemantics"] = readyToDeployContract.Semantics,
+                    ["readyToDeployDeprecated"] = readyToDeployContract.Deprecated,
+                    ["targetDriftDetected"] = false,
+                    ["staticValidationState"] = "error",
+                    ["warnings"] = warnings,
+                    ["errorCode"] = ex.ErrorCode,
+                    ["error"] = ex.Message
                 });
             }
         }
 
-        var serializedItems = items
-            .Select(item => JsonSerializer.SerializeToElement(item, JsonResponse.Options))
-            .ToArray();
-        var statusCounts = serializedItems
-            .Select(item => item.GetProperty("status").GetString() ?? "unknown")
+        var statusCounts = items
+            .Select(item => item["status"]?.ToString() ?? "unknown")
             .GroupBy(status => status, StringComparer.OrdinalIgnoreCase)
             .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        var selectedItems = onlyMismatches
+            ? items.Where(item => !string.Equals(item["deploymentState"]?.ToString(), "equivalent", StringComparison.OrdinalIgnoreCase)).ToList()
+            : items;
+        var projected = ProjectDeploymentItems(selectedItems, fields);
+        var budgeted = ApplyDeploymentTokenBudget(projected, maxTotalTokens);
         return new
         {
             count = items.Count,
+            returnedCount = budgeted.Items.Count,
+            filteredCount = items.Count - selectedItems.Count,
+            omittedCount = selectedItems.Count - budgeted.Items.Count,
             deploymentOrderPreserved = true,
+            diffMode = diffOptions.Mode,
+            onlyMismatches,
+            includeDiff = effectiveIncludeDiff,
+            maxTotalTokens = NormalizeDeploymentTokenBudget(maxTotalTokens),
             statusCounts,
-            items
+            deploymentState = AggregateDeploymentState(items.Select(item => item["deploymentState"]?.ToString() ?? "inconclusive")),
+            truncated = budgeted.Truncated,
+            truncationReason = budgeted.Truncated ? "maxTotalTokens" : null,
+            items = budgeted.Items
+        };
+    }
+
+    public async Task<object> VerifyDeploymentSetAsync(
+        DeploymentTableInput[]? tables,
+        DeploymentModuleInput[]? modules,
+        DeploymentConfigPatchInput[]? configPatches,
+        bool onlyMismatches,
+        bool includeDiff,
+        int? maxTotalTokens,
+        string[]? fields,
+        CancellationToken cancellationToken)
+    {
+        tables ??= [];
+        modules ??= [];
+        configPatches ??= [];
+        var requestedCount = tables.Length + modules.Length + configPatches.Length;
+        if (requestedCount == 0)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "At least one table, module, or config patch is required.");
+        }
+
+        if (requestedCount > 100)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Deployment set is too large.",
+                $"count={requestedCount}",
+                "Pass at most 100 combined deployment items.");
+        }
+
+        var items = new List<Dictionary<string, object?>>();
+        foreach (var table in tables)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            object result;
+            try
+            {
+                result = await CompareTableToFileAsync(
+                    table.Schema,
+                    table.Name,
+                    table.FilePath,
+                    includeDetails: includeDiff,
+                    includeDescriptions: table.IncludeDescriptions,
+                    maxTotalTokens: 50_000,
+                    fields: null,
+                    cancellationToken);
+            }
+            catch (SqlMcpException ex)
+            {
+                items.Add(BuildDeploymentErrorItem("table", table.Schema, table.Name, table.FilePath, ex));
+                continue;
+            }
+
+            var element = JsonSerializer.SerializeToElement(result, JsonResponse.Options);
+            var item = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["kind"] = "table",
+                ["schema"] = table.Schema,
+                ["name"] = table.Name,
+                ["filePath"] = table.FilePath,
+                ["status"] = GetJsonString(element, "status") ?? "inconclusive",
+                ["deploymentState"] = GetJsonString(element, "deploymentState") ?? "inconclusive",
+                ["staticValidationState"] = GetJsonString(element, "staticValidationState") ?? "valid",
+                ["warnings"] = GetJsonProperty(element, "warnings"),
+                ["summary"] = GetJsonString(element, "deploymentState") == "equivalent"
+                    ? "Target table structure is equivalent to the deployment script."
+                    : "Target table structure differs from the deployment script or could not be verified."
+            };
+            if (includeDiff)
+            {
+                item["details"] = element;
+                item["diff"] = GetJsonProperty(element, "differences");
+            }
+
+            items.Add(item);
+        }
+
+        if (modules.Length > 0)
+        {
+            var moduleResult = await CompareModulesToFilesAsync(
+                modules,
+                includeDiff ? "compact" : "summary",
+                onlyMismatches: false,
+                includeDiff,
+                maxTotalTokens: 50_000,
+                fields: null,
+                cancellationToken);
+            var moduleElement = JsonSerializer.SerializeToElement(moduleResult, JsonResponse.Options);
+            foreach (var moduleItem in moduleElement.GetProperty("items").EnumerateArray())
+            {
+                var item = moduleItem.EnumerateObject()
+                    .ToDictionary(property => property.Name, property => (object?)property.Value.Clone(), StringComparer.OrdinalIgnoreCase);
+                item["kind"] = "module";
+                items.Add(item);
+            }
+        }
+
+        foreach (var configPatch in configPatches)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            object result;
+            try
+            {
+                result = await VerifyConfigPatchFileAsync(
+                    configPatch.FilePath,
+                    configPatch.Profile,
+                    includeValues: includeDiff,
+                    cancellationToken);
+            }
+            catch (SqlMcpException ex)
+            {
+                items.Add(BuildDeploymentErrorItem(
+                    "config_patch",
+                    null,
+                    Path.GetFileName(configPatch.FilePath),
+                    configPatch.FilePath,
+                    ex));
+                continue;
+            }
+
+            var element = JsonSerializer.SerializeToElement(result, JsonResponse.Options);
+            var state = GetJsonString(element, "deploymentState") ?? "inconclusive";
+            var item = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["kind"] = "config_patch",
+                ["schema"] = null,
+                ["name"] = Path.GetFileName(configPatch.FilePath),
+                ["filePath"] = configPatch.FilePath,
+                ["profile"] = configPatch.Profile,
+                ["status"] = state,
+                ["deploymentState"] = state,
+                ["staticValidationState"] = GetJsonProperty(element, "syntaxValid") is JsonElement syntax && syntax.ValueKind == JsonValueKind.True
+                    ? "valid"
+                    : "warning",
+                ["warnings"] = GetJsonProperty(element, "diagnostics"),
+                ["summary"] = $"Configuration patch state is {state}."
+            };
+            if (includeDiff)
+            {
+                item["details"] = element;
+            }
+
+            items.Add(item);
+        }
+
+        var stateCounts = items.Select(item => item.GetValueOrDefault("deploymentState")?.ToString() ?? "inconclusive")
+            .GroupBy(state => state, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        var deploymentState = AggregateDeploymentState(items.Select(item => item.GetValueOrDefault("deploymentState")?.ToString() ?? "inconclusive"));
+        var selected = onlyMismatches
+            ? items.Where(item => item.GetValueOrDefault("deploymentState")?.ToString() is not ("deployed" or "equivalent")).ToList()
+            : items;
+        var projected = ProjectDeploymentItems(selected, fields);
+        var budgeted = ApplyDeploymentTokenBudget(projected, maxTotalTokens);
+        return new
+        {
+            deploymentState,
+            count = items.Count,
+            returnedCount = budgeted.Items.Count,
+            filteredCount = items.Count - selected.Count,
+            omittedCount = selected.Count - budgeted.Items.Count,
+            onlyMismatches,
+            includeDiff,
+            maxTotalTokens = NormalizeDeploymentTokenBudget(maxTotalTokens),
+            stateCounts,
+            truncated = budgeted.Truncated,
+            truncationReason = budgeted.Truncated ? "maxTotalTokens" : null,
+            items = budgeted.Items
         };
     }
 
@@ -2457,6 +3440,159 @@ public sealed class SqlMetadataService
         };
     }
 
+    public async Task<object> VerifyConfigPatchFileAsync(
+        string filePath,
+        string? profile,
+        bool includeValues,
+        CancellationToken cancellationToken)
+    {
+        var file = GetReadableCompareFile(filePath);
+        var script = await File.ReadAllTextAsync(file.FullName, Encoding.UTF8, cancellationToken);
+        var analysis = ConfigPatchAnalyzer.Analyze(script);
+        var targets = _options.TextSearch.Targets
+            .Where(target => target.Enabled)
+            .Where(target => string.IsNullOrWhiteSpace(profile)
+                             || target.Profile.Equals(profile, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var items = new List<object>();
+        foreach (var patch in analysis.Patches)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var matchingTargets = targets.Where(target =>
+                    target.Schema.Equals(patch.Schema, StringComparison.OrdinalIgnoreCase)
+                    && target.Table.Equals(patch.Table, StringComparison.OrdinalIgnoreCase)
+                    && target.TextColumn.Equals(patch.Column, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (matchingTargets.Length != 1)
+            {
+                items.Add(new
+                {
+                    patch.Schema,
+                    patch.Table,
+                    patch.Column,
+                    patch.Line,
+                    patch.Operation,
+                    deploymentState = "inconclusive",
+                    status = matchingTargets.Length == 0 ? "target_not_allowlisted" : "target_ambiguous",
+                    warning = "The patch target must match exactly one enabled textSearch target."
+                });
+                continue;
+            }
+
+            var target = matchingTargets[0];
+            var allowedLocators = GetConfigPatchLocatorColumns(target);
+            var locators = patch.Predicates
+                .Where(predicate => allowedLocators.Contains(predicate.Column))
+                .GroupBy(predicate => predicate.Column, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.Last())
+                .ToArray();
+            if (locators.Length == 0)
+            {
+                items.Add(new
+                {
+                    patch.Schema,
+                    patch.Table,
+                    patch.Column,
+                    patch.Line,
+                    patch.Operation,
+                    deploymentState = "inconclusive",
+                    status = "locator_missing",
+                    warning = "No equality predicate on an allow-listed locator column was found."
+                });
+                continue;
+            }
+
+            var parameters = locators.Select((locator, index) => new SqlParameter(
+                    $"@locator{index}",
+                    SqlDbType.NVarChar,
+                    4000)
+            {
+                Value = (object?)locator.Value ?? DBNull.Value
+            })
+                .ToArray();
+            var predicates = locators.Select((locator, index) => locator.Value is null
+                    ? $"{QuoteIdentifier(locator.Column)} IS NULL"
+                    : $"CONVERT(NVARCHAR(4000), {QuoteIdentifier(locator.Column)})=@locator{index}")
+                .ToArray();
+            var sql = $"""
+                       SELECT TOP (2)
+                           current_value=CONVERT(NVARCHAR(MAX), {QuoteIdentifier(target.TextColumn)})
+                       FROM {QuoteIdentifier(target.Schema)}.{QuoteIdentifier(target.Table)}
+                       WHERE {string.Join(" AND ", predicates)};
+                       """;
+            var currentRows = await QueryAsync(
+                sql,
+                parameters,
+                reader => reader.GetNullableString("current_value"),
+                cancellationToken);
+            if (currentRows.Count != 1)
+            {
+                items.Add(new
+                {
+                    profile = target.Profile,
+                    patch.Schema,
+                    patch.Table,
+                    patch.Column,
+                    patch.Line,
+                    patch.Operation,
+                    locator = locators,
+                    deploymentState = currentRows.Count == 0 ? "not_deployed" : "inconclusive",
+                    status = currentRows.Count == 0 ? "target_row_missing" : "target_row_ambiguous",
+                    rowCount = currentRows.Count
+                });
+                continue;
+            }
+
+            var currentValue = currentRows[0];
+            var state = ConfigPatchAnalyzer.EvaluateState(patch, currentValue);
+            items.Add(new
+            {
+                profile = target.Profile,
+                patch.Schema,
+                patch.Table,
+                patch.Column,
+                patch.Line,
+                patch.Operation,
+                locator = locators,
+                deploymentState = state,
+                status = state,
+                current = BuildConfigValueSummary(currentValue, includeValues),
+                expected = patch.Operation == "set_literal"
+                    ? BuildConfigValueSummary(patch.ExpectedValue, includeValues)
+                    : null,
+                replace = patch.Operation == "replace"
+                    ? new
+                    {
+                        oldValueSha256 = patch.OldValue is null ? null : ComputeSha256Hex(patch.OldValue),
+                        newValueSha256 = patch.NewValue is null ? null : ComputeSha256Hex(patch.NewValue),
+                        oldValue = includeValues ? TruncateConfigValue(patch.OldValue) : null,
+                        newValue = includeValues ? TruncateConfigValue(patch.NewValue) : null
+                    }
+                    : null
+            });
+        }
+
+        var itemElements = items.Select(item => JsonSerializer.SerializeToElement(item, JsonResponse.Options)).ToArray();
+        var states = itemElements.Select(item => item.GetProperty("deploymentState").GetString() ?? "inconclusive").ToArray();
+        var deploymentState = AggregateDeploymentState(states);
+        return new
+        {
+            filePath = file.FullName,
+            profile,
+            validationMode = "static_parse_and_allowlisted_readonly_lookup",
+            executed = false,
+            databaseWritten = false,
+            syntaxValid = analysis.SyntaxValid,
+            patchCount = analysis.Patches.Length,
+            verifiedCount = items.Count,
+            deploymentState,
+            statusCounts = states.GroupBy(state => state, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase),
+            diagnostics = analysis.Diagnostics,
+            items
+        };
+    }
+
     public async Task<object> FindFieldConsumersAsync(
         string column,
         string? schema,
@@ -3005,19 +4141,19 @@ public sealed class SqlMetadataService
                 "resolve_object" => await ResolveObjectAsync(
                     RequireBatchValue(request.Name, "name", operation),
                     request.Schema,
-                    null,
-                    10,
+                    request.ObjectTypes,
+                    request.Limit,
                     cancellationToken),
                 "describe_table" => await DescribeTableAsync(
                     request.Schema ?? "dbo",
                     RequireBatchValue(request.Name, "name", operation),
-                    "shape",
-                    null,
-                    null,
-                    null,
-                    null,
-                    null,
-                    null,
+                    request.Mode,
+                    request.Columns,
+                    request.IncludeIndexes,
+                    request.IncludeConstraints,
+                    request.IncludeForeignKeys,
+                    request.IncludeDefaults,
+                    request.IncludeDescriptions,
                     cancellationToken),
                 "get_indexes" => await GetIndexesAsync(
                     request.Schema ?? "dbo",
@@ -3025,39 +4161,53 @@ public sealed class SqlMetadataService
                     cancellationToken),
                 "find_column" => await FindColumnAsync(
                     RequireBatchValue(request.Column ?? request.Name, "column", operation),
-                    true,
-                    50,
-                    null,
+                    request.Exact ?? true,
+                    request.Limit,
+                    request.Cursor,
                     cancellationToken),
                 "get_module_definition" => await GetModuleDefinitionAsync(
                     request.Schema ?? "dbo",
                     RequireBatchValue(request.Name, "name", operation),
-                    null,
-                    null,
-                    null,
-                    null,
-                    3,
-                    null,
-                    null,
-                    null,
-                    null,
-                    true,
-                    false,
+                    request.Keyword,
+                    request.Keywords,
+                    request.StartLine,
+                    request.EndLine,
+                    request.ContextLines,
+                    request.BeforeLines,
+                    request.AfterLines,
+                    request.MaxMatches,
+                    request.Occurrence,
+                    request.CollapseOverlaps ?? true,
+                    request.IncludeLineNumbers ?? false,
                     cancellationToken),
                 "compare_module_to_file" => await CompareModuleToFileAsync(
                     request.Schema ?? "dbo",
                     RequireBatchValue(request.Name, "name", operation),
                     RequireBatchValue(request.FilePath, "filePath", operation),
-                    3,
-                    "summary",
-                    null,
-                    null,
+                    request.ContextLines,
+                    request.DiffMode ?? "summary",
+                    request.MaxHunks,
+                    request.MaxDiffLinesPerSide,
+                    cancellationToken),
+                "compare_table_to_file" => await CompareTableToFileAsync(
+                    request.Schema ?? "dbo",
+                    RequireBatchValue(request.Name, "name", operation),
+                    RequireBatchValue(request.FilePath, "filePath", operation),
+                    request.IncludeDetails ?? false,
+                    request.IncludeDescriptions ?? false,
+                    request.MaxTotalTokens,
+                    request.Fields,
+                    cancellationToken),
+                "verify_config_patch_file" => await VerifyConfigPatchFileAsync(
+                    RequireBatchValue(request.FilePath, "filePath", operation),
+                    request.Profile,
+                    request.IncludeValues ?? false,
                     cancellationToken),
                 _ => throw new SqlMcpException(
                     ErrorCodes.ConfigInvalid,
                     "Unsupported metadata batch operation.",
                     request.Operation,
-                    "Use resolve_object, describe_table, get_indexes, find_column, get_module_definition, or compare_module_to_file.")
+                    "Use resolve_object, describe_table, get_indexes, find_column, get_module_definition, compare_module_to_file, compare_table_to_file, or verify_config_patch_file.")
             };
             return new MetadataBatchItemResult(index, request.Operation ?? string.Empty, true, result, null);
         }
@@ -4298,6 +5448,231 @@ public sealed class SqlMetadataService
         }
     }
 
+    private async Task<TableSchemaModel> LoadTableSchemaModelAsync(
+        string schema,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        var dbObject = await GetObjectAsync(schema, name, ["U"], cancellationToken);
+        const string columnSql = """
+                                 SELECT
+                                     column_id=C.column_id,
+                                     column_name=C.name,
+                                     type_schema=SCHEMA_NAME(T.schema_id),
+                                     type_name=T.name,
+                                     is_user_defined=T.is_user_defined,
+                                     max_length=C.max_length,
+                                     precision=C.precision,
+                                     scale=C.scale,
+                                     is_nullable=C.is_nullable,
+                                     is_identity=CONVERT(bit, CASE WHEN IC.column_id IS NULL THEN 0 ELSE 1 END),
+                                     is_computed=C.is_computed,
+                                     computed_definition=CC.definition,
+                                     default_constraint_name=DC.name,
+                                     default_definition=DC.definition,
+                                     description=CONVERT(NVARCHAR(4000), EP.value)
+                                 FROM sys.columns C
+                                 INNER JOIN sys.types T ON T.user_type_id=C.user_type_id
+                                 LEFT JOIN sys.identity_columns IC ON IC.object_id=C.object_id AND IC.column_id=C.column_id
+                                 LEFT JOIN sys.computed_columns CC ON CC.object_id=C.object_id AND CC.column_id=C.column_id
+                                 LEFT JOIN sys.default_constraints DC ON DC.parent_object_id=C.object_id AND DC.parent_column_id=C.column_id
+                                 LEFT JOIN sys.extended_properties EP ON EP.class=1
+                                     AND EP.major_id=C.object_id
+                                     AND EP.minor_id=C.column_id
+                                     AND EP.name=N'MS_Description'
+                                 WHERE C.object_id=@objectId
+                                 ORDER BY C.column_id;
+                                 """;
+        var columns = await QueryAsync(
+            columnSql,
+            [new("@objectId", SqlDbType.Int) { Value = dbObject.ObjectId }],
+            reader => new TableColumnSpec(
+                reader.GetInt32("column_id"),
+                reader.GetString("column_name"),
+                TableScriptAnalyzer.BuildDatabaseTypeSignature(
+                    reader.GetString("type_schema"),
+                    reader.GetString("type_name"),
+                    reader.GetBoolean("is_user_defined"),
+                    reader.GetInt16("max_length"),
+                    reader.GetByte("precision"),
+                    reader.GetByte("scale")),
+                reader.GetBoolean("is_nullable"),
+                reader.GetBoolean("is_identity"),
+                reader.GetBoolean("is_computed"),
+                TableScriptAnalyzer.NormalizeExpression(reader.GetNullableString("computed_definition")),
+                reader.GetNullableString("default_constraint_name"),
+                TableScriptAnalyzer.NormalizeExpression(reader.GetNullableString("default_definition")),
+                reader.GetNullableString("description")),
+            cancellationToken);
+
+        const string indexSql = """
+                                SELECT
+                                    index_id=I.index_id,
+                                    index_name=I.name,
+                                    type_desc=I.type_desc,
+                                    is_unique=I.is_unique,
+                                    is_primary_key=I.is_primary_key,
+                                    filter_definition=I.filter_definition,
+                                    key_ordinal=IC.key_ordinal,
+                                    index_column_id=IC.index_column_id,
+                                    is_included_column=IC.is_included_column,
+                                    is_descending_key=IC.is_descending_key,
+                                    column_name=C.name
+                                FROM sys.indexes I
+                                LEFT JOIN sys.index_columns IC ON IC.object_id=I.object_id AND IC.index_id=I.index_id
+                                LEFT JOIN sys.columns C ON C.object_id=IC.object_id AND C.column_id=IC.column_id
+                                WHERE I.object_id=@objectId AND I.index_id>0 AND I.is_hypothetical=0
+                                ORDER BY I.index_id, IC.key_ordinal, IC.index_column_id;
+                                """;
+        var indexRows = await QueryAsync(
+            indexSql,
+            [new("@objectId", SqlDbType.Int) { Value = dbObject.ObjectId }],
+            reader => new IndexRow(
+                reader.GetInt32("index_id"),
+                reader.GetNullableString("index_name"),
+                reader.GetString("type_desc"),
+                reader.GetBoolean("is_unique"),
+                reader.GetBoolean("is_primary_key"),
+                !string.IsNullOrWhiteSpace(reader.GetNullableString("filter_definition")),
+                reader.GetNullableString("filter_definition"),
+                reader.GetByte("key_ordinal"),
+                reader.GetInt32("index_column_id"),
+                reader.GetBoolean("is_included_column"),
+                reader.GetBoolean("is_descending_key"),
+                reader.GetNullableString("column_name")),
+            cancellationToken);
+        var indexes = indexRows
+            .GroupBy(row => row.IndexId)
+            .Select(group =>
+            {
+                var first = group.First();
+                return new TableIndexSpec(
+                    first.IndexName,
+                    first.TypeDesc.StartsWith("CLUSTERED", StringComparison.OrdinalIgnoreCase) ? "CLUSTERED" : "NONCLUSTERED",
+                    first.IsUnique,
+                    first.IsPrimaryKey,
+                    group.Where(row => !row.IsIncludedColumn && row.KeyOrdinal > 0 && row.ColumnName is not null)
+                        .OrderBy(row => row.KeyOrdinal)
+                        .Select(row => new TableKeyColumnSpec(row.ColumnName!, row.IsDescendingKey))
+                        .ToArray(),
+                    group.Where(row => row.IsIncludedColumn && row.ColumnName is not null)
+                        .OrderBy(row => row.IndexColumnId)
+                        .Select(row => row.ColumnName!)
+                        .ToArray(),
+                    TableScriptAnalyzer.NormalizeExpression(first.FilterDefinition));
+            })
+            .ToArray();
+
+        const string keySql = """
+                              SELECT
+                                  constraint_name=KC.name,
+                                  constraint_type=KC.type,
+                                  column_name=C.name,
+                                  key_ordinal=IC.key_ordinal,
+                                  is_descending_key=IC.is_descending_key
+                              FROM sys.key_constraints KC
+                              INNER JOIN sys.index_columns IC ON IC.object_id=KC.parent_object_id AND IC.index_id=KC.unique_index_id AND IC.key_ordinal>0
+                              INNER JOIN sys.columns C ON C.object_id=IC.object_id AND C.column_id=IC.column_id
+                              WHERE KC.parent_object_id=@objectId
+                              ORDER BY KC.name, IC.key_ordinal;
+                              """;
+        var keyRows = await QueryAsync(
+            keySql,
+            [new("@objectId", SqlDbType.Int) { Value = dbObject.ObjectId }],
+            reader => new
+            {
+                Name = reader.GetString("constraint_name"),
+                Type = reader.GetString("constraint_type").Trim() == "PK" ? "PRIMARY_KEY" : "UNIQUE",
+                Column = reader.GetString("column_name"),
+                Ordinal = reader.GetByte("key_ordinal"),
+                Descending = reader.GetBoolean("is_descending_key")
+            },
+            cancellationToken);
+        var keys = keyRows.GroupBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => new TableKeyConstraintSpec(
+                group.Key,
+                group.First().Type,
+                group.OrderBy(row => row.Ordinal).Select(row => new TableKeyColumnSpec(row.Column, row.Descending)).ToArray()))
+            .ToArray();
+
+        var defaults = columns
+            .Where(column => !string.IsNullOrWhiteSpace(column.DefaultDefinition))
+            .Select(column => new TableDefaultConstraintSpec(
+                column.DefaultConstraintName,
+                column.Name,
+                column.DefaultDefinition!))
+            .ToArray();
+        const string checkSql = """
+                                SELECT constraint_name=name, definition
+                                FROM sys.check_constraints
+                                WHERE parent_object_id=@objectId
+                                ORDER BY name;
+                                """;
+        var checks = await QueryAsync(
+            checkSql,
+            [new("@objectId", SqlDbType.Int) { Value = dbObject.ObjectId }],
+            reader => new TableCheckConstraintSpec(
+                reader.GetString("constraint_name"),
+                TableScriptAnalyzer.NormalizeExpression(reader.GetNullableString("definition"))),
+            cancellationToken);
+
+        const string foreignKeySql = """
+                                     SELECT
+                                         foreign_key_name=FK.name,
+                                         parent_column=PC.name,
+                                         referenced_schema=RS.name,
+                                         referenced_table=RT.name,
+                                         referenced_column=RC.name,
+                                         constraint_column_id=FKC.constraint_column_id,
+                                         delete_action=FK.delete_referential_action_desc,
+                                         update_action=FK.update_referential_action_desc
+                                     FROM sys.foreign_keys FK
+                                     INNER JOIN sys.foreign_key_columns FKC ON FKC.constraint_object_id=FK.object_id
+                                     INNER JOIN sys.columns PC ON PC.object_id=FKC.parent_object_id AND PC.column_id=FKC.parent_column_id
+                                     INNER JOIN sys.tables RT ON RT.object_id=FK.referenced_object_id
+                                     INNER JOIN sys.schemas RS ON RS.schema_id=RT.schema_id
+                                     INNER JOIN sys.columns RC ON RC.object_id=FKC.referenced_object_id AND RC.column_id=FKC.referenced_column_id
+                                     WHERE FK.parent_object_id=@objectId
+                                     ORDER BY FK.name, FKC.constraint_column_id;
+                                     """;
+        var foreignKeyRows = await QueryAsync(
+            foreignKeySql,
+            [new("@objectId", SqlDbType.Int) { Value = dbObject.ObjectId }],
+            reader => new
+            {
+                Name = reader.GetString("foreign_key_name"),
+                ParentColumn = reader.GetString("parent_column"),
+                ReferencedSchema = reader.GetString("referenced_schema"),
+                ReferencedTable = reader.GetString("referenced_table"),
+                ReferencedColumn = reader.GetString("referenced_column"),
+                Ordinal = reader.GetInt32("constraint_column_id"),
+                DeleteAction = reader.GetString("delete_action"),
+                UpdateAction = reader.GetString("update_action")
+            },
+            cancellationToken);
+        var foreignKeys = foreignKeyRows.GroupBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => new TableForeignKeySpec(
+                group.Key,
+                group.OrderBy(row => row.Ordinal).Select(row => row.ParentColumn).ToArray(),
+                group.First().ReferencedSchema,
+                group.First().ReferencedTable,
+                group.OrderBy(row => row.Ordinal).Select(row => row.ReferencedColumn).ToArray(),
+                group.First().DeleteAction,
+                group.First().UpdateAction))
+            .ToArray();
+
+        return new TableSchemaModel(
+            dbObject.Schema,
+            dbObject.Name,
+            columns.ToArray(),
+            indexes,
+            keys,
+            defaults,
+            checks.ToArray(),
+            foreignKeys,
+            dbObject.Description);
+    }
+
     private Task<object[]> GetColumnsAsync(int objectId, CancellationToken cancellationToken)
     {
         return GetColumnsAsync(objectId, true, true, null, cancellationToken);
@@ -4983,6 +6358,11 @@ public sealed class SqlMetadataService
                                object_type_desc=O.type_desc,
                                create_date=O.create_date,
                                modify_date=O.modify_date,
+                               has_view_definition=HAS_PERMS_BY_NAME(
+                                   QUOTENAME(S.name) + N'.' + QUOTENAME(O.name),
+                                   N'OBJECT',
+                                   N'VIEW DEFINITION'),
+                               is_encrypted=CONVERT(INT, OBJECTPROPERTYEX(O.object_id, N'IsEncrypted')),
                                definition=OBJECT_DEFINITION(O.object_id)
                            FROM sys.objects O
                            INNER JOIN sys.schemas S ON S.schema_id=O.schema_id
@@ -5004,6 +6384,8 @@ public sealed class SqlMetadataService
                 reader.GetString("object_type_desc"),
                 reader.GetDateTime("create_date"),
                 reader.GetDateTime("modify_date"),
+                ReadNullablePermission(reader.GetNullableInt32("has_view_definition")),
+                ReadNullablePermission(reader.GetNullableInt32("is_encrypted")),
                 reader.GetNullableString("definition") ?? string.Empty),
             cancellationToken);
 
@@ -5015,14 +6397,53 @@ public sealed class SqlMetadataService
 
         if (string.IsNullOrWhiteSpace(module.Definition))
         {
-            throw new SqlMcpException(
-                ErrorCodes.ViewDefinitionPermissionRequired,
-                $"Definition for '{schema}.{name}' is not available.",
-                "OBJECT_DEFINITION returned NULL.",
-                "Grant VIEW DEFINITION to the MCP SQL login, or inspect the module definition from source control.");
+            throw BuildModuleDefinitionUnavailableException(
+                module.Schema,
+                module.Name,
+                module.HasViewDefinition,
+                module.IsEncrypted);
         }
 
         return module;
+    }
+
+    internal static SqlMcpException BuildModuleDefinitionUnavailableException(
+        string schema,
+        string name,
+        bool? hasViewDefinition,
+        bool? isEncrypted)
+    {
+        var qualifiedName = $"{schema}.{name}";
+        if (hasViewDefinition is false)
+        {
+            return new SqlMcpException(
+                ErrorCodes.ViewDefinitionPermissionRequired,
+                $"Definition for '{qualifiedName}' is not available because the database user lacks effective VIEW DEFINITION permission.",
+                "OBJECT_DEFINITION returned NULL and object-level HAS_PERMS_BY_NAME for VIEW DEFINITION returned 0.",
+                "Ask an authorized database administrator to grant VIEW DEFINITION on the target object, schema, or database to the mapped database user. The MCP does not execute GRANT statements.");
+        }
+
+        var permissionDetail = hasViewDefinition is true
+            ? "object-level HAS_PERMS_BY_NAME for VIEW DEFINITION returned 1"
+            : "effective object-level VIEW DEFINITION permission could not be determined";
+        var encryptionDetail = isEncrypted switch
+        {
+            true => "OBJECTPROPERTYEX reports that the module is encrypted",
+            false => "OBJECTPROPERTYEX reports that the module is not encrypted",
+            _ => "the module encryption state could not be determined"
+        };
+        var hint = isEncrypted switch
+        {
+            true => "SQL Server reports that the module is encrypted. Compare it with controlled source control or the approved deployment artifact; granting VIEW DEFINITION will not expose encrypted text.",
+            false => "SQL Server reports that the module is not encrypted, but its definition is otherwise unavailable. Compare it with controlled source control or the approved deployment artifact.",
+            _ => "The module may be encrypted or otherwise unavailable. Compare it with controlled source control or the approved deployment artifact; do not assume that granting VIEW DEFINITION will expose the text."
+        };
+
+        return new SqlMcpException(
+            ErrorCodes.ModuleDefinitionNotAvailable,
+            $"Definition for '{qualifiedName}' is unavailable; missing VIEW DEFINITION permission was not established.",
+            $"OBJECT_DEFINITION returned NULL; {permissionDetail}; {encryptionDetail}.",
+            hint);
     }
 
     private static FileInfo GetReadableCompareFile(string filePath)
@@ -5044,7 +6465,7 @@ public sealed class SqlMetadataService
         var file = new FileInfo(filePath);
         if (!file.Exists)
         {
-            throw new SqlMcpException(ErrorCodes.ConfigInvalid, "Local compare file was not found.", file.FullName);
+            throw new SqlMcpException(ErrorCodes.LocalMissing, "Local compare file was not found.", file.FullName);
         }
 
         if (file.Length > MaxCompareFileBytes)
@@ -5111,6 +6532,11 @@ public sealed class SqlMetadataService
             bodyMatch,
             semanticMatch,
             formatAndCommentMatch);
+        var deploymentRisk = BuildModuleDeploymentRisk(
+            module.Definition,
+            fileText,
+            differenceKind,
+            diff);
         var ignoredWrapperDifferences = DetectIgnoredWrapperDifferences(module.Definition, fileText);
         var firstBodyDifference = FindFirstBodyDifference(module.Definition, fileText);
         var changedLineSummary = BuildChangedLineSummary(diff);
@@ -5154,6 +6580,7 @@ public sealed class SqlMetadataService
             bodyMatch,
             semanticMatch,
             differenceKind,
+            deploymentRisk,
             ignoredWrapperDifferences,
             firstBodyDifference,
             changedLineSummary,
@@ -5314,6 +6741,113 @@ public sealed class SqlMetadataService
             diff.Hunks.Sum(hunk => hunk.DatabaseLines.Length + hunk.FileLines.Length));
     }
 
+    internal static ModuleDeploymentRisk BuildModuleDeploymentRisk(
+        string databaseDefinition,
+        string fileText,
+        string differenceKind,
+        ModuleFileDiff diff)
+    {
+        if (!differenceKind.Equals("body_changed", StringComparison.OrdinalIgnoreCase))
+        {
+            return new ModuleDeploymentRisk(
+                "none",
+                false,
+                [],
+                "No SQL body drift was detected.",
+                diff.TotalHunkCount,
+                diff.ReturnedHunkCount,
+                diff.OmittedHunkCount,
+                EmptyIdentifierSummary(),
+                EmptyIdentifierSummary(),
+                EmptyIdentifierSummary());
+        }
+
+        var databaseLines = SplitDefinitionLines(databaseDefinition);
+        var fileLines = SplitDefinitionLines(fileText);
+        var segments = BuildDiffChangeSegments(databaseLines, fileLines);
+        var targetIdentifiers = ExtractChangedIdentifiers(databaseLines, segments, databaseSide: true);
+        var localIdentifiers = ExtractChangedIdentifiers(fileLines, segments, databaseSide: false);
+        var affectedIdentifiers = targetIdentifiers
+            .Concat(localIdentifiers)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var targetOnlyIdentifiers = targetIdentifiers
+            .Except(localIdentifiers, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var localOnlyIdentifiers = localIdentifiers
+            .Except(targetIdentifiers, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var potentialRegression = diff.DatabaseChangedLineCount > 0;
+
+        return new ModuleDeploymentRisk(
+            "high",
+            potentialRegression,
+            potentialRegression
+                ? ["TARGET_BODY_DRIFT", "TARGET_LOGIC_MAY_BE_OVERWRITTEN"]
+                : ["LOCAL_BODY_DRIFT"],
+            potentialRegression
+                ? "The target contains changed body text that is not identical to the local file. Deploying the local file may overwrite target-only production logic; review every hunk before deployment."
+                : "The local SQL body differs from the target and requires review before deployment.",
+            diff.TotalHunkCount,
+            diff.ReturnedHunkCount,
+            diff.OmittedHunkCount,
+            BuildIdentifierSummary(affectedIdentifiers),
+            BuildIdentifierSummary(targetOnlyIdentifiers),
+            BuildIdentifierSummary(localOnlyIdentifiers));
+    }
+
+    private static ModuleRiskIdentifierSummary EmptyIdentifierSummary() => new(0, 0, 0, []);
+
+    private static ModuleRiskIdentifierSummary BuildIdentifierSummary(string[] identifiers)
+    {
+        const int maxReturnedIdentifiers = 200;
+        var returned = identifiers.Take(maxReturnedIdentifiers).ToArray();
+        return new ModuleRiskIdentifierSummary(
+            identifiers.Length,
+            returned.Length,
+            identifiers.Length - returned.Length,
+            returned);
+    }
+
+    private static string[] ExtractChangedIdentifiers(
+        string[] lines,
+        IReadOnlyList<DiffChangeSegment> segments,
+        bool databaseSide)
+    {
+        var identifiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var segment in segments)
+        {
+            var startIndex = databaseSide ? segment.DatabaseStartIndex : segment.FileStartIndex;
+            var endIndex = databaseSide ? segment.DatabaseEndIndex : segment.FileEndIndex;
+            if (endIndex < startIndex)
+            {
+                continue;
+            }
+
+            for (var index = Math.Max(0, startIndex); index <= endIndex && index < lines.Length; index++)
+            {
+                foreach (Match match in SqlIdentifierCandidateRegex.Matches(lines[index]))
+                {
+                    var value = match.Value;
+                    if (value.StartsWith('[') && value.EndsWith(']'))
+                    {
+                        value = value[1..^1].Replace("]]", "]", StringComparison.Ordinal);
+                    }
+
+                    if (value.Length > 0 && !SqlIdentifierKeywords.Contains(value))
+                    {
+                        identifiers.Add(value);
+                    }
+                }
+            }
+        }
+
+        return identifiers.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
     internal static string[] BuildModuleCompareNextActions(ModuleBodyDifference? firstBodyDifference, ModuleFileDiff diff)
     {
         var nextActions = new List<string>();
@@ -5410,7 +6944,7 @@ public sealed class SqlMetadataService
         var firstBodyText = firstBodyDifference is null
             ? "firstBodyDifference=none"
             : $"firstBodyDifference=body:{firstBodyDifference.BodyLine},db:{FormatNullableInt(firstBodyDifference.DatabaseLine)},file:{FormatNullableInt(firstBodyDifference.FileLine)}";
-        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; bodyMatch={FormatBool(bodyMatch)}; semanticMatch={FormatBool(semanticMatch)}; {diff.Hunks.Length} hunks; changedLines=db:{changedLineSummary.Database},file:{changedLineSummary.File}; returnedDiffLines={changedLineSummary.Returned}; {firstBodyText}; {truncatedText}";
+        return $"{differenceKind}; selected {file.Name}; exactMatch={FormatBool(exactMatch)}; normalizedMatch={FormatBool(normalizedMatch)}; bodyMatch={FormatBool(bodyMatch)}; semanticMatch={FormatBool(semanticMatch)}; hunks=total:{diff.TotalHunkCount},returned:{diff.ReturnedHunkCount},omitted:{diff.OmittedHunkCount}; changedLines=db:{changedLineSummary.Database},file:{changedLineSummary.File}; returnedDiffLines={changedLineSummary.Returned}; {firstBodyText}; {truncatedText}";
     }
 
     private static string FormatBool(bool value)
@@ -5973,7 +7507,7 @@ public sealed class SqlMetadataService
         var segments = BuildDiffChangeSegments(databaseLines, fileLines);
         if (segments.Count == 0)
         {
-            return new ModuleFileDiff(true, null, 0, 0, options.Mode, false, 0, []);
+            return new ModuleFileDiff(true, null, 0, 0, options.Mode, false, 0, 0, 0, []);
         }
 
         var hunks = segments
@@ -5990,6 +7524,8 @@ public sealed class SqlMetadataService
             segments.Sum(segment => segment.FileChangedLineCount),
             options.Mode,
             omittedHunkCount > 0 || linesTruncated,
+            hunks.Length,
+            visibleHunks.Length,
             omittedHunkCount,
             visibleHunks);
     }
@@ -7219,6 +8755,320 @@ public sealed class SqlMetadataService
         };
     }
 
+    private static HashSet<string> GetConfigPatchLocatorColumns(TextSearchTargetOptions target)
+    {
+        return new[]
+            {
+                target.KeyColumn,
+                target.NameColumn,
+                target.ContentKindColumn,
+                target.CreatedAtColumn,
+                target.UpdatedAtColumn,
+                target.CreatedByColumn,
+                target.UpdatedByColumn
+            }
+            .Concat(target.LabelColumns)
+            .Where(column => !string.IsNullOrWhiteSpace(column))
+            .Select(column => column!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private object BuildConfigValueSummary(string? value, bool includeValue)
+    {
+        return new
+        {
+            isNull = value is null,
+            length = value?.Length,
+            sha256 = value is null ? null : ComputeSha256Hex(value),
+            value = includeValue ? TruncateConfigValue(value) : null
+        };
+    }
+
+    private string? TruncateConfigValue(string? value)
+    {
+        if (value is null || value.Length <= _options.Limits.MaxTextLength)
+        {
+            return value;
+        }
+
+        return string.Concat(value.AsSpan(0, _options.Limits.MaxTextLength), "...<truncated>");
+    }
+
+    internal static string AggregateDeploymentState(IEnumerable<string> states)
+    {
+        var values = states.Where(state => !string.IsNullOrWhiteSpace(state)).ToArray();
+        if (values.Length == 0)
+        {
+            return "inconclusive";
+        }
+
+        if (values.Any(state => state.Equals("inconclusive", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "inconclusive";
+        }
+
+        if (values.Any(state => state.Equals("definition_mismatch", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "definition_mismatch";
+        }
+
+        if (values.All(state => state is "deployed" or "equivalent"))
+        {
+            return "deployed";
+        }
+
+        if (values.All(state => state.Equals("not_deployed", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "not_deployed";
+        }
+
+        return "partially_deployed";
+    }
+
+    internal static Dictionary<string, object?> FinalizeTableComparisonResult(
+        Dictionary<string, object?> result,
+        bool includeDetails,
+        string[]? fields,
+        int? maxTotalTokens)
+    {
+        var requestedFields = fields?
+            .Where(field => !string.IsNullOrWhiteSpace(field))
+            .Select(field => field.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        string[] essentialFields =
+        [
+            "schema",
+            "name",
+            "filePath",
+            "status",
+            "deploymentState",
+            "equivalent",
+            "staticValidationState",
+            "warnings",
+            "descriptionsCompared",
+            "differenceCount",
+            "differenceSummary",
+            "diagnosticCount"
+        ];
+        var projected = requestedFields is null || requestedFields.Count == 0
+            ? new Dictionary<string, object?>(result, StringComparer.OrdinalIgnoreCase)
+            : result
+                .Where(pair => essentialFields.Contains(pair.Key, StringComparer.OrdinalIgnoreCase)
+                               || requestedFields.Contains(pair.Key))
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+        var normalizedBudget = NormalizeDeploymentTokenBudget(maxTotalTokens);
+        projected["includeDetailsRequested"] = includeDetails;
+        projected["detailsIncluded"] = includeDetails
+                                       && projected.Keys.Any(key => key is "local" or "target" or "differences" or "diagnostics" or "analysis");
+        projected["maxTotalTokens"] = normalizedBudget;
+        projected["truncated"] = false;
+        projected["truncationReason"] = null;
+        projected["omittedDifferenceCount"] = 0;
+
+        var maxCharacters = normalizedBudget * 4;
+        if (JsonSerializer.Serialize(projected, JsonResponse.Options).Length <= maxCharacters)
+        {
+            return projected;
+        }
+
+        string[] detailFields = ["local", "target", "differences", "diagnostics", "analysis"];
+        var availableDetails = detailFields
+            .Where(projected.ContainsKey)
+            .ToDictionary(field => field, field => projected[field], StringComparer.OrdinalIgnoreCase);
+        foreach (var detailField in detailFields)
+        {
+            projected.Remove(detailField);
+        }
+
+        var differences = availableDetails.TryGetValue("differences", out var rawDifferences)
+            ? EnumerateDetailItems(rawDifferences)
+            : [];
+        var returnedDifferences = new List<object?>();
+        foreach (var difference in differences)
+        {
+            var candidateDifferences = returnedDifferences.Append(difference).ToArray();
+            projected["differences"] = candidateDifferences;
+            projected["omittedDifferenceCount"] = differences.Count - candidateDifferences.Length;
+            projected["detailsIncluded"] = true;
+            projected["truncated"] = projected["omittedDifferenceCount"] is > 0;
+            projected["truncationReason"] = projected["truncated"] is true ? "maxTotalTokens" : null;
+            if (JsonSerializer.Serialize(projected, JsonResponse.Options).Length > maxCharacters)
+            {
+                projected.Remove("differences");
+                projected["detailsIncluded"] = returnedDifferences.Count > 0;
+                break;
+            }
+
+            returnedDifferences.Add(difference);
+        }
+
+        if (returnedDifferences.Count > 0)
+        {
+            projected["differences"] = returnedDifferences.ToArray();
+        }
+
+        projected["omittedDifferenceCount"] = differences.Count - returnedDifferences.Count;
+        if (returnedDifferences.Count == differences.Count)
+        {
+            foreach (var detailField in new[] { "diagnostics", "analysis", "local", "target" })
+            {
+                if (!availableDetails.TryGetValue(detailField, out var detail))
+                {
+                    continue;
+                }
+
+                projected[detailField] = detail;
+                if (JsonSerializer.Serialize(projected, JsonResponse.Options).Length > maxCharacters)
+                {
+                    projected.Remove(detailField);
+                }
+            }
+        }
+
+        var includedDetails = detailFields.Any(projected.ContainsKey);
+        var omittedDetails = availableDetails.Keys.Any(field => !projected.ContainsKey(field))
+                             || returnedDifferences.Count < differences.Count;
+        projected["detailsIncluded"] = includedDetails;
+        projected["truncated"] = omittedDetails;
+        projected["truncationReason"] = omittedDetails ? "maxTotalTokens" : null;
+        return projected;
+    }
+
+    private static List<object?> EnumerateDetailItems(object? value)
+    {
+        if (value is null || value is string)
+        {
+            return [];
+        }
+
+        if (value is JsonElement { ValueKind: JsonValueKind.Array } json)
+        {
+            return json.EnumerateArray().Select(item => (object?)item.Clone()).ToList();
+        }
+
+        if (value is System.Collections.IEnumerable enumerable)
+        {
+            return enumerable.Cast<object?>().ToList();
+        }
+
+        return [];
+    }
+
+    private static List<Dictionary<string, object?>> ProjectDeploymentItems(
+        IEnumerable<Dictionary<string, object?>> items,
+        string[]? fields)
+    {
+        var requested = fields?
+            .Where(field => !string.IsNullOrWhiteSpace(field))
+            .Select(field => field.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (requested is null || requested.Count == 0)
+        {
+            return items.Select(item => new Dictionary<string, object?>(item, StringComparer.OrdinalIgnoreCase)).ToList();
+        }
+
+        return items.Select(item => item
+                .Where(pair => requested.Contains(pair.Key))
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+    }
+
+    internal static Dictionary<string, object?> BuildDeploymentErrorItem(
+        string kind,
+        string? schema,
+        string? name,
+        string? filePath,
+        SqlMcpException exception)
+    {
+        var localMissing = exception.ErrorCode == ErrorCodes.LocalMissing;
+        return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["kind"] = kind,
+            ["schema"] = schema,
+            ["name"] = name,
+            ["filePath"] = filePath,
+            ["status"] = localMissing ? "local_missing" : "error",
+            ["deploymentState"] = exception.ErrorCode == ErrorCodes.ObjectNotFound ? "not_deployed" : "inconclusive",
+            ["staticValidationState"] = "error",
+            ["warnings"] = Array.Empty<string>(),
+            ["errorCode"] = exception.ErrorCode,
+            ["error"] = exception.Message
+        };
+    }
+
+    private static string? GetJsonString(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : null;
+    }
+
+    private static object? GetJsonProperty(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var property) ? property.Clone() : null;
+    }
+
+    private static DeploymentBudgetResult ApplyDeploymentTokenBudget(
+        IReadOnlyList<Dictionary<string, object?>> items,
+        int? maxTotalTokens)
+    {
+        var maxCharacters = NormalizeDeploymentTokenBudget(maxTotalTokens) * 4;
+        var selected = new List<(int Index, Dictionary<string, object?> Item)>();
+        var usedCharacters = 0;
+        foreach (var candidate in items
+                     .Select((item, index) => new { Item = item, Index = index })
+                     .OrderBy(candidate => string.Equals(
+                         candidate.Item.GetValueOrDefault("deploymentState")?.ToString(),
+                         "equivalent",
+                         StringComparison.OrdinalIgnoreCase))
+                     .ThenBy(candidate => candidate.Index))
+        {
+            var item = candidate.Item;
+            var length = JsonSerializer.Serialize(item, JsonResponse.Options).Length;
+            if (length > maxCharacters - usedCharacters)
+            {
+                item = MinimizeDeploymentItem(item);
+                length = JsonSerializer.Serialize(item, JsonResponse.Options).Length;
+            }
+
+            if (length > maxCharacters - usedCharacters)
+            {
+                continue;
+            }
+
+            selected.Add((candidate.Index, item));
+            usedCharacters += length;
+        }
+
+        return new DeploymentBudgetResult(
+            selected.OrderBy(item => item.Index).Select(item => item.Item).ToList(),
+            selected.Count != items.Count);
+    }
+
+    private static Dictionary<string, object?> MinimizeDeploymentItem(Dictionary<string, object?> item)
+    {
+        string[] essentialFields =
+        [
+            "deploymentOrder",
+            "kind",
+            "schema",
+            "name",
+            "filePath",
+            "status",
+            "deploymentState",
+            "staticValidationState",
+            "warnings",
+            "summary",
+            "errorCode",
+            "error"
+        ];
+        return item
+            .Where(pair => essentialFields.Contains(pair.Key, StringComparer.OrdinalIgnoreCase))
+            .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static int NormalizeDeploymentTokenBudget(int? requested) => Math.Clamp(requested ?? 4000, 512, 50_000);
+
     private static bool IsValidTextSearchTarget(TextSearchTargetOptions target)
     {
         return !string.IsNullOrWhiteSpace(target.Schema)
@@ -8306,6 +10156,8 @@ public sealed class SqlMetadataService
         string TypeDesc,
         DateTime CreateDate,
         DateTime ModifyDate,
+        bool? HasViewDefinition,
+        bool? IsEncrypted,
         string Definition);
 
     private sealed record ValidationObject(
@@ -8341,6 +10193,60 @@ public sealed class SqlMetadataService
         TsqlObjectValidation[] Objects,
         TsqlTypeValidation[] Types);
 
+    internal sealed record ServerLevelDmvAccess(
+        ServerLevelDmvSqlPermissions SqlServer,
+        ServerLevelDmvMcpPolicy McpPolicy,
+        bool EffectiveAccess,
+        string[] BlockedBy,
+        string[] Recommendations,
+        string FinalDecisionExplanation);
+
+    internal sealed record ServerLevelDmvSqlPermissions(
+        string RequiredPermission,
+        bool? HasRequiredPermission,
+        bool? HasViewServerPerformanceState,
+        bool? HasViewServerState);
+
+    internal sealed record ServerLevelDmvMcpPolicy(
+        bool AllowDmvQueries,
+        bool AllowServerLevelDmv,
+        bool Allowed);
+
+    internal sealed record HealthPermissionGuidance(
+        string[] Recommendations,
+        HealthAdminSqlSuggestion[] AdminSql,
+        string Notice,
+        bool AutomaticallyExecuted);
+
+    internal sealed record HealthAdminSqlSuggestion(
+        string Scope,
+        string PrincipalType,
+        string Principal,
+        string RequiredPermission,
+        string Description,
+        string Sql,
+        bool SuggestionOnly);
+
+    internal sealed record DeploymentReadiness(
+        string TargetComparisonState,
+        bool TargetCompared,
+        bool TargetDriftDetected,
+        bool DeploymentReady,
+        string RiskLevel,
+        string[] ReasonCodes);
+
+    internal sealed record ReadyToDeployContract(
+        bool ReadyToDeploy,
+        string Semantics,
+        bool Deprecated);
+
+    internal sealed record TargetComparisonFailure(
+        string ErrorCode,
+        string Message,
+        string? Detail,
+        string Hint,
+        string? RequiredPermission);
+
     private sealed record ModuleCompareDatabaseInfo(
         DateTime CreateDate,
         DateTime ModifyDate,
@@ -8373,6 +10279,7 @@ public sealed class SqlMetadataService
         bool BodyMatch,
         bool SemanticMatch,
         string DifferenceKind,
+        ModuleDeploymentRisk DeploymentRisk,
         string[] IgnoredWrapperDifferences,
         ModuleBodyDifference? FirstBodyDifference,
         ModuleChangedLineSummary ChangedLineSummary,
@@ -8420,8 +10327,28 @@ public sealed class SqlMetadataService
         int FileChangedLineCount,
         string Mode,
         bool Truncated,
+        int TotalHunkCount,
+        int ReturnedHunkCount,
         int OmittedHunkCount,
         ModuleFileDiffHunk[] Hunks);
+
+    internal sealed record ModuleDeploymentRisk(
+        string Level,
+        bool PotentialProductionRegression,
+        string[] ReasonCodes,
+        string Message,
+        int TotalHunkCount,
+        int ReturnedHunkCount,
+        int OmittedHunkCount,
+        ModuleRiskIdentifierSummary AffectedIdentifiers,
+        ModuleRiskIdentifierSummary TargetOnlyIdentifiers,
+        ModuleRiskIdentifierSummary LocalOnlyIdentifiers);
+
+    internal sealed record ModuleRiskIdentifierSummary(
+        int TotalCount,
+        int ReturnedCount,
+        int OmittedCount,
+        string[] Identifiers);
 
     private sealed record DiffOutputOptions(
         string Mode,
@@ -8429,6 +10356,10 @@ public sealed class SqlMetadataService
         int MaxHunks,
         int MaxDiffLinesPerSide,
         bool IncludeLines);
+
+    private sealed record DeploymentBudgetResult(
+        List<Dictionary<string, object?>> Items,
+        bool Truncated);
 
     private sealed record SqlModuleComparableLine(int OriginalLineNumber, string Text);
 

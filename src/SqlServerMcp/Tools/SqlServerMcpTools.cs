@@ -15,7 +15,7 @@ public static class SqlServerMcpTools
         return service.TestConnectionAsync(cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Return serverVersion, config, connection, runtime directory, and SQL permission health for this MCP server.")]
+    [McpServerTool(ReadOnly = true), Description("Return distinct mcpServerVersion and SQL Server product version/edition, config/runtime health, database permissions, server-level DMV SQL permissions, MCP policy, final blockers, and safely quoted administrator SQL suggestions that are never executed.")]
     public static Task<CallToolResult> HealthCheck(
         SqlServerToolService service,
         CancellationToken cancellationToken)
@@ -189,23 +189,65 @@ public static class SqlServerMcpTools
             cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Parse and validate a T-SQL module script without executing it or writing to the database. Reports syntax, variables, INSERT shape, objects, columns, user-defined types, temp tables, wrapper status, and dynamic-SQL warnings.")]
+    [McpServerTool(ReadOnly = true), Description("Statically validate a T-SQL module script without execution or writes. Defaults to summary output. Legacy readyToDeploy remains an alias of staticValidationPassed; conservative deploymentReady stays false until the target is compared (or confirmed missing).")]
     public static Task<CallToolResult> ValidateTsqlScript(
         SqlServerToolService service,
         [Description("T-SQL script text to validate. The script is never executed.")] string script,
         [Description("Optional source label used in the response.")] string? sourceName = null,
+        [Description("Output detail: summary (default) or full. Full preserves resolved references, temp tables, table variables, and target parameters.")] string? detailLevel = null,
         CancellationToken cancellationToken = default)
     {
-        return service.ValidateTsqlScriptAsync(script, sourceName, cancellationToken);
+        return service.ValidateTsqlScriptAsync(script, sourceName, detailLevel, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Read and statically validate a local .sql file without executing it or writing to the database.")]
+    [McpServerTool(ReadOnly = true), Description("Read and statically validate a local .sql file without execution or writes. Defaults to summary output. Legacy readyToDeploy remains static-only; use deploymentReady or validate_deployment for a target-aware safety decision.")]
     public static Task<CallToolResult> ValidateTsqlFile(
         SqlServerToolService service,
         [Description("Absolute local .sql file path.")] string filePath,
+        [Description("Output detail: summary (default) or full. Full preserves the prior resolved-reference and temporary-object details.")] string? detailLevel = null,
         CancellationToken cancellationToken = default)
     {
-        return service.ValidateTsqlFileAsync(filePath, cancellationToken);
+        return service.ValidateTsqlFileAsync(filePath, detailLevel, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Combined deployment safety check for one local SQL module file. Preserves static validation and returns targetComparison=inconclusive for recognized metadata-permission failures; otherwise reports target drift, complete diff risk metadata, and conservative deploymentReady without executing SQL or writing to the database.")]
+    public static Task<CallToolResult> ValidateDeployment(
+        SqlServerToolService service,
+        [Description("Absolute local .sql file path containing CREATE OR ALTER for a procedure, function, view, or trigger.")] string filePath,
+        [Description("Static-validation output detail: summary (default) or full.")] string? detailLevel = null,
+        [Description("Diff output mode: summary (default), compact, or full.")] string? diffMode = null,
+        [Description("Include returned diff hunk line text and the full nested comparison object. Defaults to false.")] bool includeDiff = false,
+        CancellationToken cancellationToken = default)
+    {
+        return service.ValidateDeploymentAsync(
+            filePath,
+            detailLevel,
+            diffMode,
+            includeDiff,
+            cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Compare a CREATE TABLE deployment script with the target table's effective columns, indexes, key/default/check constraints, and outgoing foreign keys. The script is parsed but never executed.")]
+    public static Task<CallToolResult> CompareTableToFile(
+        SqlServerToolService service,
+        [Description("Schema name, usually dbo.")] string schema,
+        [Description("Target table name.")] string name,
+        [Description("Absolute local .sql file containing CREATE TABLE and optional subsequent ALTER/CREATE INDEX statements.")] string filePath,
+        [Description("Include full local/target models, differences, and diagnostics. Defaults to false.")] bool includeDetails = false,
+        [Description("Also compare table and column MS_Description values declared through sp_addextendedproperty/sp_updateextendedproperty. Defaults to false.")] bool includeDescriptions = false,
+        [Description("Approximate total response token budget. Defaults to 4000 and is capped.")] int? maxTotalTokens = null,
+        [Description("Optional detail fields to return; identifiers, states, counts, summaries, and truncation metadata remain available.")] string[]? fields = null,
+        CancellationToken cancellationToken = default)
+    {
+        return service.CompareTableToFileAsync(
+            schema,
+            name,
+            filePath,
+            includeDetails,
+            includeDescriptions,
+            maxTotalTokens,
+            fields,
+            cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Compare a SQL Server module definition with a known local .sql file path. Use to confirm whether a repository SQL file has been executed to the database, whether the database procedure/function/view/trigger matches the local file, and what local-vs-target diff remains.")]
@@ -265,9 +307,43 @@ public static class SqlServerMcpTools
         SqlServerToolService service,
         [Description("Modules in deployment order, each with schema, name, and absolute filePath.")] DeploymentModuleInput[] modules,
         [Description("Diff output mode: summary, compact, or full. Defaults to summary for batch use.")] string? diffMode = null,
+        [Description("Return only body mismatches, missing targets/files, and errors. Equivalent wrapper/format/comment variants are omitted.")] bool onlyMismatches = false,
+        [Description("Include nested comparison/diff details. Defaults to false for summary mode and true otherwise.")] bool? includeDiff = null,
+        [Description("Approximate total response token budget. Matching rows are omitted before mismatches when the budget is reached.")] int? maxTotalTokens = null,
+        [Description("Optional item fields to return. Supported values include deploymentOrder, schema, name, filePath, status, deploymentState, matched, staticValidationState, warnings, localSyntaxValid, referencedObjectsValid, staticValidationPassed, deploymentReady, readyToDeploy, readyToDeploySemantics, readyToDeployDeprecated, targetDriftDetected, deploymentRisk, comparison, and diff.")] string[]? fields = null,
         CancellationToken cancellationToken = default)
     {
-        return service.CompareModulesToFilesAsync(modules, diffMode, cancellationToken);
+        return service.CompareModulesToFilesAsync(
+            modules,
+            diffMode,
+            onlyMismatches,
+            includeDiff,
+            maxTotalTokens,
+            fields,
+            cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Verify tables, SQL modules, and allow-listed configuration patch files as one deployment set. Returns deployed, not_deployed, partially_deployed, or definition_mismatch and defaults to differences only.")]
+    public static Task<CallToolResult> VerifyDeploymentSet(
+        SqlServerToolService service,
+        [Description("Optional tables, each with schema, name, and absolute CREATE TABLE script filePath.")] DeploymentTableInput[]? tables = null,
+        [Description("Optional SQL modules, each with schema, name, and absolute filePath.")] DeploymentModuleInput[]? modules = null,
+        [Description("Optional allow-listed configuration patch SQL files.")] DeploymentConfigPatchInput[]? configPatches = null,
+        [Description("Return only items that are not fully deployed/equivalent. Defaults to true.")] bool onlyMismatches = true,
+        [Description("Include module diff and table/config details. Defaults to false.")] bool includeDiff = false,
+        [Description("Approximate total response token budget. Defaults to 4000 and is capped.")] int? maxTotalTokens = null,
+        [Description("Optional per-item fields to return; identifiers, kind, deploymentState, staticValidationState, warnings, and summary remain available by default.")] string[]? fields = null,
+        CancellationToken cancellationToken = default)
+    {
+        return service.VerifyDeploymentSetAsync(
+            tables,
+            modules,
+            configPatches,
+            onlyMismatches,
+            includeDiff,
+            maxTotalTokens,
+            fields,
+            cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Analyze local temp table usage inside a stored procedure, function, trigger, or view definition, including CREATE TABLE, SELECT INTO, writes, reads, joins, and line numbers.")]
@@ -353,6 +429,17 @@ public static class SqlServerMcpTools
         CancellationToken cancellationToken = default)
     {
         return service.SearchConfigTextAsync(keyword, profile, limit, includeTargets, usableOnly, cursor, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Parse a local UI/configuration UPDATE patch and verify its current database state using only allow-listed textSearch targets and parameterized read-only lookups.")]
+    public static Task<CallToolResult> VerifyConfigPatchFile(
+        SqlServerToolService service,
+        [Description("Absolute local .sql patch file path.")] string filePath,
+        [Description("Optional textSearch profile used to restrict allowed targets.")] string? profile = null,
+        [Description("Include bounded current and expected text values. Defaults to hashes and lengths only.")] bool includeValues = false,
+        CancellationToken cancellationToken = default)
+    {
+        return service.VerifyConfigPatchFileAsync(filePath, profile, includeValues, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true), Description("Locate database and configured application consumers of a field, combining exact column discovery, module usage, and allow-listed page/low-code text search.")]
@@ -442,7 +529,7 @@ public static class SqlServerMcpTools
         return service.ExplainQueryPlanSummaryAsync(sql, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Run independent metadata lookups in parallel. Supported operations: resolve_object, describe_table, get_indexes, find_column, get_module_definition, and compare_module_to_file.")]
+    [McpServerTool(ReadOnly = true), Description("Run independent metadata lookups in parallel with per-request parameters. Supported operations: resolve_object, describe_table, get_indexes, find_column, get_module_definition, compare_module_to_file, compare_table_to_file, and verify_config_patch_file.")]
     public static Task<CallToolResult> BatchMetadata(
         SqlServerToolService service,
         [Description("Independent metadata requests; each item returns its own success or error result.")] MetadataBatchRequest[] requests,
@@ -462,9 +549,47 @@ public static class SqlServerMcpTools
 
 public sealed record DeploymentModuleInput(string Schema, string Name, string FilePath);
 
+public sealed record DeploymentTableInput(
+    string Schema,
+    string Name,
+    string FilePath,
+    bool IncludeDescriptions = false);
+
+public sealed record DeploymentConfigPatchInput(string FilePath, string? Profile = null);
+
 public sealed record MetadataBatchRequest(
     string Operation,
     string? Schema = null,
     string? Name = null,
     string? Column = null,
-    string? FilePath = null);
+    string? FilePath = null,
+    string? Mode = null,
+    string? Profile = null,
+    string[]? Columns = null,
+    bool? IncludeIndexes = null,
+    bool? IncludeConstraints = null,
+    bool? IncludeForeignKeys = null,
+    bool? IncludeDefaults = null,
+    bool? IncludeDescriptions = null,
+    bool? IncludeValues = null,
+    string[]? ObjectTypes = null,
+    bool? Exact = null,
+    int? Limit = null,
+    string? Cursor = null,
+    string? Keyword = null,
+    string[]? Keywords = null,
+    int? StartLine = null,
+    int? EndLine = null,
+    int? ContextLines = null,
+    int? BeforeLines = null,
+    int? AfterLines = null,
+    int? MaxMatches = null,
+    int? Occurrence = null,
+    bool? CollapseOverlaps = null,
+    bool? IncludeLineNumbers = null,
+    string? DiffMode = null,
+    int? MaxHunks = null,
+    int? MaxDiffLinesPerSide = null,
+    bool? IncludeDetails = null,
+    int? MaxTotalTokens = null,
+    string[]? Fields = null);
