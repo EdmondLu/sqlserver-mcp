@@ -10,7 +10,7 @@ A Windows-first, read-only [Model Context Protocol](https://modelcontextprotocol
 
 ## Highlights
 
-- 35 focused tools for connection checks, object resolution, schema inspection, dependency/call-graph analysis, deployment validation, guarded diagnostics, and estimated query plans.
+- 39 focused tools for connection checks, object resolution, schema inspection, dependency/call-graph analysis, deployment validation, guarded diagnostics, and estimated query plans.
 - Lazy database connections: startup registers tools but does not connect to SQL Server or scan the database.
 - Credentials are read from Windows Credential Manager and are never stored in the JSON config.
 - A ScriptDom-based guard accepts one `SELECT`/`WITH` query, or a tightly controlled diagnostic batch limited to variables, local `#temp` tables, temp-table inserts, and a final `SELECT`.
@@ -62,6 +62,8 @@ GRANT SHOWPLAN TO [readonly_user];
 
 `VIEW DEFINITION` enables module and schema inspection. `SHOWPLAN` is required only for `explain_query_plan`. Grant these permissions in the intended user database, not in `master`.
 
+Server-level DMVs use a separate permission layer (`VIEW SERVER PERFORMANCE STATE` on SQL Server 2022+, otherwise `VIEW SERVER STATE`) and are also independently controlled by `security.allowDmvQueries` and `security.allowServerLevelDmv`. `health_check` reports SQL permission, MCP policy, effective access, and every blocker separately. A database view that wraps a server-level DMV can pass the MCP text guard but still fail in SQL Server with error 300 when the login lacks the required server permission. Permission guidance separates human-readable `recommendations` from `permissionGuidance.adminSql`; database grants target the mapped database user, server grants target the login, and every database/principal identifier is safely bracket-escaped. These statements are suggestions for an authorized administrator and are never executed by the MCP.
+
 ## Configuration
 
 See [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json) for a complete example.
@@ -99,7 +101,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | Tool | Purpose |
 | --- | --- |
 | `test_connection` | Validate the connection and current SQL identity |
-| `health_check` | Check serverVersion, config, runtime paths, connection, and permissions |
+| `health_check` | Distinguish MCP version, SQL Server product version/edition, SQL permissions, MCP policy, and effective blockers |
 | `find_objects` | Search tables, views, procedures, and functions |
 | `resolve_object` | Resolve exact and similar object names, including legacy view-to-table mappings |
 | `describe_table` | Inspect compact `shape`, `write_contract`, `keys`, `performance`, or `full` metadata |
@@ -111,11 +113,14 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `get_foreign_keys` | Inspect incoming and outgoing foreign keys |
 | `search_sql_modules` | Search SQL module definitions with next-step compare hints |
 | `get_module_definition` | Read a module definition, optionally by keyword or line range, with explicit discontinuous `slices[]` |
-| `validate_tsql_script` | Parse and metadata-check T-SQL without execution or database writes |
-| `validate_tsql_file` | Validate a local `.sql` file without executing it |
+| `validate_tsql_script` | Summary-first static parse/metadata validation without execution or database writes |
+| `validate_tsql_file` | Summary-first static validation of a local `.sql` file without claiming unverified deployment safety |
+| `validate_deployment` | Combine one module file's static validation, target comparison, drift, and deployment risk |
+| `compare_table_to_file` | Compare a CREATE TABLE script's effective structure with the target table |
 | `compare_module_to_file` | Compare a database module definition with a known local file |
 | `compare_module_to_repo` | Auto-discover matching repository `.sql` files and compare the best unambiguous candidate with the database module |
-| `compare_modules_to_files` | Validate and compare an ordered deployment set, including missing targets |
+| `compare_modules_to_files` | Validate and compare an ordered deployment set with differences-only, field selection, diff suppression, and token budgets |
+| `verify_deployment_set` | Verify tables, modules, and configuration patches together with one deployment state |
 | `analyze_module_temp_tables` | Analyze local temp table creation, usage, multiline statements, and column flow inside a module |
 | `get_dependencies` | Find incoming and outgoing dependencies |
 | `get_callers` | Find confirmed/static/dynamic callers and caller transaction signals |
@@ -123,6 +128,7 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `get_dependency_graph` | Build a bounded confirmed dependency graph |
 | `find_usage` | Rank literal identifier/text/regex usage with source location and confidence |
 | `search_config_text` | Search configured application/configuration text and locator metadata with match-column and audit metadata |
+| `verify_config_patch_file` | Parse a configuration UPDATE patch and verify its allow-listed current value without writes |
 | `find_field_consumers` | Combine column, module, and configured page/low-code consumers |
 | `find_page_by_table` | Find configured pages that reference a table or view |
 | `find_page_by_save_procedure` | Find configured pages that reference a save procedure |
@@ -134,6 +140,8 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `batch_metadata` | Run independent metadata requests in parallel with per-item errors |
 | `reload_connection` | Clear cached credentials, SQL connection pools, and metadata snapshots |
 
+`health_check.mcpServerVersion` is the MCP executable version. The retained `serverVersion` field is only a compatibility alias and is not the database version; SQL Server identity is reported separately as `sqlServerProductVersion`, `sqlServerProductLevel`, and `sqlServerEdition`.
+
 Bounded search/query tools expose stable `cursor`, `nextCursor`, `hasMore`, and executable `nextRequest` metadata where paging is supported. `find_usage` performs literal matching rather than SQL `LIKE`, so `_` in procedure and column names is never treated as a wildcard.
 
 `find_usage` and caller analysis reuse an in-memory module catalog keyed by `object_id + modify_date`, plus line indexes and confirmed dependency edges. Hot calls avoid repeatedly transferring and scanning all module definitions; `reload_connection` explicitly invalidates these snapshots.
@@ -141,6 +149,18 @@ Bounded search/query tools expose stable `cursor`, `nextCursor`, `hasMore`, and 
 Multi-keyword `get_module_definition` results expose each selected window in `slices[]`. The compatibility `definition` string inserts `-- ... omitted lines X-Y ...` between discontinuous windows instead of joining unrelated statements directly.
 
 Module/file comparison now reports `exactMatch`, `bodyMatch`, and `semanticMatch`, with `differenceKind` values `exact_match`, `wrapper_only`, `format_only`, `comment_only`, and `body_changed`. `CREATE`/`CREATE OR ALTER`, BOMs, leading/trailing blank lines, session `SET` wrappers, and trailing `GO` do not change `bodyMatch`. Ordered deployment-set comparison also reports `target_missing` and `local_missing`, and validates a missing target's local script before deployment.
+
+`validate_tsql_script` and `validate_tsql_file` default to `detailLevel=summary`; use `detailLevel=full` to preserve resolved references, temp tables, table variables, and target parameter details. `staticValidationPassed` means only that parsing, metadata checks, and wrapper requirements passed. For backward compatibility, the existing `readyToDeploy` field on these tools and on `compare_modules_to_files` remains a deprecated alias of `staticValidationPassed`; responses mark this with `readyToDeploySemantics=legacy_alias_of_staticValidationPassed` and `readyToDeployDeprecated=true`. The new `deploymentReady` field is conservative: an existing target that has not been compared, or any detected target body drift, keeps it false. `validate_deployment` is the single-file combined entry point, and its top-level `readyToDeploy` is an alias of its strict `deploymentReady` with `readyToDeployDeprecated=false`; its nested `validation` object retains the legacy static semantics. When target comparison fails for a recognized metadata permission such as `VIEW DEFINITION`, the tool preserves `validation`, returns `targetComparison.state=inconclusive`, `compared=false`, stable error/hint/required-permission metadata, and `TARGET_COMPARISON_INCONCLUSIVE` instead of losing the static result. `OBJECT_DEFINITION=NULL` is not treated as proof of a permission failure: the module lookup also checks effective object-level `VIEW DEFINITION` and `IsEncrypted`. Only a confirmed missing permission returns `VIEW_DEFINITION_PERMISSION_REQUIRED` and `requiredPermission=VIEW DEFINITION`; an encrypted or otherwise unavailable definition returns `MODULE_DEFINITION_NOT_AVAILABLE` with no required permission and directs the caller to controlled source or an approved deployment artifact. Cancellation, connection failures, and unknown errors are not converted to inconclusive results.
+
+Compact module diffs always report `totalHunkCount`, `returnedHunkCount`, and `omittedHunkCount`. `deploymentRisk` is computed from the complete diff before line-text truncation and includes affected, target-only, and local-only identifier summaries. Any `body_changed` target is marked as a potential production regression because deploying the local file may overwrite target-only logic.
+
+`compare_modules_to_files` separates `deploymentState` from `staticValidationState`; caller-provided temporary tables are reported as non-blocking `external_temp_table` contracts. `diffMode=summary` omits nested diffs by default, while `onlyMismatches`, `includeDiff`, `maxTotalTokens`, and `fields` bound batch output explicitly. `batch_metadata` forwards each request's supported operation parameters, including `describe_table(mode=full)` and include overrides.
+
+`compare_table_to_file` parses `CREATE TABLE`, subsequent `ALTER TABLE`, and index statements into an effective schema model before comparing columns, indexes, key/default/check constraints, and outgoing foreign keys. Expressions are normalized through ScriptDom, including quoted identifiers, redundant parentheses, numeric formats, Boolean term order, and SQL Server's equivalent `IN` expansion. It is summary-first and bounded by `includeDetails`, `fields`, and `maxTotalTokens`; `includeDescriptions=true` also compares table and column `MS_Description` values. `verify_config_patch_file` supports literal assignments and `REPLACE(column, old, new)` patches, but queries only configured `textSearch.targets` through parameterized read-only locators. `verify_deployment_set` combines table, module, and configuration results and defaults to returning differences only; any missing local input keeps the aggregate state `inconclusive` and is identified as `local_missing`.
+
+Static validation binds complete CTE, derived-table, and APPLY projections. Remaining derived-source uncertainty is collapsed into one non-blocking `analysis_inconclusive` warning with reference, alias, and scope counts. When table comparison details exceed `maxTotalTokens`, leading differences are retained before full local/target models and `omittedDifferenceCount` reports the remainder.
+
+Static validation reports `doomed_transaction_write_before_guard` when a CATCH block performs DROP, DML, `SELECT INTO`, `CREATE TABLE`, or calls a procedure before `IF XACT_STATE() = -1 THROW;`. It reports `doomed_transaction_write_without_guard` when the CATCH performs the same conservative set of possible writes but has no such guard at all. A guard before the operation suppresses both warnings, and nested TRY/CATCH blocks are assessed independently. These operations can raise SQL error 3930 in an uncommittable transaction and hide the original exception.
 
 `describe_query_result` accepts optional `templateValues` for UI SQL placeholders, for example `{ "0": "1=1" }` replaces `{0}` before describing columns. Replacements are raw SQL fragments, and the final SQL is still parsed by the read-only guard.
 

@@ -201,20 +201,64 @@ public sealed class SqlServerToolService
     public Task<CallToolResult> ValidateTsqlScriptAsync(
         string script,
         string? sourceName,
+        string? detailLevel,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "validate_tsql_script",
-            () => _metadataService.ValidateTsqlScriptAsync(script, sourceName, cancellationToken));
+            () => _metadataService.ValidateTsqlScriptAsync(script, sourceName, detailLevel, cancellationToken));
     }
 
     public Task<CallToolResult> ValidateTsqlFileAsync(
         string filePath,
+        string? detailLevel,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "validate_tsql_file",
-            () => _metadataService.ValidateTsqlFileAsync(filePath, cancellationToken));
+            () => _metadataService.ValidateTsqlFileAsync(filePath, detailLevel, cancellationToken));
+    }
+
+    public Task<CallToolResult> ValidateDeploymentAsync(
+        string filePath,
+        string? detailLevel,
+        string? diffMode,
+        bool includeDiff,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "validate_deployment",
+            () => _metadataService.ValidateDeploymentAsync(
+                filePath,
+                detailLevel,
+                diffMode,
+                includeDiff,
+                cancellationToken));
+    }
+
+    public Task<CallToolResult> CompareTableToFileAsync(
+        string schema,
+        string name,
+        string filePath,
+        bool includeDetails,
+        bool includeDescriptions,
+        int? maxTotalTokens,
+        string[]? fields,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "compare_table_to_file",
+            () => _metadataService.CompareTableToFileAsync(
+                schema,
+                name,
+                filePath,
+                includeDetails,
+                includeDescriptions,
+                maxTotalTokens,
+                fields,
+                cancellationToken),
+            schema,
+            name);
     }
 
     public Task<CallToolResult> CompareModuleToFileAsync(
@@ -276,11 +320,45 @@ public sealed class SqlServerToolService
     public Task<CallToolResult> CompareModulesToFilesAsync(
         DeploymentModuleInput[] modules,
         string? diffMode,
+        bool onlyMismatches,
+        bool? includeDiff,
+        int? maxTotalTokens,
+        string[]? fields,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
             "compare_modules_to_files",
-            () => _metadataService.CompareModulesToFilesAsync(modules, diffMode, cancellationToken));
+            () => _metadataService.CompareModulesToFilesAsync(
+                modules,
+                diffMode,
+                onlyMismatches,
+                includeDiff,
+                maxTotalTokens,
+                fields,
+                cancellationToken));
+    }
+
+    public Task<CallToolResult> VerifyDeploymentSetAsync(
+        DeploymentTableInput[]? tables,
+        DeploymentModuleInput[]? modules,
+        DeploymentConfigPatchInput[]? configPatches,
+        bool onlyMismatches,
+        bool includeDiff,
+        int? maxTotalTokens,
+        string[]? fields,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "verify_deployment_set",
+            () => _metadataService.VerifyDeploymentSetAsync(
+                tables,
+                modules,
+                configPatches,
+                onlyMismatches,
+                includeDiff,
+                maxTotalTokens,
+                fields,
+                cancellationToken));
     }
 
     public Task<CallToolResult> AnalyzeModuleTempTablesAsync(
@@ -384,6 +462,17 @@ public sealed class SqlServerToolService
         return ExecuteAsync(
             "search_config_text",
             () => _metadataService.SearchConfigTextAsync(keyword, profile, limit, includeTargets, usableOnly, cursor, cancellationToken));
+    }
+
+    public Task<CallToolResult> VerifyConfigPatchFileAsync(
+        string filePath,
+        string? profile,
+        bool includeValues,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "verify_config_patch_file",
+            () => _metadataService.VerifyConfigPatchFileAsync(filePath, profile, includeValues, cancellationToken));
     }
 
     public Task<CallToolResult> FindFieldConsumersAsync(
@@ -663,6 +752,7 @@ public sealed class SqlServerToolService
             207 => ErrorCodes.SqlInvalidColumn,
             208 => ErrorCodes.SqlInvalidObject,
             2715 => ErrorCodes.SqlInvalidType,
+            300 => ErrorCodes.SqlServerPermissionRequired,
             201 or 8144 => ErrorCodes.SqlParameterMismatch,
             102 or 156 => ErrorCodes.SqlSyntaxError,
             _ => ErrorCodes.UnknownError
@@ -678,6 +768,7 @@ public sealed class SqlServerToolService
             ErrorCodes.SqlInvalidType => "Use validate_tsql_script to verify referenced user-defined types.",
             ErrorCodes.SqlParameterMismatch => "Inspect the target procedure parameters or validate the T-SQL script.",
             ErrorCodes.SqlSyntaxError => "Use validate_tsql_script for line-and-column syntax diagnostics.",
+            ErrorCodes.SqlServerPermissionRequired => "SQL Server denied the submitted query. Call health_check to inspect SQL effective permissions and MCP policy separately; SQL error 300 identifies the SQL Server permission layer as the final blocker.",
             _ => null
         };
     }
@@ -691,6 +782,7 @@ public sealed class SqlServerToolService
             ErrorCodes.SqlInvalidType => ["Call validate_tsql_script and inspect unresolved types."],
             ErrorCodes.SqlParameterMismatch => ["Compare supplied arguments with the module parameter definition."],
             ErrorCodes.SqlSyntaxError => ["Call validate_tsql_script to get parser diagnostics."],
+            ErrorCodes.SqlServerPermissionRequired => ["Call health_check and inspect permissions.sqlServerEffectivePermissions, permissions.mcpPolicy, and permissions.serverLevelDmvAccess.blockedBy."],
             _ => []
         };
     }
