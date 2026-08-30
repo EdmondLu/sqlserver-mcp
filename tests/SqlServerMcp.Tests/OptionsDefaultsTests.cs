@@ -43,4 +43,20 @@ public sealed class OptionsDefaultsTests
 
         Assert.Equal(["backup/**", "domain2/**"], options.RepoExcludePatterns);
     }
+
+    [Fact]
+    public void LimitOptions_ProvideBoundedLobDefaults()
+    {
+        var options = new LimitOptions();
+
+        Assert.Equal(50, options.MaxLobMb);
+        Assert.Equal(262_144, options.MaxLobChunkSize);
+
+        options.MaxLobMb = int.MaxValue;
+        options.MaxLobChunkSize = int.MaxValue;
+        options.Normalize();
+
+        Assert.Equal(512, options.MaxLobMb);
+        Assert.Equal(1_048_576, options.MaxLobChunkSize);
+    }
 }

@@ -10,7 +10,8 @@ public sealed class SqlMcpException : Exception
         Exception? innerException = null,
         int? sqlErrorNumber = null,
         int? lineNumber = null,
-        IReadOnlyList<string>? suggestions = null)
+        IReadOnlyList<string>? suggestions = null,
+        object? errorDetails = null)
         : base(message, innerException)
     {
         ErrorCode = errorCode;
@@ -19,6 +20,7 @@ public sealed class SqlMcpException : Exception
         SqlErrorNumber = sqlErrorNumber;
         LineNumber = lineNumber;
         Suggestions = suggestions ?? [];
+        ErrorDetails = errorDetails;
     }
 
     public string ErrorCode { get; }
@@ -32,4 +34,6 @@ public sealed class SqlMcpException : Exception
     public int? LineNumber { get; }
 
     public IReadOnlyList<string> Suggestions { get; }
+
+    public object? ErrorDetails { get; }
 }

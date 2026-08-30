@@ -44,11 +44,22 @@ public sealed class ReadonlySqlGuard
         var fragment = parser.Parse(new StringReader(sql), out var errors);
         if (errors.Count > 0)
         {
+            var parseErrors = errors.Select(ToParseErrorDetail).ToArray();
             throw new SqlMcpException(
                 ErrorCodes.SqlParseFailed,
                 "SQL batch parse failed.",
-                string.Join("; ", errors.Select(AggregateParseError)),
-                "Use DECLARE, CREATE TABLE #temp, INSERT #temp SELECT, and a final SELECT.");
+                string.Join("; ", parseErrors.Select(error => error.Summary)),
+                "Use one batch containing only local variables, local #temp state, and read-only SELECT statements.",
+                errorDetails: new
+                {
+                    stage = "parse",
+                    reasons = parseErrors.Select(error => new
+                    {
+                        error.Line,
+                        error.Column,
+                        error.Message
+                    }).ToArray()
+                });
         }
 
         if (fragment is not TSqlScript script)
@@ -56,21 +67,26 @@ public sealed class ReadonlySqlGuard
             throw new SqlMcpException(ErrorCodes.SqlParseFailed, "SQL did not parse as a T-SQL script.");
         }
 
-        var statements = script.Batches.SelectMany(batch => batch.Statements).ToArray();
-        if (statements.Length == 0 || statements.Length > 50)
+        if (script.Batches.Count != 1)
         {
-            throw new SqlMcpException(
-                ErrorCodes.SqlGuardRejected,
-                "SQL batch was rejected by read-only guard.",
-                $"Statement count {statements.Length} is outside the allowed range 1..50.");
+            throw GuardRejected(
+                [$"Batch separator count produced {script.Batches.Count} batches; exactly one executable batch is required."],
+                script.Batches.Sum(batch => batch.Statements.Count));
         }
 
-        if (statements[^1] is not SelectStatement)
+        var statements = script.Batches[0].Statements.ToArray();
+        if (statements.Length == 0 || statements.Length > 50)
         {
-            throw new SqlMcpException(
-                ErrorCodes.SqlGuardRejected,
-                "SQL batch was rejected by read-only guard.",
-                "The final statement must be SELECT.");
+            throw GuardRejected(
+                [$"Statement count {statements.Length} is outside the allowed range 1..50."],
+                statements.Length);
+        }
+
+        if (!statements.Any(statement => statement is SelectStatement))
+        {
+            throw GuardRejected(
+                ["At least one SELECT result set is required."],
+                statements.Length);
         }
 
         var batchVisitor = new ReadonlyBatchVisitor();
@@ -80,12 +96,26 @@ public sealed class ReadonlySqlGuard
         var allErrors = batchVisitor.Errors.Concat(objectVisitor.Errors).Distinct().ToArray();
         if (allErrors.Length > 0)
         {
-            throw new SqlMcpException(
-                ErrorCodes.SqlGuardRejected,
-                "SQL batch was rejected by read-only guard.",
-                string.Join("; ", allErrors),
-                "Only DECLARE, CREATE TABLE #temp, INSERT #temp SELECT, and a final SELECT are allowed.");
+            throw GuardRejected(allErrors, statements.Length);
         }
+    }
+
+    private static SqlMcpException GuardRejected(IReadOnlyList<string> reasons, int statementCount)
+    {
+        return new SqlMcpException(
+            ErrorCodes.SqlGuardRejected,
+            "SQL batch was rejected by read-only guard.",
+            string.Join("; ", reasons),
+            "Allowed state is limited to DECLARE, SET @local, CREATE/SELECT INTO local #temp, INSERT/UPDATE/DELETE local #temp, and SELECT result sets.",
+            errorDetails: new
+            {
+                stage = "ast_validation",
+                statementCount,
+                reasons,
+                permanentWritesAllowed = false,
+                dynamicSqlAllowed = false,
+                explicitTransactionsAllowed = false
+            });
     }
 
     private void ValidateReadonlySelect(string sql, string parseHint)
@@ -156,7 +186,17 @@ public sealed class ReadonlySqlGuard
 
     private static string AggregateParseError(ParseError error)
     {
-        return $"Line {error.Line}, Column {error.Column}: {error.Message}";
+        return ToParseErrorDetail(error).Summary;
+    }
+
+    private static ParseErrorDetail ToParseErrorDetail(ParseError error)
+    {
+        var message = SensitiveDataRedactor.Redact(error.Message);
+        return new ParseErrorDetail(
+            error.Line,
+            error.Column,
+            message,
+            $"Line {error.Line}, Column {error.Column}: {message}");
     }
 
     private sealed class GuardVisitor : TSqlFragmentVisitor
@@ -215,11 +255,23 @@ public sealed class ReadonlySqlGuard
             base.ExplicitVisit(node);
         }
 
+        public override void ExplicitVisit(NextValueForExpression node)
+        {
+            Errors.Add("NEXT VALUE FOR is not allowed because advancing a sequence has persistent side effects.");
+            base.ExplicitVisit(node);
+        }
+
         private void ValidateSchemaObject(SchemaObjectName name)
         {
             var parts = name.Identifiers.Select(identifier => identifier.Value).ToList();
             if (parts.Count == 0)
             {
+                return;
+            }
+
+            if (parts[^1].StartsWith("##", StringComparison.Ordinal))
+            {
+                Errors.Add($"Global temporary object '{parts[^1]}' is not allowed; only local #temp state is permitted in guarded SQL.");
                 return;
             }
 
@@ -281,7 +333,13 @@ public sealed class ReadonlySqlGuard
 
         public override void Visit(TSqlStatement node)
         {
-            if (node is not (DeclareVariableStatement or CreateTableStatement or InsertStatement or SelectStatement))
+            if (node is not (DeclareVariableStatement
+                or SetVariableStatement
+                or CreateTableStatement
+                or InsertStatement
+                or UpdateStatement
+                or DeleteStatement
+                or SelectStatement))
             {
                 Errors.Add($"{node.GetType().Name} statements are not allowed in a read-only batch.");
             }
@@ -306,6 +364,41 @@ public sealed class ReadonlySqlGuard
                 Errors.Add("INSERT is allowed only when the target is a local #temp table.");
             }
 
+            if (node.InsertSource is not (SelectInsertSource or ValuesInsertSource))
+            {
+                Errors.Add($"{node.InsertSource.GetType().Name} is not an allowed INSERT source; INSERT EXEC and uncertain sources are rejected.");
+            }
+
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(UpdateSpecification node)
+        {
+            if (!IsTempWriteTarget(node.Target, node.FromClause))
+            {
+                Errors.Add("UPDATE is allowed only when the target is a local #temp table, directly or through one uniquely resolved top-level #temp alias.");
+            }
+
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(DeleteSpecification node)
+        {
+            if (!IsTempWriteTarget(node.Target, node.FromClause))
+            {
+                Errors.Add("DELETE is allowed only when the target is a local #temp table, directly or through one uniquely resolved top-level #temp alias.");
+            }
+
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(OutputIntoClause node)
+        {
+            if (node.IntoTable is not NamedTableReference namedTarget || !IsTempObject(namedTarget.SchemaObject))
+            {
+                Errors.Add("OUTPUT INTO is allowed only when the target is a local #temp table.");
+            }
+
             base.ExplicitVisit(node);
         }
 
@@ -321,9 +414,73 @@ public sealed class ReadonlySqlGuard
 
         private static bool IsTempObject(SchemaObjectName? name)
         {
-            return name?.BaseIdentifier?.Value.StartsWith('#') == true
-                   && name.ServerIdentifier is null
+            var identifier = name?.BaseIdentifier?.Value;
+            return identifier is { Length: > 1 }
+                   && identifier[0] == '#'
+                   && identifier[1] != '#'
+                   && name!.ServerIdentifier is null
                    && name.DatabaseIdentifier is null;
         }
+
+        private static bool IsTempWriteTarget(TableReference? target, FromClause? fromClause)
+        {
+            if (target is not NamedTableReference namedTarget)
+            {
+                return false;
+            }
+
+            if (IsTempObject(namedTarget.SchemaObject))
+            {
+                return true;
+            }
+
+            if (fromClause is null || namedTarget.SchemaObject.Identifiers.Count != 1)
+            {
+                return false;
+            }
+
+            var targetAlias = namedTarget.SchemaObject.BaseIdentifier?.Value;
+            if (string.IsNullOrWhiteSpace(targetAlias))
+            {
+                return false;
+            }
+
+            var aliasMatches = fromClause.TableReferences
+                .SelectMany(EnumerateTopLevelNamedTables)
+                .Where(table => table.Alias?.Value.Equals(targetAlias, StringComparison.OrdinalIgnoreCase) == true)
+                .ToArray();
+            return aliasMatches.Length == 1 && IsTempObject(aliasMatches[0].SchemaObject);
+        }
+
+        private static IEnumerable<NamedTableReference> EnumerateTopLevelNamedTables(TableReference reference)
+        {
+            switch (reference)
+            {
+                case NamedTableReference named:
+                    yield return named;
+                    break;
+                case JoinTableReference join:
+                    foreach (var table in EnumerateTopLevelNamedTables(join.FirstTableReference))
+                    {
+                        yield return table;
+                    }
+
+                    foreach (var table in EnumerateTopLevelNamedTables(join.SecondTableReference))
+                    {
+                        yield return table;
+                    }
+
+                    break;
+                case JoinParenthesisTableReference parenthesized:
+                    foreach (var table in EnumerateTopLevelNamedTables(parenthesized.Join))
+                    {
+                        yield return table;
+                    }
+
+                    break;
+            }
+        }
     }
+
+    private sealed record ParseErrorDetail(int Line, int Column, string Message, string Summary);
 }

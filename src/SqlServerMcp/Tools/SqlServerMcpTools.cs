@@ -488,15 +488,132 @@ public static class SqlServerMcpTools
         return service.RunReadonlyQueryAsync(sql, parameters, maxRows, cursor, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Run a guarded multi-statement diagnostic batch that allows only DECLARE, CREATE TABLE #temp, INSERT into #temp, and a final SELECT. The batch runs in a transaction that is always rolled back.")]
+    [McpServerTool(ReadOnly = true), Description("Run a guarded multi-statement diagnostic batch with local variables, local #temp INSERT/UPDATE/DELETE state, and multiple SELECT result sets. Permanent writes, uncertain statements, dynamic SQL, procedures, and explicit transactions are rejected; the enclosing transaction is always rolled back.")]
     public static Task<CallToolResult> RunReadonlyBatch(
         SqlServerToolService service,
-        [Description("Guarded diagnostic batch ending in SELECT. Business-table writes, EXEC, dynamic SQL, DDL beyond #temp creation, and cross-database violations are rejected.")] string sql,
+        [Description("Guarded diagnostic batch with at least one SELECT result set. Business-table writes, EXEC, dynamic SQL, DDL beyond local #temp creation, explicit transactions, sequence advancement, and cross-database violations are rejected.")] string sql,
         [Description("Optional named SQL parameters.")] Dictionary<string, object?>? parameters = null,
-        [Description("Maximum rows from the final SELECT.")] int? maxRows = null,
+        [Description("Maximum rows from each result set.")] int? maxRows = null,
         CancellationToken cancellationToken = default)
     {
         return service.RunReadonlyBatchAsync(sql, parameters, maxRows, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Read exactly one text or binary LOB selected by one guarded read-only query. Hashes the complete value and returns a bounded resumable chunk without MaxTextLength truncation; optional ReportString inspection validates Base64/GZip/UTF-8/XML bytes without reserialization.")]
+    public static Task<CallToolResult> ReadLob(
+        SqlServerToolService service,
+        [Description("Single guarded SELECT that must return exactly one row and one LOB column.")] string sql,
+        [Description("Optional named SQL parameters for the unique key predicate.")] Dictionary<string, object?>? parameters = null,
+        [Description("Chunk size in characters for text or bytes for binary; capped by limits.maxLobChunkSize.")] int? chunkSize = null,
+        [Description("Opaque cursor from the prior read_lob call. It binds SQL, parameters, kind, lengths, and an exact source identity (UTF-16LE code units for text, raw bytes for binary); source changes require restarting from the first chunk.")] string? cursor = null,
+        [Description("When true, treat the text value as Base64 + GZip + UTF-8 XML and return byte-preserving container metadata.")] bool inspectBase64GzipXml = false,
+        [Description("Optional XML element local name that must occur exactly once.")] string? targetElementName = null,
+        [Description("Optional attribute local name used with targetElementName.")] string? targetAttributeName = null,
+        [Description("Optional exact attribute value used with targetAttributeName.")] string? targetAttributeValue = null,
+        CancellationToken cancellationToken = default)
+    {
+        return service.ReadLobAsync(
+            sql,
+            parameters,
+            chunkSize,
+            cursor,
+            inspectBase64GzipXml,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue,
+            cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Inspect a FastReport-style ReportString offline as Base64 + GZip + UTF-8 XML. Reports hashes, BOM, XML declaration, exact CRLF/LF/CR counts, Base64 canonical/whitespace properties, root, and optional target-node uniqueness; it does not run FastReport or claim rendering validation.")]
+    public static Task<CallToolResult> InspectReportPayload(
+        SqlServerToolService service,
+        [Description("Exact ReportString text containing Base64 of GZip-compressed UTF-8 XML bytes.")] string reportStringBase64,
+        [Description("Optional XML element local name that must occur exactly once.")] string? targetElementName = null,
+        [Description("Optional attribute local name used with targetElementName.")] string? targetAttributeName = null,
+        [Description("Optional exact attribute value used with targetAttributeName.")] string? targetAttributeValue = null)
+    {
+        return service.InspectReportPayloadAsync(
+            reportStringBase64,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Compare original and candidate ReportString values offline at compressed and decompressed byte level. Optional Base64 byte fragments prove an exact single replacement; without that proof safeForGuardedPatch is false. FastReport rendering is not executed.")]
+    public static Task<CallToolResult> CompareReportPayloads(
+        SqlServerToolService service,
+        [Description("Original ReportString Base64 + GZip value.")] string originalReportStringBase64,
+        [Description("Candidate ReportString Base64 + GZip value.")] string candidateReportStringBase64,
+        [Description("Optional XML element local name that must occur exactly once.")] string? targetElementName = null,
+        [Description("Optional attribute local name used with targetElementName.")] string? targetAttributeName = null,
+        [Description("Optional exact attribute value used with targetAttributeName.")] string? targetAttributeValue = null,
+        [Description("Optional Base64 of the exact original decompressed byte fragment; must be supplied with replacementFragmentBase64.")] string? originalFragmentBase64 = null,
+        [Description("Optional Base64 of the exact replacement decompressed byte fragment; must be supplied with originalFragmentBase64.")] string? replacementFragmentBase64 = null)
+    {
+        return service.CompareReportPayloadsAsync(
+            originalReportStringBase64,
+            candidateReportStringBase64,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue,
+            originalFragmentBase64,
+            replacementFragmentBase64);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Build a report candidate entirely offline by replacing one unique Base64-encoded fragment in the original decompressed bytes, then creating a new canonical Base64/GZip value. XML is parsed only for validation and is never reserialized. The tool never connects to SQL Server and does not run FastReport.")]
+    public static Task<CallToolResult> ReplaceReportPayloadFragment(
+        SqlServerToolService service,
+        [Description("Original ReportString text containing Base64 of GZip-compressed UTF-8 XML bytes.")] string originalReportStringBase64,
+        [Description("Base64 of the exact non-empty decompressed byte fragment, which must occur exactly once.")] string originalFragmentBase64,
+        [Description("Base64 of replacement bytes. Empty Base64 is allowed and removes the original fragment.")] string replacementFragmentBase64,
+        [Description("Optional XML element local name that must occur exactly once after replacement.")] string? targetElementName = null,
+        [Description("Optional attribute local name used with targetElementName.")] string? targetAttributeName = null,
+        [Description("Optional exact attribute value used with targetAttributeName.")] string? targetAttributeValue = null,
+        [Description("Optional complete target contract. When supplied, nextRequest.arguments is directly callable as generate_guarded_report_patch; the generator still performs all identifier/type validation offline.")] GuardedReportPatchTarget? patchTarget = null)
+    {
+        return service.ReplaceReportPayloadFragmentAsync(
+            originalReportStringBase64,
+            originalFragmentBase64,
+            replacementFragmentBase64,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue,
+            patchTarget);
+    }
+
+    [McpServerTool(ReadOnly = true), Description("Generate—but never execute—an auditable SQL patch for one Base64/GZip report column. Requires proof that the candidate is exactly one supplied raw-byte fragment replacement. @Apply=0 performs read-only preflight and returns before write locks or UPDATE; @Apply=1 rechecks under lock before updating. No writable MCP tool is added.")]
+    public static Task<CallToolResult> GenerateGuardedReportPatch(
+        SqlServerToolService service,
+        [Description("Target schema as one simple identifier.")] string schema,
+        [Description("Target table as one simple identifier.")] string table,
+        [Description("Unique key column as one simple identifier.")] string keyColumn,
+        [Description("Exact key value encoded according to keySqlType.")] string keyValue,
+        [Description("Key type: nvarchar, varchar, int, bigint, or uniqueidentifier.")] string keySqlType,
+        [Description("ReportString column as one simple identifier.")] string reportColumn,
+        [Description("Exact report column type family: nvarchar or varchar.")] string reportColumnSqlType,
+        [Description("Exact audited current ReportString Base64 + GZip value; embedded as the recovery preimage and old-value guard.")] string originalReportStringBase64,
+        [Description("Exact candidate ReportString Base64 + GZip value; stored byte-for-byte if a human later enables and runs the generated script.")] string candidateReportStringBase64,
+        [Description("Base64 of the exact non-empty byte fragment that must occur once in the original decompressed bytes.")] string originalFragmentBase64,
+        [Description("Base64 of the exact replacement bytes; candidate decompressed bytes must equal the one raw-byte substitution exactly.")] string replacementFragmentBase64,
+        [Description("Optional XML element local name that must occur exactly once in both payloads.")] string? targetElementName = null,
+        [Description("Optional attribute local name used with targetElementName.")] string? targetAttributeName = null,
+        [Description("Optional exact attribute value used with targetAttributeName.")] string? targetAttributeValue = null)
+    {
+        return service.GenerateGuardedReportPatchAsync(
+            schema,
+            table,
+            keyColumn,
+            keyValue,
+            keySqlType,
+            reportColumn,
+            reportColumnSqlType,
+            originalReportStringBase64,
+            candidateReportStringBase64,
+            originalFragmentBase64,
+            replacementFragmentBase64,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue);
     }
 
     [McpServerTool(ReadOnly = true), Description("Describe the result columns for one guarded read-only SELECT or WITH CTE query without executing it, optionally applying explicit UI SQL template replacements first.")]
@@ -556,6 +673,15 @@ public sealed record DeploymentTableInput(
     bool IncludeDescriptions = false);
 
 public sealed record DeploymentConfigPatchInput(string FilePath, string? Profile = null);
+
+public sealed record GuardedReportPatchTarget(
+    string Schema,
+    string Table,
+    string KeyColumn,
+    string KeyValue,
+    string KeySqlType,
+    string ReportColumn,
+    string ReportColumnSqlType);
 
 public sealed record MetadataBatchRequest(
     string Operation,

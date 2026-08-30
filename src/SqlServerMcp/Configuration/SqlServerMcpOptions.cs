@@ -102,6 +102,10 @@ public sealed class LimitOptions
 
     public int MaxTextLength { get; set; } = 1000;
 
+    public int MaxLobMb { get; set; } = 50;
+
+    public int MaxLobChunkSize { get; set; } = 262_144;
+
     public int LockTimeoutMs { get; set; } = 5000;
 
     public int CommandTimeoutSeconds { get; set; } = 20;
@@ -114,6 +118,8 @@ public sealed class LimitOptions
         MaxRows = Math.Clamp(MaxRows, 1, 5000);
         MaxResultMb = Math.Clamp(MaxResultMb, 1, 100);
         MaxTextLength = Math.Clamp(MaxTextLength, 100, 100_000);
+        MaxLobMb = Math.Clamp(MaxLobMb, 1, 512);
+        MaxLobChunkSize = Math.Clamp(MaxLobChunkSize, 1024, 1_048_576);
         LockTimeoutMs = Math.Clamp(LockTimeoutMs, 1, 60_000);
         CommandTimeoutSeconds = Math.Clamp(CommandTimeoutSeconds, 1, 300);
         ConnectTimeoutSeconds = Math.Clamp(ConnectTimeoutSeconds, 1, 60);

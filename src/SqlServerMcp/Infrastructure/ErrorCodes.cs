@@ -24,5 +24,9 @@ public static class ErrorCodes
     public const string ShowplanPermissionRequired = "SHOWPLAN_PERMISSION_REQUIRED";
     public const string SqlServerPermissionRequired = "SQL_SERVER_PERMISSION_REQUIRED";
     public const string ResultTooLarge = "RESULT_TOO_LARGE";
+    public const string LobShapeInvalid = "LOB_SHAPE_INVALID";
+    public const string LobCursorExpired = "LOB_CURSOR_EXPIRED";
+    public const string PayloadInvalid = "PAYLOAD_INVALID";
+    public const string PayloadInvariantFailed = "PAYLOAD_INVARIANT_FAILED";
     public const string UnknownError = "UNKNOWN_ERROR";
 }

@@ -26,6 +26,21 @@ public sealed class JsonResponseTests
     }
 
     [Fact]
+    public void Error_RedactsCommonSecretsFromMessageAndDetail()
+    {
+        var json = JsonResponse.Error(
+            ErrorCodes.UnknownError,
+            "Login failed; Password=super-secret; Authorization: Bearer token-value",
+            "url=https://example.invalid/?api_key=query-secret and {\"password\":\"json-secret\"}");
+
+        Assert.DoesNotContain("super-secret", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("token-value", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("query-secret", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("json-secret", json, StringComparison.Ordinal);
+        Assert.Contains("<redacted>", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SuccessResult_UsesStructuredContentWithoutJsonInTextBlock()
     {
         var result = JsonResponse.SuccessResult(
@@ -69,5 +84,57 @@ public sealed class JsonResponseTests
 
         Assert.NotNull(result.StructuredContent);
         Assert.False(result.IsError);
+    }
+
+    [Fact]
+    public void ErrorResult_IncludesStructuredGuardDetails()
+    {
+        var result = JsonResponse.ErrorResult(
+            "run_readonly_batch",
+            ErrorCodes.SqlGuardRejected,
+            "Rejected.",
+            new SqlServerMcpOptions
+            {
+                Server = "server",
+                Database = "db",
+                CredentialTarget = "credential"
+            },
+            null,
+            1,
+            errorDetails: new { stage = "ast_validation", reasons = new[] { "permanent write" } });
+
+        var details = result.StructuredContent!.Value.GetProperty("errorDetails");
+        Assert.Equal("ast_validation", details.GetProperty("stage").GetString());
+        Assert.Equal("permanent write", details.GetProperty("reasons")[0].GetString());
+    }
+
+    [Fact]
+    public void SuccessResult_RedactsNestedPerItemErrorsButPreservesOrdinaryData()
+    {
+        var result = JsonResponse.SuccessResult(
+            "batch",
+            new
+            {
+                items = new[]
+                {
+                    new
+                    {
+                        error = "Password=nested-secret",
+                        data = "Password=ordinary-result-data"
+                    }
+                }
+            },
+            new SqlServerMcpOptions
+            {
+                Server = "server",
+                Database = "db",
+                CredentialTarget = "credential"
+            },
+            null,
+            1);
+
+        var item = result.StructuredContent!.Value.GetProperty("items")[0];
+        Assert.DoesNotContain("nested-secret", item.GetProperty("error").GetString(), StringComparison.Ordinal);
+        Assert.Contains("ordinary-result-data", item.GetProperty("data").GetString(), StringComparison.Ordinal);
     }
 }
