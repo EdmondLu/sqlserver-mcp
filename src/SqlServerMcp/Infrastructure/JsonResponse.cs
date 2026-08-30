@@ -22,13 +22,15 @@ public static class JsonResponse
 
     public static string Error(string errorCode, string message, string? detail = null, string? hint = null)
     {
+        var safeMessage = SensitiveDataRedactor.Redact(message);
+        var safeDetail = detail is null ? null : SensitiveDataRedactor.Redact(detail);
         return JsonSerializer.Serialize(
             new
             {
                 ok = false,
                 errorCode,
-                message,
-                detail,
+                message = safeMessage,
+                detail = safeDetail,
                 hint
             },
             Options);
@@ -56,6 +58,16 @@ public static class JsonResponse
         };
     }
 
+    internal static long GetSuccessPayloadLengthBytes(
+        object result,
+        SqlServerMcpOptions options,
+        string? login = null,
+        long elapsedMs = 0)
+    {
+        var payload = AddConnectionContext(result, options, login, elapsedMs);
+        return JsonSerializer.SerializeToUtf8Bytes(payload, Options).LongLength;
+    }
+
     public static CallToolResult ErrorResult(
         string toolName,
         string errorCode,
@@ -67,18 +79,22 @@ public static class JsonResponse
         string? hint = null,
         int? sqlErrorNumber = null,
         int? lineNumber = null,
-        IReadOnlyList<string>? suggestions = null)
+        IReadOnlyList<string>? suggestions = null,
+        object? errorDetails = null)
     {
+        var safeMessage = SensitiveDataRedactor.Redact(message);
+        var safeDetail = detail is null ? null : SensitiveDataRedactor.Redact(detail);
         var error = new
         {
             ok = false,
             errorCode,
             sqlErrorNumber,
-            message,
+            message = safeMessage,
             lineNumber,
-            detail,
+            detail = safeDetail,
             hint,
-            suggestions = suggestions ?? []
+            suggestions = suggestions ?? [],
+            errorDetails
         };
         var payload = AddConnectionContext(error, options, login, elapsedMs);
         return new CallToolResult
@@ -118,7 +134,51 @@ public static class JsonResponse
                 isolationLevel = "READ COMMITTED"
             },
             Options);
+        RedactErrorStrings(payload, insideErrorField: false);
         return payload;
+    }
+
+    private static void RedactErrorStrings(JsonNode? node, bool insideErrorField)
+    {
+        switch (node)
+        {
+            case JsonObject jsonObject:
+                foreach (var property in jsonObject.ToArray())
+                {
+                    var propertyIsErrorField = insideErrorField || IsErrorField(property.Key);
+                    if (property.Value is JsonValue value
+                        && propertyIsErrorField
+                        && value.TryGetValue<string>(out var text))
+                    {
+                        jsonObject[property.Key] = SensitiveDataRedactor.Redact(text);
+                    }
+                    else
+                    {
+                        RedactErrorStrings(property.Value, propertyIsErrorField);
+                    }
+                }
+
+                break;
+            case JsonArray jsonArray:
+                foreach (var item in jsonArray)
+                {
+                    RedactErrorStrings(item, insideErrorField);
+                }
+
+                break;
+        }
+    }
+
+    private static bool IsErrorField(string name)
+    {
+        return name.Equals("message", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("detail", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("details", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("error", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("errorMessage", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("hint", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("suggestions", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("errorDetails", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildTextSummary(string toolName, JsonObject payload, bool isError)

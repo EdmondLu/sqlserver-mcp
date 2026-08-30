@@ -546,6 +546,128 @@ public sealed class SqlServerToolService
             sql: _options.Logging.LogSql ? sql : null);
     }
 
+    public Task<CallToolResult> ReadLobAsync(
+        string sql,
+        IReadOnlyDictionary<string, object?>? parameters,
+        int? chunkSize,
+        string? cursor,
+        bool inspectBase64GzipXml,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAsync(
+            "read_lob",
+            () => _metadataService.ReadLobAsync(
+                sql,
+                parameters,
+                chunkSize,
+                cursor,
+                inspectBase64GzipXml,
+                targetElementName,
+                targetAttributeName,
+                targetAttributeValue,
+                cancellationToken),
+            sql: _options.Logging.LogSql ? sql : null);
+    }
+
+    public Task<CallToolResult> InspectReportPayloadAsync(
+        string reportStringBase64,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue)
+    {
+        return ExecuteAsync(
+            "inspect_report_payload",
+            () => Task.FromResult(
+                _metadataService.InspectReportPayload(
+                    reportStringBase64,
+                    targetElementName,
+                    targetAttributeName,
+                    targetAttributeValue)));
+    }
+
+    public Task<CallToolResult> CompareReportPayloadsAsync(
+        string originalReportStringBase64,
+        string candidateReportStringBase64,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue,
+        string? originalFragmentBase64,
+        string? replacementFragmentBase64)
+    {
+        return ExecuteAsync(
+            "compare_report_payloads",
+            () => Task.FromResult(
+                _metadataService.CompareReportPayloads(
+                    originalReportStringBase64,
+                    candidateReportStringBase64,
+                    targetElementName,
+                    targetAttributeName,
+                    targetAttributeValue,
+                    originalFragmentBase64,
+                replacementFragmentBase64)));
+    }
+
+    public Task<CallToolResult> ReplaceReportPayloadFragmentAsync(
+        string originalReportStringBase64,
+        string originalFragmentBase64,
+        string replacementFragmentBase64,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue,
+        GuardedReportPatchTarget? patchTarget)
+    {
+        return ExecuteAsync(
+            "replace_report_payload_fragment",
+            () => Task.FromResult(
+                _metadataService.ReplaceReportPayloadFragment(
+                    originalReportStringBase64,
+                    originalFragmentBase64,
+                    replacementFragmentBase64,
+                    targetElementName,
+                    targetAttributeName,
+                    targetAttributeValue,
+                    patchTarget)));
+    }
+
+    public Task<CallToolResult> GenerateGuardedReportPatchAsync(
+        string schema,
+        string table,
+        string keyColumn,
+        string keyValue,
+        string keySqlType,
+        string reportColumn,
+        string reportColumnSqlType,
+        string originalReportStringBase64,
+        string candidateReportStringBase64,
+        string originalFragmentBase64,
+        string replacementFragmentBase64,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue)
+    {
+        return ExecuteAsync(
+            "generate_guarded_report_patch",
+            () => Task.FromResult(
+                _metadataService.GenerateGuardedReportPatch(
+                    schema,
+                    table,
+                    keyColumn,
+                    keyValue,
+                    keySqlType,
+                    reportColumn,
+                    reportColumnSqlType,
+                    originalReportStringBase64,
+                    candidateReportStringBase64,
+                    originalFragmentBase64,
+                    replacementFragmentBase64,
+                    targetElementName,
+                    targetAttributeName,
+                    targetAttributeValue)));
+    }
+
     public Task<CallToolResult> DescribeQueryResultAsync(
         string sql,
         IReadOnlyDictionary<string, object?>? parameters,
@@ -650,7 +772,8 @@ public sealed class SqlServerToolService
                 ex.Hint,
                 ex.SqlErrorNumber,
                 ex.LineNumber,
-                suggestions.Count > 0 ? suggestions : BuildSqlErrorSuggestions(ex.ErrorCode));
+                suggestions.Count > 0 ? suggestions : BuildSqlErrorSuggestions(ex.ErrorCode),
+                ex.ErrorDetails);
         }
         catch (SqlException ex) when (ex.Number == -2)
         {
@@ -832,7 +955,7 @@ public sealed class SqlServerToolService
             .ForContext("object", objectName)
             .ForContext("sql", sql)
             .ForContext("error_code", errorCode)
-            .ForContext("error_message", errorMessage)
+            .ForContext("error_message", SensitiveDataRedactor.Redact(errorMessage))
             .Warning("MCP tool failed");
     }
 }

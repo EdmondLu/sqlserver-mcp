@@ -7,6 +7,8 @@
     "maxRows": 500,
     "maxResultMb": 5,
     "maxTextLength": 1000,
+    "maxLobMb": 50,
+    "maxLobChunkSize": 262144,
     "lockTimeoutMs": 5000,
     "commandTimeoutSeconds": 20,
     "connectTimeoutSeconds": 10

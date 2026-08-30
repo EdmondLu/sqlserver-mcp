@@ -10,10 +10,10 @@ A Windows-first, read-only [Model Context Protocol](https://modelcontextprotocol
 
 ## Highlights
 
-- 39 focused tools for connection checks, object resolution, schema inspection, dependency/call-graph analysis, deployment validation, guarded diagnostics, and estimated query plans.
+- 44 focused tools for connection checks, object resolution, schema inspection, dependency/call-graph analysis, deployment validation, guarded diagnostics, LOB/report-byte inspection, and estimated query plans.
 - Lazy database connections: startup registers tools but does not connect to SQL Server or scan the database.
 - Credentials are read from Windows Credential Manager and are never stored in the JSON config.
-- A ScriptDom-based guard accepts one `SELECT`/`WITH` query, or a tightly controlled diagnostic batch limited to variables, local `#temp` tables, temp-table inserts, and a final `SELECT`.
+- A ScriptDom-based guard accepts one `SELECT`/`WITH` query, or a tightly controlled diagnostic batch limited to local variables, local `#temp` DML, and SELECT result sets; uncertain statements and persistent side effects remain rejected.
 - Every tool returns native MCP `structuredContent` plus a short compatibility text summary and a connection context containing server, database, read-only state, login, timestamp, elapsed time, and isolation level.
 - Result row, payload, text-length, lock-wait, command, and connection limits are configurable.
 - Bounded tools include a `resultInfo` block that summarizes returned rows/items, limits, truncation reasons, and narrowing hints.
@@ -77,6 +77,8 @@ See [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json) for a c
 | `limits.maxRows` | `500` | Hard row cap |
 | `limits.maxResultMb` | `5` | Approximate result-size cap |
 | `limits.maxTextLength` | `1000` | Per-value text cap |
+| `limits.maxLobMb` | `50` | Maximum full LOB bytes scanned (`UTF-8` bytes for text, raw bytes for binary) by `read_lob`/report tools |
+| `limits.maxLobChunkSize` | `262144` | Maximum returned LOB chunk in characters or bytes |
 | `limits.lockTimeoutMs` | `5000` | SQL lock timeout |
 | `limits.commandTimeoutSeconds` | `20` | SQL command timeout |
 | `limits.connectTimeoutSeconds` | `10` | Connection timeout |
@@ -133,7 +135,12 @@ Relative `logs`, `cache`, and `tmp` directories are created beside the config fi
 | `find_page_by_table` | Find configured pages that reference a table or view |
 | `find_page_by_save_procedure` | Find configured pages that reference a save procedure |
 | `run_readonly_query` | Run one guarded read-only query with optional named parameters |
-| `run_readonly_batch` | Run a rollback-only diagnostic batch using local `#temp` state |
+| `run_readonly_batch` | Run a rollback-only diagnostic batch with local variables, local `#temp` DML, and multiple result sets |
+| `read_lob` | Hash one complete text/binary LOB and return resumable untruncated text or Base64 chunks |
+| `inspect_report_payload` | Validate Base64/GZip/UTF-8/XML report bytes, BOM/declaration/newlines, and optional node uniqueness offline |
+| `compare_report_payloads` | Compare original/candidate report containers and decompressed bytes without XML reserialization |
+| `replace_report_payload_fragment` | Build a candidate offline through one unique exact decompressed-byte replacement, without XML reserialization or a database connection |
+| `generate_guarded_report_patch` | Generate but never execute an exact-byte-replacement patch whose default branch is read-only preflight |
 | `describe_query_result` | Describe guarded query result columns without executing the query, optionally applying explicit UI placeholder replacements |
 | `explain_query_plan` | Return an estimated-plan summary, with raw XML only when requested |
 | `explain_query_plan_summary` | Return only the compact estimated-plan summary |
@@ -163,6 +170,16 @@ Static validation binds complete CTE, derived-table, and APPLY projections. Rema
 Static validation reports `doomed_transaction_write_before_guard` when a CATCH block performs DROP, DML, `SELECT INTO`, `CREATE TABLE`, or calls a procedure before `IF XACT_STATE() = -1 THROW;`. It reports `doomed_transaction_write_without_guard` when the CATCH performs the same conservative set of possible writes but has no such guard at all. A guard before the operation suppresses both warnings, and nested TRY/CATCH blocks are assessed independently. These operations can raise SQL error 3930 in an uncommittable transaction and hide the original exception.
 
 `describe_query_result` accepts optional `templateValues` for UI SQL placeholders, for example `{ "0": "1=1" }` replaces `{0}` before describing columns. Replacements are raw SQL fragments, and the final SQL is still parsed by the read-only guard.
+
+`run_readonly_batch` accepts `DECLARE`, `SET @local`, local `#temp` creation/`SELECT INTO`, local `#temp` `INSERT`/`UPDATE`/`DELETE` (directly or through one uniquely resolved top-level alias), and one or more SELECT result sets. It returns every result set in `resultSets[]` while retaining the last result in compatibility `columns`/`rows`. A local temporary identifier must have exactly one leading `#`; global `##temp` references are rejected for reads and writes. Permanent targets, write-target aliases that cannot be proven locally, `EXEC`, dynamic SQL, explicit transactions, unsupported DDL, `NEXT VALUE FOR`, and other uncertain statements are rejected with structured reasons. The MCP-owned transaction is rolled back even on success.
+
+`read_lob` requires exactly one row and one text or binary column. Each call performs one sequential scan, incrementally hashing and measuring the complete bounded value while retaining only the requested chunk. The byte limit means UTF-8 bytes for text and raw bytes for binary. `sha256` remains the cross-system content hash over normalized UTF-8 bytes for text or raw bytes for binary. `nextCursor` resumes by UTF-16 code-unit offset for text (without splitting valid surrogate pairs) or byte offset for binary. Its separate `cursorIdentity` binds the exact UTF-16LE code units (`identityEncoding=utf-16le-code-units`) for text or raw bytes (`identityEncoding=raw-bytes`) for binary, plus kind and lengths, in addition to the SQL/parameter fingerprint. This distinction prevents different malformed UTF-16 sequences that share the same replacement-fallback UTF-8 hash from being mixed. If a later scan sees different source content it returns `LOB_CURSOR_EXPIRED`; clients must discard prior chunks and restart. Bounded `inspectBase64GzipXml=true` explicitly captures the full text for inspection. For `nvarchar`, the UTF-16LE database-value hash is also returned for exact SQL-value guards.
+
+`inspect_report_payload` and `compare_report_payloads` validate Base64/GZip, UTF-8 BOM, the exact XML declaration, exact CRLF/LF/CR counts, Base64 canonical/whitespace properties, XML parsing, root identity, and optional target-node uniqueness without converting the stored value to SQL Server XML or serializing it back. `compare_report_payloads` remains useful as a general diff, but `safeForGuardedPatch` can be true only when `originalFragmentBase64` and `replacementFragmentBase64` prove that the candidate decompressed bytes are exactly one raw-byte substitution. They do not load the FastReport runtime, execute scripts/data bindings, or validate rendering.
+
+`replace_report_payload_fragment` closes the byte-sensitive candidate-construction step offline. It requires the original raw fragment to occur exactly once, substitutes the replacement directly in the decompressed byte array, creates a new GZip stream and canonical no-whitespace Base64 text, then returns all layer hashes, inspection/comparison/proof metadata, and guarded-patch payload arguments. When the optional complete `patchTarget` is supplied, `nextRequest.arguments` is directly callable as `generate_guarded_report_patch`; otherwise `readyToCall=false` and `requiredTargetArguments` lists the fields that must still be added. It never writes or connects to SQL Server and never reserializes XML. Exact preservation applies to decompressed bytes outside the replacement only: compressed bytes and GZip header metadata are explicitly not claimed to be preserved. If the original Base64 text is non-canonical or contains whitespace, the output policy reports canonicalization and keeps `safeForGuardedPatch=false` because the stored text policy changed.
+
+`generate_guarded_report_patch` is an offline generator. The tool itself never opens a database connection and no writable MCP tool exists. It requires Base64-encoded original/replacement raw fragments, proves the original fragment occurs exactly once, and proves the candidate is byte-for-byte the result of that single substitution; proof metadata includes occurrence/replacement counts and the expected candidate SHA-256. It also refuses BOM/declaration/newline-count/Base64-property/root/selector drift, embeds the exact old ReportString as a recovery preimage, and guards old/new text plus compressed and decompressed hashes. In the generated SQL, `@Apply=0` performs read-only checks and a preimage preview, then `RETURN`s before any transaction, write lock, or `UPDATE`. Only `@Apply=1` starts a transaction, reacquires `UPDLOCK`/`HOLDLOCK`, rechecks uniqueness and the old value, updates, verifies, and commits. A human must verify real key/column types, export the preimage, review the SQL, and enable execution outside this MCP in an approved write session.
 
 Structure tools recognize the legacy view prefixes `vwp_`, `vwpr_`, `vwt_`, and `vwtr_`, and try the corresponding unprefixed physical table first.
 

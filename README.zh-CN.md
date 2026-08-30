@@ -6,10 +6,10 @@
 
 ## 特性
 
-- 提供 39 个固定工具，覆盖连接检查、对象解析、结构查看、调用图、部署前校验、安全诊断和预估执行计划。
+- 提供 44 个固定工具，覆盖连接检查、对象解析、结构查看、调用图、部署前校验、安全诊断、LOB/报表字节检查和预估执行计划。
 - 启动时只注册工具，不连接数据库，也不扫描全库；首次数据库调用时才建立连接。
 - SQL 用户名和密码从 Windows Credential Manager 读取，不写入 JSON 配置。
-- 基于 ScriptDom 的只读 Guard 接受单条 `SELECT` / `WITH`，或仅包含变量、本地 `#temp`、向临时表插入和最终 `SELECT` 的受控诊断批次。
+- 基于 ScriptDom 的只读 Guard 接受单条 `SELECT` / `WITH`，或仅包含局部变量、本地 `#temp` DML 和 SELECT 结果集的受控诊断批次；不确定语句和持久副作用仍一律拒绝。
 - 所有工具都返回原生 MCP `structuredContent` 和精简兼容文本，并统一附带服务器、数据库、只读状态、登录、时间、耗时和隔离级别。
 - 可配置返回行数、结果大小、文本长度、锁等待、命令和连接超时。
 - 受限制或可能截断的工具会返回统一 `resultInfo`，说明已返回数量、限制、截断原因和缩小范围建议。
@@ -62,7 +62,7 @@ GRANT SHOWPLAN TO [readonly_user];
 
 ## 配置
 
-完整示例见 [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json)。主要默认值：返回 50 行、最大 500 行、结果上限 5 MB、单个文本值 1000 字符、锁等待 5 秒、命令超时 20 秒、连接超时 10 秒。
+完整示例见 [`docs/sqlserver_mcp.example.json`](docs/sqlserver_mcp.example.json)。主要默认值：返回 50 行、最大 500 行、结果上限 5 MB、单个文本值 1000 字符、LOB 完整检查上限 50 MB、LOB 单块上限 262144 字符或字节、锁等待 5 秒、命令超时 20 秒、连接超时 10 秒。
 
 安全默认值为：禁止跨库和系统库，禁止服务器级 DMV，连接加密开启，不默认信任服务器证书，SQL 日志关闭。相对路径的 `logs`、`cache`、`tmp` 目录会创建在配置文件旁边。
 
@@ -80,7 +80,8 @@ SQL 文本可能包含敏感数据，仅在确有需要时启用 `logging.logSql
 - `compare_table_to_file`、`compare_module_to_file`、`compare_module_to_repo`、`compare_modules_to_files`、`verify_deployment_set`、`analyze_module_temp_tables`
 - `get_dependencies`、`get_callers`、`get_callees`、`get_dependency_graph`
 - `search_config_text`、`verify_config_patch_file`、`find_field_consumers`、`find_page_by_table`、`find_page_by_save_procedure`
-- `run_readonly_query`、`run_readonly_batch`、`describe_query_result`
+- `run_readonly_query`、`run_readonly_batch`、`read_lob`、`describe_query_result`
+- `inspect_report_payload`、`compare_report_payloads`、`replace_report_payload_fragment`、`generate_guarded_report_patch`
 - `explain_query_plan`、`explain_query_plan_summary`、`batch_metadata`
 - `reload_connection`
 
@@ -113,6 +114,16 @@ compact 模块差异即使截断正文，也会完整返回 `totalHunkCount`、`
 `get_module_definition` 的多关键字结果会在 `slices[]` 中分别返回每个代码窗口；兼容字段 `definition` 会在不连续窗口之间插入 `-- ... omitted lines X-Y ...`，不再直接拼接无关语句。
 
 `describe_query_result` 可显式传入 `templateValues` 描述 UI SQL 模板，例如 `{ "0": "1=1" }` 会先把 `{0}` 替换为 `1=1`，再推断结果列。替换值按 SQL 片段处理，最终 SQL 仍会经过只读 Guard。
+
+`run_readonly_batch` 允许 `DECLARE`、`SET @local`、创建本地 `#temp` / `SELECT INTO #temp`、直接或通过唯一可解析顶层别名针对本地 `#temp` 的 `INSERT` / `UPDATE` / `DELETE`，以及一个或多个 SELECT 结果集。响应通过 `resultSets[]` 保留全部结果集，同时用兼容字段 `columns` / `rows` 返回最后一个结果集。本地临时对象必须恰好只有一个前导 `#`；全局 `##temp` 无论读写都会被拒绝。永久对象写入、无法静态证明的写目标别名、`EXEC`、动态 SQL、显式事务、不支持的 DDL、`NEXT VALUE FOR` 和其它不确定语句会被结构化拒绝；MCP 自己建立的事务即使成功也会强制回滚。
+
+`read_lob` 要求查询精确返回一行一列文本或二进制值。每次调用只做一次顺序扫描，增量计算完整值哈希和长度，只保留请求分块；`maxLobMb` 对文本按 UTF-8 字节、对二进制按原始字节计限。顶层 `sha256` 是供跨系统比对的内容哈希：文本按替换回退后的 UTF-8、二进制按原始字节计算。文本按 UTF-16 代码单元偏移续读且不拆分有效代理项对，二进制以 Base64 分块返回。`nextCursor` 使用独立的 `cursorIdentity`：文本绑定精确 UTF-16LE 代码单元哈希（`identityEncoding=utf-16le-code-units`），二进制绑定原始字节哈希（`identityEncoding=raw-bytes`），并同时绑定 LOB kind、总长度和 SQL/参数指纹；因此两个 UTF-8 替换回退哈希相同但代码单元不同的非法代理项序列也会返回 `LOB_CURSOR_EXPIRED`。调用方必须丢弃之前的所有分块并从头读取。只有显式 `inspectBase64GzipXml=true` 才在既有字节上限内保留完整文本用于容器检查；`nvarchar` 的 UTF-16LE 数据库值哈希也继续返回。
+
+`inspect_report_payload` 和 `compare_report_payloads` 不把内容转成 SQL Server XML，也不重新序列化，而是直接验证 Base64、GZip、UTF-8 BOM、XML 声明、CRLF/LF/CR 精确计数、Base64 规范/空白属性、XML 可解析性、根节点及可选目标节点唯一性。普通 compare 仍可用于一般差异分析，但只有同时提供 `originalFragmentBase64` 与 `replacementFragmentBase64`，并证明候选解压字节严格等于一次原始字节替换的结果时，`safeForGuardedPatch` 才可能为 true。它们不会加载 FastReport 运行库、执行脚本或数据绑定，也不宣称完成渲染校验。
+
+`replace_report_payload_fragment` 把最容易破坏字节格式的候选构建步骤闭合在纯离线工具中：旧字节片段必须在原始解压字节中恰好出现一次，替换直接作用于原始 `byte[]`，随后生成新的 GZip 与无空白规范 Base64，并返回各层哈希、inspection/comparison/exactReplacementProof 以及补丁载荷参数。可选提供完整 `patchTarget`；提供后 `nextRequest.arguments` 可原样调用 `generate_guarded_report_patch`，未提供时则返回 `readyToCall=false` 和仍需补齐的 `requiredTargetArguments`。该工具不建立数据库连接、不写库，也不把 XML 重新序列化。它只承诺替换范围外的解压字节保持不变，不承诺压缩流或 GZip header 元数据完全保真；原始 Base64 若非规范或含空白，会明确报告规范化策略，并因存储文本属性变化保持 `safeForGuardedPatch=false`。
+
+`generate_guarded_report_patch` 是纯离线生成器：工具本身不建立数据库连接，项目也没有新增任何可写 MCP 工具。调用者必须以 Base64 提供原始与替换字节片段；工具会证明旧片段在原始解压字节中恰好出现一次，且候选严格等于这一次字节替换，并返回出现次数、替换次数和期望候选 SHA-256。它还会拒绝 BOM、XML 声明、换行精确计数、Base64 属性、根节点或目标节点不变量漂移，把精确旧 ReportString 嵌入为恢复前像并添加各层哈希守卫。生成 SQL 的 `@Apply=0` 是只读预检：输出前像与检查结果后，在事务、`UPDLOCK` / `HOLDLOCK` 和 `UPDATE` 之前直接 `RETURN`；只有 `@Apply=1` 才开启写事务、重新锁定并校验唯一行与旧值、更新、验证和提交。不得把“执行后回滚”称为 dry-run。人工执行前仍必须核对真实键值与字段类型、导出前像、审核 SQL，并在 MCP 之外的获批写会话中显式启用。
 
 结构工具会识别 `vwp_`、`vwpr_`、`vwt_`、`vwtr_` 这四种历史视图前缀，并优先尝试对应的无前缀物理表。
 

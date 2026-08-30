@@ -3982,12 +3982,15 @@ public sealed class SqlMetadataService
         var effectiveMaxRows = _options.Limits.ClampRows(maxRows);
         var resultLimitBytes = _options.Limits.MaxResultMb * 1024L * 1024L;
         var stopwatch = Stopwatch.StartNew();
-        var rows = new List<Dictionary<string, object?>>();
-        var columns = new List<object>();
-        var truncation = new QueryValueTruncationInfo();
+        var resultSets = new List<object>();
+        object[] lastColumns = [];
+        Dictionary<string, object?>[] lastRows = [];
         var rowLimitTruncated = false;
+        var totalTextValuesTruncated = 0;
+        var columnsWithTruncatedText = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         long estimatedBytes = 0;
         var resultSetCount = 0;
+        var totalRowCount = 0;
 
         await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(
@@ -4017,8 +4020,10 @@ public sealed class SqlMetadataService
                 }
 
                 resultSetCount++;
-                columns.Clear();
-                rows.Clear();
+                var columns = new List<object>();
+                var rows = new List<Dictionary<string, object?>>();
+                var resultSetTruncation = new QueryValueTruncationInfo();
+                var resultSetRowLimitTruncated = false;
                 for (var i = 0; i < reader.FieldCount; i++)
                 {
                     columns.Add(new
@@ -4033,13 +4038,14 @@ public sealed class SqlMetadataService
                     if (rows.Count >= effectiveMaxRows)
                     {
                         rowLimitTruncated = true;
+                        resultSetRowLimitTruncated = true;
                         break;
                     }
 
                     var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
                     for (var i = 0; i < reader.FieldCount; i++)
                     {
-                        var value = ReadValue(reader, i, truncation);
+                        var value = ReadValue(reader, i, resultSetTruncation);
                         row[reader.GetName(i)] = value;
                         estimatedBytes += EstimateBytes(value);
                     }
@@ -4055,6 +4061,31 @@ public sealed class SqlMetadataService
 
                     rows.Add(row);
                 }
+
+                totalRowCount += rows.Count;
+                totalTextValuesTruncated += resultSetTruncation.TextValuesTruncated;
+                columnsWithTruncatedText.UnionWith(resultSetTruncation.ColumnsWithTruncatedText);
+                lastColumns = columns.ToArray();
+                lastRows = rows.ToArray();
+                var resultSetTruncated = resultSetRowLimitTruncated || resultSetTruncation.TextValuesTruncated > 0;
+                resultSets.Add(new
+                {
+                    index = resultSetCount - 1,
+                    columns = lastColumns,
+                    rows = lastRows,
+                    rowCount = lastRows.Length,
+                    truncated = resultSetTruncated,
+                    truncation = new
+                    {
+                        rowLimitTruncated = resultSetRowLimitTruncated,
+                        textValuesTruncated = resultSetTruncation.TextValuesTruncated,
+                        columnsWithTruncatedText = resultSetTruncation.ColumnsWithTruncatedText
+                            .OrderBy(column => column)
+                            .ToArray(),
+                        maxRows = effectiveMaxRows,
+                        maxTextLength = _options.Limits.MaxTextLength
+                    }
+                });
             }
             while (await reader.NextResultAsync(cancellationToken));
         }
@@ -4064,7 +4095,18 @@ public sealed class SqlMetadataService
         }
 
         stopwatch.Stop();
-        var truncated = rowLimitTruncated || truncation.TextValuesTruncated > 0;
+        var truncated = rowLimitTruncated || totalTextValuesTruncated > 0;
+        var truncationReasons = new List<string>();
+        if (rowLimitTruncated)
+        {
+            truncationReasons.Add("maxRows");
+        }
+
+        if (totalTextValuesTruncated > 0)
+        {
+            truncationReasons.Add("maxTextLength");
+        }
+
         var nextRequest = rowLimitTruncated
             ? new
             {
@@ -4074,23 +4116,563 @@ public sealed class SqlMetadataService
             : null;
         return new
         {
-            columns,
-            rows,
-            rowCount = rows.Count,
+            columns = lastColumns,
+            rows = lastRows,
+            rowCount = lastRows.Length,
+            resultSets,
             resultSetCount,
+            totalRowCount,
             transactionRolledBack = true,
             businessWritesAllowed = false,
             truncated,
             resultInfo = BuildResultInfo(
-                rows.Count,
-                effectiveMaxRows,
+                totalRowCount,
+                effectiveMaxRows * Math.Max(resultSetCount, 1),
                 truncated,
-                rowLimitTruncated ? "Add filters or raise maxRows within the configured cap." : null,
-                rowLimitTruncated ? "maxRows" : truncation.TextValuesTruncated > 0 ? "maxTextLength" : null),
+                rowLimitTruncated ? "Add filters or raise maxRows within the configured cap." : totalTextValuesTruncated > 0 ? "Use read_lob for complete or chunked LOB values." : null,
+                truncationReasons.Count == 0 ? null : string.Join(",", truncationReasons),
+                new
+                {
+                    resultSetCount,
+                    rowLimitTruncated,
+                    textValuesTruncated = totalTextValuesTruncated,
+                    columnsWithTruncatedText = columnsWithTruncatedText.OrderBy(column => column).ToArray(),
+                    maxRowsPerResultSet = effectiveMaxRows,
+                    maxTextLength = _options.Limits.MaxTextLength,
+                    maxResultMb = _options.Limits.MaxResultMb,
+                    estimatedBytes
+                }),
             nextRequest,
             parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
             elapsedMs = stopwatch.ElapsedMilliseconds
         };
+    }
+
+    public async Task<object> ReadLobAsync(
+        string sql,
+        IReadOnlyDictionary<string, object?>? parameters,
+        int? chunkSize,
+        string? cursor,
+        bool inspectBase64GzipXml,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue,
+        CancellationToken cancellationToken)
+    {
+        _sqlGuard.ValidateReadonlyQuery(sql);
+        var parameterSpecs = BuildUserSqlParameters(parameters);
+        var responseSafeChunkLimit = Math.Max(
+            1,
+            Math.Min(
+                _options.Limits.MaxLobChunkSize,
+                _options.Limits.MaxResultMb * 1024 * 1024 / 4));
+        var effectiveChunkSize = chunkSize is null or <= 0
+            ? Math.Min(65_536, responseSafeChunkLimit)
+            : Math.Clamp(chunkSize.Value, 1, responseSafeChunkLimit);
+        var fingerprint = LobValueCodec.ComputeSha256Hex(
+            Encoding.UTF8.GetBytes(
+                $"read_lob\n{sql}\n{JsonSerializer.Serialize(parameters, JsonResponse.Options)}"));
+        var cursorState = LobValueCodec.DecodeCursor(cursor, fingerprint);
+        var offset = cursorState?.Offset ?? 0;
+        var maxLobBytes = _options.Limits.MaxLobMb * 1024L * 1024L;
+        var stopwatch = Stopwatch.StartNew();
+
+        await using var connection = await _connectionFactory.OpenConnectionAsync(cancellationToken);
+        await using var command = CreateCommand(
+            connection,
+            $"SET LOCK_TIMEOUT {_options.Limits.LockTimeoutMs};\n{sql}");
+        command.CommandTimeout = _options.Limits.CommandTimeoutSeconds;
+        foreach (var parameter in parameterSpecs.Select(CreateSqlParameter))
+        {
+            command.Parameters.Add(parameter);
+        }
+
+        await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
+        if (reader.FieldCount != 1)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.LobShapeInvalid,
+                "read_lob requires exactly one selected column.",
+                $"fieldCount={reader.FieldCount}",
+                "Submit one guarded SELECT that returns one LOB column from one row.",
+                errorDetails: new { expectedColumns = 1, actualColumns = reader.FieldCount });
+        }
+
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            if (cursorState is not null)
+            {
+                throw LobValueCodec.CreateExpiredCursorForMissingValue(cursorState, "row_missing");
+            }
+
+            throw new SqlMcpException(
+                ErrorCodes.LobShapeInvalid,
+                "read_lob query returned no rows.",
+                null,
+                "Check the key predicate and target environment.",
+                errorDetails: new { expectedRows = 1, actualRows = 0 });
+        }
+
+        var columnName = reader.GetName(0);
+        var sqlType = reader.GetDataTypeName(0);
+        if (reader.IsDBNull(0))
+        {
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                throw CreateLobMultipleRowsException();
+            }
+
+            if (cursorState is not null)
+            {
+                throw LobValueCodec.CreateExpiredCursorForMissingValue(cursorState, "value_is_null");
+            }
+
+            stopwatch.Stop();
+            return new
+            {
+                column = new { name = columnName, dataType = sqlType },
+                kind = "null",
+                isNull = true,
+                totalLengthBytes = 0,
+                totalLengthCharacters = (int?)null,
+                sha256 = (string?)null,
+                cursor,
+                nextCursor = (string?)null,
+                hasMore = false,
+                partial = false,
+                truncated = false,
+                parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
+                elapsedMs = stopwatch.ElapsedMilliseconds
+            };
+        }
+
+        object result;
+        if (IsBinaryLobType(sqlType))
+        {
+            await using var stream = reader.GetStream(0);
+            var scan = await LobValueCodec.ScanBinaryAsync(
+                stream,
+                offset,
+                effectiveChunkSize,
+                maxLobBytes,
+                deferCursorBoundaryValidation: cursorState is not null,
+                cancellationToken);
+            var identity = new LobValueIdentity(
+                "binary",
+                scan.TotalLengthBytes,
+                scan.TotalLengthBytes,
+                scan.Sha256,
+                "raw-bytes");
+            LobValueCodec.ValidateCursorSource(cursorState, identity);
+            LobValueCodec.ValidateDeferredCursorBoundary(
+                scan.BoundaryError,
+                offset,
+                scan.TotalLengthBytes);
+            var nextCursor = scan.Chunk.NextOffsetBytes is long nextOffset
+                ? LobValueCodec.EncodeCursor(new LobCursorState(
+                    nextOffset,
+                    fingerprint,
+                    identity.IdentitySha256,
+                    identity.IdentityEncoding,
+                    identity.Kind,
+                    identity.TotalLengthUnits,
+                    identity.TotalLengthBytes))
+                : null;
+            result = new
+            {
+                column = new { name = columnName, dataType = sqlType },
+                kind = "binary",
+                isNull = false,
+                totalLengthBytes = scan.TotalLengthBytes,
+                totalLengthCharacters = (int?)null,
+                sha256 = scan.Sha256,
+                hashEncoding = "raw-bytes",
+                cursorIdentity = new
+                {
+                    sha256 = identity.IdentitySha256,
+                    identityEncoding = identity.IdentityEncoding,
+                    identity.TotalLengthUnits,
+                    identity.TotalLengthBytes
+                },
+                chunk = scan.Chunk,
+                cursor,
+                nextCursor,
+                hasMore = nextCursor is not null,
+                partial = nextCursor is not null || offset > 0,
+                truncated = false,
+                chunkLimit = responseSafeChunkLimit,
+                maxLobMb = _options.Limits.MaxLobMb,
+                inspection = (object?)null,
+                parameters = parameterSpecs.Select(ToParameterSummary).ToArray()
+            };
+        }
+        else if (IsTextLobType(sqlType))
+        {
+            using var textReader = reader.GetTextReader(0);
+            var scan = await LobValueCodec.ScanTextAsync(
+                textReader,
+                offset,
+                effectiveChunkSize,
+                maxLobBytes,
+                captureFullText: inspectBase64GzipXml,
+                deferCursorBoundaryValidation: cursorState is not null,
+                cancellationToken);
+            var identity = new LobValueIdentity(
+                "text",
+                scan.TotalLengthCharacters,
+                scan.TotalLengthUtf8Bytes,
+                scan.Sha256Utf16Le,
+                "utf-16le-code-units");
+            LobValueCodec.ValidateCursorSource(cursorState, identity);
+            LobValueCodec.ValidateDeferredCursorBoundary(
+                scan.BoundaryError,
+                offset,
+                scan.TotalLengthCharacters);
+            var nextCursor = scan.Chunk.NextOffsetCharacters is long nextOffset
+                ? LobValueCodec.EncodeCursor(new LobCursorState(
+                    nextOffset,
+                    fingerprint,
+                    identity.IdentitySha256,
+                    identity.IdentityEncoding,
+                    identity.Kind,
+                    identity.TotalLengthUnits,
+                    identity.TotalLengthBytes))
+                : null;
+            var isUnicodeSqlType = sqlType.StartsWith("n", StringComparison.OrdinalIgnoreCase);
+            var inspection = inspectBase64GzipXml
+                ? ReportPayloadCodec.Inspect(
+                    scan.FullText!,
+                    _options.Limits.MaxLobMb,
+                    targetElementName,
+                    targetAttributeName,
+                    targetAttributeValue)
+                : null;
+            result = new
+            {
+                column = new { name = columnName, dataType = sqlType },
+                kind = "text",
+                isNull = false,
+                totalLengthBytes = scan.TotalLengthUtf8Bytes,
+                totalLengthCharacters = scan.TotalLengthCharacters,
+                sha256 = scan.Sha256Utf8,
+                hashEncoding = "utf-8",
+                cursorIdentity = new
+                {
+                    sha256 = identity.IdentitySha256,
+                    identityEncoding = identity.IdentityEncoding,
+                    identity.TotalLengthUnits,
+                    identity.TotalLengthBytes
+                },
+                databaseValueHash = new
+                {
+                    sha256 = isUnicodeSqlType ? scan.Sha256Utf16Le : scan.Sha256Utf8,
+                    encoding = isUnicodeSqlType ? "utf-16le" : scan.IsAscii ? "ascii" : "utf-8-normalized",
+                    exactSqlStorageBytes = isUnicodeSqlType || scan.IsAscii
+                },
+                chunk = scan.Chunk,
+                cursor,
+                nextCursor,
+                hasMore = nextCursor is not null,
+                partial = nextCursor is not null || offset > 0,
+                truncated = false,
+                chunkLimit = responseSafeChunkLimit,
+                maxLobMb = _options.Limits.MaxLobMb,
+                inspection,
+                parameters = parameterSpecs.Select(ToParameterSummary).ToArray()
+            };
+        }
+        else
+        {
+            throw new SqlMcpException(
+                ErrorCodes.LobShapeInvalid,
+                "read_lob selected a non-LOB data type.",
+                $"dataType={sqlType}",
+                "Select an nvarchar/varchar/text/xml or varbinary/binary/image column.",
+                errorDetails: new { dataType = sqlType });
+        }
+
+        if (await reader.ReadAsync(cancellationToken))
+        {
+            throw CreateLobMultipleRowsException();
+        }
+
+        stopwatch.Stop();
+        return new
+        {
+            value = result,
+            summary = "LOB value was hashed in full and returned as a bounded, resumable chunk without MaxTextLength truncation.",
+            elapsedMs = stopwatch.ElapsedMilliseconds
+        };
+    }
+
+    public object InspectReportPayload(
+        string reportStringBase64,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue)
+    {
+        var inspection = ReportPayloadCodec.Inspect(
+            reportStringBase64,
+            _options.Limits.MaxLobMb,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue);
+        return new
+        {
+            inspection,
+            safeForBytePreservingStorage = inspection.ValidationPassed,
+            fastReportRenderingValidated = false,
+            summary = inspection.ValidationPassed
+                ? "Base64/GZip/UTF-8/XML validation passed without reserializing the report bytes."
+                : "Container and XML validation passed, but the optional target-node uniqueness assertion failed."
+        };
+    }
+
+    public object CompareReportPayloads(
+        string originalReportStringBase64,
+        string candidateReportStringBase64,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue,
+        string? originalFragmentBase64,
+        string? replacementFragmentBase64)
+    {
+        var original = ReportPayloadCodec.Inspect(
+            originalReportStringBase64,
+            _options.Limits.MaxLobMb,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue);
+        var candidate = ReportPayloadCodec.Inspect(
+            candidateReportStringBase64,
+            _options.Limits.MaxLobMb,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue);
+        var comparison = ReportPayloadCodec.Compare(original, candidate);
+        if ((originalFragmentBase64 is null) != (replacementFragmentBase64 is null))
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Both originalFragmentBase64 and replacementFragmentBase64 are required for exact replacement proof.");
+        }
+
+        var exactReplacementProof = originalFragmentBase64 is null
+            ? null
+            : ReportPayloadCodec.ProveExactReplacement(
+                original,
+                candidate,
+                originalFragmentBase64,
+                replacementFragmentBase64!);
+        return new
+        {
+            original,
+            candidate,
+            comparison,
+            exactReplacementProof,
+            safeForGuardedPatch = ReportPayloadCodec.IsSafeForGuardedPatch(
+                candidate,
+                comparison,
+                exactReplacementProof),
+            fastReportRenderingValidated = false,
+            summary = comparison.DecompressedExactMatch
+                ? "Decompressed report bytes are identical."
+                : exactReplacementProof?.Proved == true && comparison.ByteLevelInvariantsPreserved
+                    ? "Candidate is exactly one audited byte-fragment replacement and all required invariants are preserved."
+                    : exactReplacementProof is null
+                        ? "General comparison completed; exact fragment inputs are required before safeForGuardedPatch can be true."
+                    : "Report bytes differ and at least one byte-level or structural invariant changed."
+        };
+    }
+
+    public object ReplaceReportPayloadFragment(
+        string originalReportStringBase64,
+        string originalFragmentBase64,
+        string replacementFragmentBase64,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue,
+        GuardedReportPatchTarget? patchTarget)
+    {
+        var build = ReportPayloadCodec.BuildReplacementCandidate(
+            originalReportStringBase64,
+            originalFragmentBase64,
+            replacementFragmentBase64,
+            _options.Limits.MaxLobMb,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue);
+        var patchTargetComplete = patchTarget is not null
+                                  && !string.IsNullOrWhiteSpace(patchTarget.Schema)
+                                  && !string.IsNullOrWhiteSpace(patchTarget.Table)
+                                  && !string.IsNullOrWhiteSpace(patchTarget.KeyColumn)
+                                  && !string.IsNullOrWhiteSpace(patchTarget.KeyValue)
+                                  && !string.IsNullOrWhiteSpace(patchTarget.KeySqlType)
+                                  && !string.IsNullOrWhiteSpace(patchTarget.ReportColumn)
+                                  && !string.IsNullOrWhiteSpace(patchTarget.ReportColumnSqlType);
+        var response = new
+        {
+            build.CandidateReportStringBase64,
+            original = build.Original,
+            candidate = build.Candidate,
+            comparison = build.Comparison,
+            exactReplacementProof = build.ExactReplacementProof,
+            build.SafeForGuardedPatch,
+            outputPolicy = build.OutputPolicy,
+            build.FastReportRenderingValidated,
+            build.ValidationBoundary,
+            nextRequest = new
+            {
+                toolName = "generate_guarded_report_patch",
+                readyToCall = patchTargetComplete,
+                requiredTargetArguments = patchTargetComplete
+                    ? []
+                    : new[]
+                    {
+                        "schema",
+                        "table",
+                        "keyColumn",
+                        "keyValue",
+                        "keySqlType",
+                        "reportColumn",
+                        "reportColumnSqlType"
+                    },
+                arguments = new
+                {
+                    schema = patchTarget?.Schema,
+                    table = patchTarget?.Table,
+                    keyColumn = patchTarget?.KeyColumn,
+                    keyValue = patchTarget?.KeyValue,
+                    keySqlType = patchTarget?.KeySqlType,
+                    reportColumn = patchTarget?.ReportColumn,
+                    reportColumnSqlType = patchTarget?.ReportColumnSqlType,
+                    originalReportStringBase64,
+                    candidateReportStringBase64 = build.CandidateReportStringBase64,
+                    originalFragmentBase64,
+                    replacementFragmentBase64,
+                    targetElementName,
+                    targetAttributeName,
+                    targetAttributeValue
+                }
+            },
+            toolConnectedToDatabase = false,
+            summary = build.SafeForGuardedPatch
+                ? patchTargetComplete
+                    ? "Built a canonical Base64/GZip candidate by one exact decompressed-byte replacement without XML reserialization. nextRequest is ready for the offline generate_guarded_report_patch call."
+                    : "Built a canonical Base64/GZip candidate by one exact decompressed-byte replacement without XML reserialization. Add the listed target arguments before calling generate_guarded_report_patch."
+                : "Built an exact decompressed-byte replacement candidate, but one or more patch invariants are not preserved; review comparison and outputPolicy before proceeding."
+        };
+        var responseLengthBytes = JsonResponse.GetSuccessPayloadLengthBytes(response, _options);
+        var maxResultBytes = _options.Limits.MaxResultMb * 1024L * 1024L;
+        if (responseLengthBytes > maxResultBytes)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ResultTooLarge,
+                "Offline report replacement result exceeded the configured response limit.",
+                $"responseLengthBytes={responseLengthBytes}; maxResultBytes={maxResultBytes}",
+                "Use a smaller payload or raise limits.maxResultMb only after reviewing response-size impact.",
+                errorDetails: new { responseLengthBytes, maxResultBytes, limitUnit = "bytes" });
+        }
+
+        return response;
+    }
+
+    public object GenerateGuardedReportPatch(
+        string schema,
+        string table,
+        string keyColumn,
+        string keyValue,
+        string keySqlType,
+        string reportColumn,
+        string reportColumnSqlType,
+        string originalReportStringBase64,
+        string candidateReportStringBase64,
+        string originalFragmentBase64,
+        string replacementFragmentBase64,
+        string? targetElementName,
+        string? targetAttributeName,
+        string? targetAttributeValue)
+    {
+        var original = ReportPayloadCodec.Inspect(
+            originalReportStringBase64,
+            _options.Limits.MaxLobMb,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue);
+        var candidate = ReportPayloadCodec.Inspect(
+            candidateReportStringBase64,
+            _options.Limits.MaxLobMb,
+            targetElementName,
+            targetAttributeName,
+            targetAttributeValue);
+        var comparison = ReportPayloadCodec.Compare(original, candidate);
+        var exactReplacementProof = ReportPayloadCodec.ProveExactReplacement(
+            original,
+            candidate,
+            originalFragmentBase64,
+            replacementFragmentBase64);
+        var patch = GuardedReportPatchGenerator.Generate(
+            schema,
+            table,
+            keyColumn,
+            keyValue,
+            keySqlType,
+            reportColumn,
+            reportColumnSqlType,
+            originalReportStringBase64,
+            candidateReportStringBase64,
+            original,
+            candidate,
+            comparison,
+            exactReplacementProof);
+        var patchLengthBytes = Encoding.UTF8.GetByteCount(patch.Script);
+        var maxResultBytes = _options.Limits.MaxResultMb * 1024L * 1024L;
+        if (patchLengthBytes > maxResultBytes)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ResultTooLarge,
+                "Generated report patch exceeded the configured response limit.",
+                $"patchLengthBytes={patchLengthBytes}; maxResultMb={_options.Limits.MaxResultMb}",
+                "Review whether embedding both full values is appropriate, then raise limits.maxResultMb deliberately or use a smaller approved payload.");
+        }
+
+        return new
+        {
+            patch,
+            patchLengthBytes,
+            original,
+            candidate,
+            comparison,
+            exactReplacementProof,
+            toolExecutedDatabaseWrite = false,
+            defaultExecutionMode = "read_only_preflight",
+            fastReportRenderingValidated = false,
+            summary = "Generated an auditable patch with exact byte-replacement proof. @Apply=0 performs read-only preflight and exits before locks or UPDATE; the MCP tool executed no database command."
+        };
+    }
+
+    private static bool IsBinaryLobType(string sqlType)
+    {
+        return sqlType.Contains("binary", StringComparison.OrdinalIgnoreCase)
+               || sqlType.Equals("image", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsTextLobType(string sqlType)
+    {
+        return sqlType.Contains("char", StringComparison.OrdinalIgnoreCase)
+               || sqlType.Equals("text", StringComparison.OrdinalIgnoreCase)
+               || sqlType.Equals("ntext", StringComparison.OrdinalIgnoreCase)
+               || sqlType.Equals("xml", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static SqlMcpException CreateLobMultipleRowsException()
+    {
+        return new SqlMcpException(
+            ErrorCodes.LobShapeInvalid,
+            "read_lob query returned more than one row.",
+            null,
+            "Use a unique key predicate; TOP without a unique predicate is not a substitute for identity.",
+            errorDetails: new { expectedRows = 1, actualRows = "more_than_one" });
     }
 
     public async Task<object> BatchMetadataAsync(
