@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 2.4.1 - 2026-09-11
+
+- Allowed one-level `OPENQUERY` table sources in single guarded `SELECT`/`WITH` queries and estimated-plan requests. The pass-through text must be a string literal that independently parses as one query under the same read-only, cross-database, DMV, and side-effect restrictions; nested external sources remain blocked. `OPENROWSET`, `OPENDATASOURCE`, and `OPENQUERY` inside controlled multi-statement batches remain rejected.
+
 ## 2.4.0 - 2026-08-30
 
 - Expanded `run_readonly_batch` through ScriptDom-only proof rules to allow `SET @local`, direct local `#temp` `UPDATE`/`DELETE`, and multiple SELECT result sets while continuing to reject permanent writes, global `##temp` objects, uncertain aliases, dynamic SQL, procedure execution, explicit transactions, unsupported DDL, external sources, cross-database access, and sequence advancement. Every accepted batch still runs inside an MCP-owned transaction that is always rolled back.

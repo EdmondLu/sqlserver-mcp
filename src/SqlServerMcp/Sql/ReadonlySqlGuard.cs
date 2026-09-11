@@ -25,12 +25,18 @@ public sealed class ReadonlySqlGuard
 
     public void ValidateReadonlyQuery(string sql)
     {
-        ValidateReadonlySelect(sql, "Only one read-only SELECT or WITH CTE query is supported.");
+        ValidateReadonlySelect(
+            sql,
+            "Only one read-only SELECT or WITH CTE query is supported.",
+            allowOpenQuery: true);
     }
 
     public void ValidateShowplanQuery(string sql)
     {
-        ValidateReadonlySelect(sql, "Only one read-only SELECT or WITH CTE query can be explained.");
+        ValidateReadonlySelect(
+            sql,
+            "Only one read-only SELECT or WITH CTE query can be explained.",
+            allowOpenQuery: true);
     }
 
     public void ValidateReadonlyBatch(string sql)
@@ -91,7 +97,7 @@ public sealed class ReadonlySqlGuard
 
         var batchVisitor = new ReadonlyBatchVisitor();
         fragment.Accept(batchVisitor);
-        var objectVisitor = new GuardVisitor(_options.Security);
+        var objectVisitor = new GuardVisitor(_options.Security, allowOpenQuery: false);
         fragment.Accept(objectVisitor);
         var allErrors = batchVisitor.Errors.Concat(objectVisitor.Errors).Distinct().ToArray();
         if (allErrors.Length > 0)
@@ -118,7 +124,7 @@ public sealed class ReadonlySqlGuard
             });
     }
 
-    private void ValidateReadonlySelect(string sql, string parseHint)
+    private void ValidateReadonlySelect(string sql, string parseHint, bool allowOpenQuery)
     {
         if (string.IsNullOrWhiteSpace(sql))
         {
@@ -171,7 +177,13 @@ public sealed class ReadonlySqlGuard
                 "Remove INTO and return rows directly.");
         }
 
-        var visitor = new GuardVisitor(_options.Security);
+        var visitor = new GuardVisitor(
+            _options.Security,
+            allowOpenQuery,
+            remoteSql => ValidateReadonlySelect(
+                remoteSql,
+                "The OPENQUERY text must contain one read-only SELECT or WITH CTE query.",
+                allowOpenQuery: false));
         selectStatement.Accept(visitor);
 
         if (visitor.Errors.Count > 0)
@@ -211,10 +223,17 @@ public sealed class ReadonlySqlGuard
         };
 
         private readonly SecurityOptions _security;
+        private readonly bool _allowOpenQuery;
+        private readonly Action<string>? _validateOpenQuery;
 
-        public GuardVisitor(SecurityOptions security)
+        public GuardVisitor(
+            SecurityOptions security,
+            bool allowOpenQuery,
+            Action<string>? validateOpenQuery = null)
         {
             _security = security;
+            _allowOpenQuery = allowOpenQuery;
+            _validateOpenQuery = validateOpenQuery;
         }
 
         public List<string> Errors { get; } = [];
@@ -239,7 +258,23 @@ public sealed class ReadonlySqlGuard
 
         public override void ExplicitVisit(OpenQueryTableReference node)
         {
-            RejectExternalDataSource("OPENQUERY");
+            if (!_allowOpenQuery || _validateOpenQuery is null)
+            {
+                Errors.Add("OPENQUERY is allowed only in a single guarded SELECT or WITH CTE query.");
+                base.ExplicitVisit(node);
+                return;
+            }
+
+            try
+            {
+                _validateOpenQuery(node.Query.Value);
+            }
+            catch (SqlMcpException ex)
+            {
+                var detail = string.IsNullOrWhiteSpace(ex.Detail) ? ex.Message : ex.Detail;
+                Errors.Add($"OPENQUERY remote query is not allowed: {detail}");
+            }
+
             base.ExplicitVisit(node);
         }
 

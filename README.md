@@ -13,7 +13,7 @@ A Windows-first, read-only [Model Context Protocol](https://modelcontextprotocol
 - 44 focused tools for connection checks, object resolution, schema inspection, dependency/call-graph analysis, deployment validation, guarded diagnostics, LOB/report-byte inspection, and estimated query plans.
 - Lazy database connections: startup registers tools but does not connect to SQL Server or scan the database.
 - Credentials are read from Windows Credential Manager and are never stored in the JSON config.
-- A ScriptDom-based guard accepts one `SELECT`/`WITH` query, or a tightly controlled diagnostic batch limited to local variables, local `#temp` DML, and SELECT result sets; uncertain statements and persistent side effects remain rejected.
+- A ScriptDom-based guard accepts one `SELECT`/`WITH` query, including one-level `OPENQUERY` sources whose inner text independently passes the same guard, or a tightly controlled diagnostic batch limited to local variables, local `#temp` DML, and SELECT result sets; uncertain statements and persistent side effects remain rejected.
 - Every tool returns native MCP `structuredContent` plus a short compatibility text summary and a connection context containing server, database, read-only state, login, timestamp, elapsed time, and isolation level.
 - Result row, payload, text-length, lock-wait, command, and connection limits are configurable.
 - Bounded tools include a `resultInfo` block that summarizes returned rows/items, limits, truncation reasons, and narrowing hints.

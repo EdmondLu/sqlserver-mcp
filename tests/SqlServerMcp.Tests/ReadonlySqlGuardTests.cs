@@ -28,7 +28,6 @@ public sealed class ReadonlySqlGuardTests
     [InlineData("USE OtherDb; SELECT * FROM dbo.TableA;")]
     [InlineData("SELECT * FROM OtherDb.dbo.TableA;")]
     [InlineData("SELECT * FROM sys.dm_exec_requests;")]
-    [InlineData("SELECT * FROM OPENQUERY([RemoteServer], 'SELECT 1');")]
     [InlineData("SELECT * FROM OPENROWSET(BULK 'C:\\secret.txt', SINGLE_CLOB) AS contents;")]
     [InlineData("SELECT * FROM OPENDATASOURCE('MSOLEDBSQL', 'Server=remote;Trusted_Connection=yes;').SampleDb.dbo.TableA;")]
     [InlineData("SELECT * FROM ##items;")]
@@ -39,6 +38,54 @@ public sealed class ReadonlySqlGuardTests
         var ex = Assert.Throws<SqlMcpException>(() => guard.ValidateReadonlyQuery(sql));
 
         Assert.Contains(ex.ErrorCode, new[] { ErrorCodes.SqlGuardRejected, ErrorCodes.SqlParseFailed });
+    }
+
+    [Fact]
+    public void ValidateReadonlyQuery_AllowsGuardedOpenQueryWithJoinsAliasesAndUnicode()
+    {
+        var guard = new ReadonlySqlGuard(CreateOptions());
+
+        guard.ValidateReadonlyQuery(
+            """
+            SELECT RemoteRows.*,
+                [本地单号]=LocalHeader.document_no,
+                [本地明细ID]=CONVERT(NVARCHAR(30),LocalDetail.id),
+                [本地物料]=LocalDetail.item_code
+            FROM OPENQUERY(RemoteSqlServer,'
+                SELECT [远程单号]=RemoteHeader.document_no,
+                    [远程明细GUID]=CONVERT(NVARCHAR(36),RemoteDetail.detail_guid),
+                    [卷号]=RemoteDetail.roll_no,
+                    [远程物料]=RemoteDetail.item_code,
+                    [远程数量]=RemoteDetail.quantity,
+                    [本地明细ID]=CONVERT(NVARCHAR(30),RemoteDetail.local_detail_id)
+                FROM dbo.RemoteHeader
+                JOIN dbo.RemoteDetail ON RemoteDetail.header_guid=RemoteHeader.header_guid
+                LEFT JOIN dbo.RemoteNotice ON RemoteNotice.detail_guid=RemoteDetail.source_detail_guid
+                WHERE RemoteHeader.document_no=N''DOC-001''
+            ') RemoteRows
+            LEFT JOIN dbo.LocalDetail ON LocalDetail.id=RemoteRows.[本地明细ID]
+                AND RemoteRows.[本地明细ID]<>N'0'
+            LEFT JOIN dbo.LocalHeader ON LocalHeader.id=LocalDetail.header_id
+            ORDER BY RemoteRows.[卷号],RemoteRows.[远程明细GUID],LocalDetail.id;
+            """);
+    }
+
+    [Theory]
+    [InlineData("SELECT * FROM OPENQUERY(RemoteServer, 'UPDATE dbo.Items SET value = 1;');")]
+    [InlineData("SELECT * FROM OPENQUERY(RemoteServer, 'EXEC dbo.ChangeItems;');")]
+    [InlineData("SELECT * FROM OPENQUERY(RemoteServer, 'SELECT * INTO dbo.CopiedItems FROM dbo.Items;');")]
+    [InlineData("SELECT * FROM OPENQUERY(RemoteServer, 'SELECT 1; SELECT 2;');")]
+    [InlineData("SELECT * FROM OPENQUERY(RemoteServer, 'SELECT * FROM OtherDb.dbo.Items;');")]
+    [InlineData("SELECT * FROM OPENQUERY(RemoteServer, 'SELECT * FROM OPENQUERY(RemoteServer2, ''SELECT 1'');');")]
+    [InlineData("SELECT * FROM OPENQUERY(RemoteServer, 'SELECT * FROM OPENROWSET(BULK ''C:\\secret.txt'', SINGLE_CLOB) AS contents;');")]
+    public void ValidateReadonlyQuery_RejectsUnsafeOpenQueryText(string sql)
+    {
+        var guard = new ReadonlySqlGuard(CreateOptions());
+
+        var ex = Assert.Throws<SqlMcpException>(() => guard.ValidateReadonlyQuery(sql));
+
+        Assert.Equal(ErrorCodes.SqlGuardRejected, ex.ErrorCode);
+        Assert.Contains("OPENQUERY remote query is not allowed", ex.Detail, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -121,6 +168,7 @@ public sealed class ReadonlySqlGuardTests
     [InlineData("DELETE FROM dbo.TableA; SELECT 1;")]
     [InlineData("BEGIN TRANSACTION; SELECT 1; ROLLBACK TRANSACTION;")]
     [InlineData("SET NOCOUNT ON; SELECT 1;")]
+    [InlineData("SELECT * FROM OPENQUERY(RemoteServer, 'SELECT 1');")]
     [InlineData("DROP TABLE #items; SELECT 1;")]
     [InlineData("DECLARE @sql nvarchar(max)=N'SELECT 1'; EXEC(@sql); SELECT 1;")]
     [InlineData("CREATE TABLE #items(id int); INSERT INTO #items EXEC dbo.SomeProcedure; SELECT 1;")]
