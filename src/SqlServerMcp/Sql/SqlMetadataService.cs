@@ -812,6 +812,7 @@ public sealed class SqlMetadataService
             effectiveIncludeDescriptions,
             selectedColumns,
             cancellationToken);
+        var columnSelection = BuildDescribeColumnSelection(selectedColumns, columns);
 
         return new
         {
@@ -830,6 +831,7 @@ public sealed class SqlMetadataService
                 defaults = effectiveIncludeDefaults,
                 descriptions = effectiveIncludeDescriptions
             },
+            columnSelection,
             columns,
             indexes = effectiveIncludeIndexes ? await GetIndexesCoreAsync(dbObject.ObjectId, cancellationToken) : null,
             constraints = effectiveIncludeConstraints ? await GetConstraintsCoreAsync(dbObject.ObjectId, cancellationToken) : null,
@@ -4157,15 +4159,19 @@ public sealed class SqlMetadataService
         string? targetElementName,
         string? targetAttributeName,
         string? targetAttributeValue,
+        string[]? searchTerms,
+        int? searchContextCharacters,
+        int? maxMatchesPerTerm,
         CancellationToken cancellationToken)
     {
         _sqlGuard.ValidateReadonlyQuery(sql);
+        var normalizedSearchTerms = LobValueCodec.NormalizeSearchTerms(searchTerms);
         var parameterSpecs = BuildUserSqlParameters(parameters);
         var responseSafeChunkLimit = Math.Max(
             1,
             Math.Min(
                 _options.Limits.MaxLobChunkSize,
-                _options.Limits.MaxResultMb * 1024 * 1024 / 4));
+                _options.Limits.MaxResultMb * 1024 * 1024 / 12));
         var effectiveChunkSize = chunkSize is null or <= 0
             ? Math.Min(65_536, responseSafeChunkLimit)
             : Math.Clamp(chunkSize.Value, 1, responseSafeChunkLimit);
@@ -4228,7 +4234,7 @@ public sealed class SqlMetadataService
             }
 
             stopwatch.Stop();
-            return new
+            var nullResponse = new
             {
                 column = new { name = columnName, dataType = sqlType },
                 kind = "null",
@@ -4241,14 +4247,26 @@ public sealed class SqlMetadataService
                 hasMore = false,
                 partial = false,
                 truncated = false,
+                search = (object?)null,
                 parameters = parameterSpecs.Select(ToParameterSummary).ToArray(),
                 elapsedMs = stopwatch.ElapsedMilliseconds
             };
+            EnsureLobResponseWithinLimit(nullResponse, _options);
+            return nullResponse;
         }
 
         object result;
         if (IsBinaryLobType(sqlType))
         {
+            if (normalizedSearchTerms.Length > 0)
+            {
+                throw new SqlMcpException(
+                    ErrorCodes.ConfigInvalid,
+                    "read_lob searchTerms are supported only for text LOBs.",
+                    $"dataType={sqlType}",
+                    "Remove searchTerms or select a text LOB column.");
+            }
+
             await using var stream = reader.GetStream(0);
             var scan = await LobValueCodec.ScanBinaryAsync(
                 stream,
@@ -4302,6 +4320,7 @@ public sealed class SqlMetadataService
                 truncated = false,
                 chunkLimit = responseSafeChunkLimit,
                 maxLobMb = _options.Limits.MaxLobMb,
+                search = (object?)null,
                 inspection = (object?)null,
                 parameters = parameterSpecs.Select(ToParameterSummary).ToArray()
             };
@@ -4316,7 +4335,11 @@ public sealed class SqlMetadataService
                 maxLobBytes,
                 captureFullText: inspectBase64GzipXml,
                 deferCursorBoundaryValidation: cursorState is not null,
-                cancellationToken);
+                cancellationToken,
+                normalizedSearchTerms,
+                searchContextCharacters,
+                maxMatchesPerTerm,
+                searchResultByteBudget: Math.Min(262_144, _options.Limits.MaxResultMb * 1024 * 1024 / 4));
             var identity = new LobValueIdentity(
                 "text",
                 scan.TotalLengthCharacters,
@@ -4377,6 +4400,7 @@ public sealed class SqlMetadataService
                 truncated = false,
                 chunkLimit = responseSafeChunkLimit,
                 maxLobMb = _options.Limits.MaxLobMb,
+                search = scan.Search,
                 inspection,
                 parameters = parameterSpecs.Select(ToParameterSummary).ToArray()
             };
@@ -4397,12 +4421,29 @@ public sealed class SqlMetadataService
         }
 
         stopwatch.Stop();
-        return new
+        var response = new
         {
             value = result,
-            summary = "LOB value was hashed in full and returned as a bounded, resumable chunk without MaxTextLength truncation.",
+            summary = normalizedSearchTerms.Length > 0
+                ? "LOB value was hashed in full, searched across the complete text, and returned with bounded match contexts plus a resumable chunk."
+                : "LOB value was hashed in full and returned as a bounded, resumable chunk without MaxTextLength truncation.",
             elapsedMs = stopwatch.ElapsedMilliseconds
         };
+        EnsureLobResponseWithinLimit(response, _options, _connectionFactory.CachedUserName, stopwatch.ElapsedMilliseconds);
+        return response;
+    }
+
+    internal static void EnsureLobResponseWithinLimit(object response, SqlServerMcpOptions options,
+        string? login = null, long elapsedMs = 0)
+    {
+        if (JsonResponse.GetSuccessPayloadLengthBytes(response, options, login, elapsedMs)
+            > options.Limits.MaxResultMb * 1024L * 1024L)
+        {
+            throw new SqlMcpException(ErrorCodes.ResultTooLarge,
+                "LOB response exceeded the configured result byte limit.",
+                null, "Reduce chunkSize, search context/matches, or disable report inspection.");
+        }
+
     }
 
     public object InspectReportPayload(
@@ -6322,18 +6363,6 @@ public sealed class SqlMetadataService
             .Where(column => !string.IsNullOrWhiteSpace(column))
             .Select(column => column.Trim())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var missingColumns = filter is null
-            ? []
-            : filter.Except(rows.Select(row => row.Name), StringComparer.OrdinalIgnoreCase).ToArray();
-        if (missingColumns.Length > 0)
-        {
-            throw new SqlMcpException(
-                ErrorCodes.ColumnNotFound,
-                "One or more requested columns were not found.",
-                string.Join(", ", missingColumns),
-                "Use mode=shape without columns to inspect available names.");
-        }
-
         return rows
             .Where(row => filter is null || filter.Count == 0 || filter.Contains(row.Name))
             .Select(row =>
@@ -6366,6 +6395,38 @@ public sealed class SqlMetadataService
                 return (object)item;
             })
             .ToArray();
+    }
+
+    internal static DescribeColumnSelection? BuildDescribeColumnSelection(
+        string[]? selectedColumns,
+        IReadOnlyCollection<object> returnedColumns)
+    {
+        var requested = selectedColumns?
+            .Where(column => !string.IsNullOrWhiteSpace(column))
+            .Select(column => column.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray() ?? [];
+        if (requested.Length == 0)
+        {
+            return null;
+        }
+
+        var matchedNames = returnedColumns
+            .OfType<IReadOnlyDictionary<string, object?>>()
+            .Select(column => column.TryGetValue("name", out var value) ? value?.ToString() : null)
+            .OfType<string>()
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var matched = requested.Where(matchedNames.Contains).ToArray();
+        var missing = requested.Where(column => !matchedNames.Contains(column)).ToArray();
+        return new DescribeColumnSelection(
+            requested,
+            matched,
+            missing,
+            missing.Length == 0,
+            matched.Length,
+            missing.Length == 0
+                ? null
+                : "Some requested columns were not found. Use describe_table without columns or find_column to inspect current names.");
     }
 
     private async Task<object[]> GetIndexesCoreAsync(int objectId, CancellationToken cancellationToken)
@@ -11208,6 +11269,14 @@ public sealed class SqlMetadataService
         bool IsNotTrusted,
         string Direction);
 }
+
+internal sealed record DescribeColumnSelection(
+    string[] Requested,
+    string[] Matched,
+    string[] Missing,
+    bool AllMatched,
+    int ReturnedCount,
+    string? Hint);
 
 internal static class SqlDataReaderExtensions
 {

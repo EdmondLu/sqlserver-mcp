@@ -555,6 +555,9 @@ public sealed class SqlServerToolService
         string? targetElementName,
         string? targetAttributeName,
         string? targetAttributeValue,
+        string[]? searchTerms,
+        int? searchContextCharacters,
+        int? maxMatchesPerTerm,
         CancellationToken cancellationToken)
     {
         return ExecuteAsync(
@@ -568,6 +571,9 @@ public sealed class SqlServerToolService
                 targetElementName,
                 targetAttributeName,
                 targetAttributeValue,
+                searchTerms,
+                searchContextCharacters,
+                maxMatchesPerTerm,
                 cancellationToken),
             sql: _options.Logging.LogSql ? sql : null);
     }

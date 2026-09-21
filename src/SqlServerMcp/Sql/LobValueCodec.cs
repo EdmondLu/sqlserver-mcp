@@ -8,6 +8,12 @@ namespace SqlServerMcp.Sql;
 internal static class LobValueCodec
 {
     private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
+    private const int DefaultSearchContextCharacters = 160;
+    private const int MaxSearchContextCharacters = 500;
+    private const int DefaultMatchesPerTerm = 10;
+    private const int MaxMatchesPerTerm = 20;
+    private const int MaxSearchTerms = 10;
+    private const int MaxSearchTermLength = 512;
 
     public static async Task<TextLobScanResult> ScanTextAsync(
         TextReader reader,
@@ -16,7 +22,11 @@ internal static class LobValueCodec
         long maxUtf8Bytes,
         bool captureFullText,
         bool deferCursorBoundaryValidation = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string[]? searchTerms = null,
+        int? searchContextCharacters = null,
+        int? maxMatchesPerTerm = null,
+        int searchResultByteBudget = 262_144)
     {
         ValidateRequest(offsetCharacters, requestedSize);
         using var utf8Hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -27,6 +37,9 @@ internal static class LobValueCodec
         var utf16Buffer = new byte[charBuffer.Length * 2];
         var chunkBuffer = new StringBuilder(Math.Min(checked(requestedSize + 1), 1_048_576));
         var fullText = captureFullText ? new StringBuilder() : null;
+        var terms = NormalizeSearchTerms(searchTerms);
+        var search = terms.Length == 0 ? null : new StreamingTextSearch(
+            terms, searchContextCharacters, maxMatchesPerTerm, searchResultByteBudget);
         var totalCharacters = 0L;
         var totalUtf8Bytes = 0L;
         var isAscii = true;
@@ -78,6 +91,7 @@ internal static class LobValueCodec
             EnsureWithinLimit(totalUtf8Bytes, maxUtf8Bytes);
             utf8Hash.AppendData(utf8Buffer, 0, utf8Count);
             totalCharacters += read;
+            search?.Append(charBuffer.AsSpan(0, read));
         }
 
         var finalUtf8Count = utf8Encoder.GetBytes(
@@ -134,7 +148,8 @@ internal static class LobValueCodec
                 ChunkSha256: ComputeSha256Hex(chunkUtf8),
                 NextOffsetCharacters: nextOffset),
             BoundaryError: boundaryError,
-            FullText: fullText?.ToString());
+            FullText: fullText?.ToString(),
+            Search: search?.Complete());
     }
 
     public static async Task<BinaryLobScanResult> ScanBinaryAsync(
@@ -322,6 +337,144 @@ internal static class LobValueCodec
         return ToHex(SHA256.HashData(value));
     }
 
+    public static string[] NormalizeSearchTerms(string[]? searchTerms)
+    {
+        var terms = searchTerms?
+            .Where(term => !string.IsNullOrEmpty(term))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray() ?? [];
+        if (terms.Length > MaxSearchTerms)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "Too many LOB search terms.",
+                $"count={terms.Length}; max={MaxSearchTerms}",
+                $"Pass at most {MaxSearchTerms} distinct search terms.");
+        }
+
+        var oversized = terms.FirstOrDefault(term => term.Length > MaxSearchTermLength);
+        if (oversized is not null)
+        {
+            throw new SqlMcpException(
+                ErrorCodes.ConfigInvalid,
+                "LOB search term is too long.",
+                $"length={oversized.Length}; max={MaxSearchTermLength}",
+                $"Keep each search term at or below {MaxSearchTermLength} characters.");
+        }
+
+        return terms;
+    }
+
+    // Only a bounded overlap window survives each read. Each term's search frontier
+    // moves forward once; defer starts until their right context and surrogate lookahead exist.
+    private sealed class StreamingTextSearch
+    {
+        private readonly SearchTermState[] _terms;
+        private readonly int _context;
+        private readonly int _maxMatches;
+        private readonly int _lookahead;
+        private readonly StringBuilder _window = new();
+        private long _windowStart;
+        private int _remainingBytes;
+
+        public StreamingTextSearch(string[] terms, int? context, int? maxMatches, int byteBudget)
+        {
+            _terms = terms.Select(term => new SearchTermState(term)).ToArray();
+            _context = Math.Clamp(context ?? DefaultSearchContextCharacters, 0, MaxSearchContextCharacters);
+            _maxMatches = Math.Clamp(maxMatches ?? DefaultMatchesPerTerm, 1, MaxMatchesPerTerm);
+            _lookahead = terms.Select(term => term.Length).DefaultIfEmpty(0).Max() + _context + 1;
+            // Reserve bounded term metadata separately from snippet objects.
+            _remainingBytes = Math.Max(0, byteBudget - 40_960);
+        }
+
+        public void Append(ReadOnlySpan<char> block)
+        {
+            _window.Append(block);
+            Process(final: false);
+        }
+
+        private void Process(bool final)
+        {
+            var text = _window.ToString();
+            var end = _windowStart + text.Length;
+            var eligibleEnd = final ? end : Math.Max(_windowStart, end - _lookahead);
+            foreach (var state in _terms)
+            {
+                while (state.NextStart < eligibleEnd)
+                {
+                    var start = text.IndexOf(state.Term, checked((int)(state.NextStart - _windowStart)),
+                        StringComparison.OrdinalIgnoreCase);
+                    if (start < 0 || _windowStart + start >= eligibleEnd)
+                    {
+                        state.NextStart = eligibleEnd;
+                        break;
+                    }
+
+                    state.Count++;
+                    var matchEnd = start + state.Term.Length;
+                    state.NextStart = _windowStart + matchEnd; // Non-overlapping per term.
+                    if (state.Matches.Count >= _maxMatches || state.BudgetExhausted || _remainingBytes == 0)
+                    {
+                        continue;
+                    }
+
+                    var snippetStart = Math.Max(0, start - _context);
+                    var snippetEnd = Math.Min(text.Length, matchEnd + _context);
+                    if (snippetStart > 0 && char.IsSurrogatePair(text, snippetStart - 1))
+                    {
+                        snippetStart--;
+                    }
+
+                    if (snippetEnd > 0 && snippetEnd < text.Length && char.IsSurrogatePair(text, snippetEnd - 1))
+                    {
+                        snippetEnd++;
+                    }
+
+                    var match = new TextLobSearchMatch(state.Count, _windowStart + start,
+                        _windowStart + matchEnd, _windowStart + snippetStart, _windowStart + snippetEnd,
+                        _windowStart + snippetStart > 0, !final || snippetEnd < text.Length,
+                        text[snippetStart..snippetEnd]);
+                    var bytes = JsonSerializer.SerializeToUtf8Bytes(match, JsonResponse.Options).Length + 256;
+                    if (bytes <= _remainingBytes)
+                    {
+                        state.Matches.Add(match);
+                        _remainingBytes -= bytes;
+                    }
+                    else
+                    {
+                        state.BudgetExhausted = true;
+                    }
+                }
+            }
+
+            var keepFrom = Math.Max(_windowStart,
+                _terms.Select(term => term.NextStart).DefaultIfEmpty(end).Min() - _context - 1);
+            var remove = checked((int)Math.Min(text.Length, keepFrom - _windowStart));
+            _window.Remove(0, remove);
+            _windowStart += remove;
+        }
+
+        public TextLobSearchResult Complete()
+        {
+            Process(final: true);
+            var terms = _terms.Select(term => new TextLobSearchTermResult(term.Term, term.Count,
+                term.Matches.Count, term.Count > term.Matches.Count, term.Matches.ToArray())).ToArray();
+            var count = terms.Sum(term => term.MatchCount);
+            var returned = terms.Sum(term => term.ReturnedCount);
+            return new TextLobSearchResult("ordinal_ignore_case", _context, _maxMatches,
+                count, returned, count > returned, count > 0, terms);
+        }
+
+        private sealed class SearchTermState(string term)
+        {
+            public string Term { get; } = term;
+            public long NextStart { get; set; }
+            public long Count { get; set; }
+            public bool BudgetExhausted { get; set; }
+            public List<TextLobSearchMatch> Matches { get; } = [];
+        }
+    }
+
     private static string ToHex(ReadOnlySpan<byte> value)
     {
         return Convert.ToHexString(value).ToLowerInvariant();
@@ -394,7 +547,8 @@ internal sealed record TextLobScanResult(
     bool IsAscii,
     TextLobChunk Chunk,
     string? BoundaryError,
-    string? FullText);
+    string? FullText,
+    TextLobSearchResult? Search);
 
 internal sealed record BinaryLobScanResult(
     long TotalLengthBytes,
@@ -416,3 +570,30 @@ internal sealed record BinaryLobChunk(
     string Base64,
     string ChunkSha256,
     long? NextOffsetBytes);
+
+internal sealed record TextLobSearchResult(
+    string MatchMode,
+    int ContextCharacters,
+    int MaxMatchesPerTerm,
+    long TotalMatchCount,
+    int ReturnedMatchCount,
+    bool Truncated,
+    bool AnyMatch,
+    TextLobSearchTermResult[] Terms);
+
+internal sealed record TextLobSearchTermResult(
+    string Term,
+    long MatchCount,
+    int ReturnedCount,
+    bool Truncated,
+    TextLobSearchMatch[] Matches);
+
+internal sealed record TextLobSearchMatch(
+    long Occurrence,
+    long StartCharacter,
+    long EndCharacterExclusive,
+    long SnippetStartCharacter,
+    long SnippetEndCharacterExclusive,
+    bool BeforeTruncated,
+    bool AfterTruncated,
+    string Snippet);
