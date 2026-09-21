@@ -278,6 +278,48 @@ public sealed class ModuleFileDiffTests
         Assert.Equal(expectedDefaults, preset.IncludeDefaults);
     }
 
+    [Fact]
+    public void BuildDescribeColumnSelection_ReturnsMatchesAndMissingWithoutFailing()
+    {
+        object[] returnedColumns =
+        [
+            new Dictionary<string, object?> { ["name"] = "id" },
+            new Dictionary<string, object?> { ["name"] = "bill_no" }
+        ];
+
+        var selection = SqlMetadataService.BuildDescribeColumnSelection(
+            [" ID ", "missing_column", "bill_no", "id"],
+            returnedColumns);
+
+        Assert.NotNull(selection);
+        Assert.Equal(["ID", "missing_column", "bill_no"], selection.Requested);
+        Assert.Equal(["ID", "bill_no"], selection.Matched);
+        Assert.Equal(["missing_column"], selection.Missing);
+        Assert.False(selection.AllMatched);
+        Assert.Equal(2, selection.ReturnedCount);
+        Assert.NotNull(selection.Hint);
+    }
+
+    [Fact]
+    public void BuildDescribeColumnSelection_AllMissingEmptyAndAllMatchedAreExplicit()
+    {
+        var missing = SqlMetadataService.BuildDescribeColumnSelection(["stale", "STALE", "", null!], []);
+        Assert.NotNull(missing);
+        Assert.Equal(["stale"], missing.Missing);
+        Assert.Empty(missing.Matched);
+        Assert.False(missing.AllMatched);
+        Assert.Equal(0, missing.ReturnedCount);
+        object[] columns = [new Dictionary<string, object?> { ["name"] = "Id" }];
+        Assert.Null(SqlMetadataService.BuildDescribeColumnSelection(null, columns));
+        Assert.Null(SqlMetadataService.BuildDescribeColumnSelection([], columns));
+        Assert.Null(SqlMetadataService.BuildDescribeColumnSelection([" ", "", null!], columns));
+        var matched = SqlMetadataService.BuildDescribeColumnSelection(["id", "ID"], columns);
+        Assert.True(matched!.AllMatched);
+        Assert.Equal(1, matched.ReturnedCount);
+        Assert.Empty(matched.Missing);
+        Assert.Null(matched.Hint);
+    }
+
     [Theory]
     [InlineData(true, true, true, true, "exact_match")]
     [InlineData(false, true, true, true, "wrapper_only")]

@@ -47,13 +47,13 @@ public static class SqlServerMcpTools
         return service.ResolveObjectAsync(name, schema, objectTypes, limit, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Describe a SQL Server table or view with compact shape, write_contract, keys, performance, or full presets and explicit include overrides.")]
+    [McpServerTool(ReadOnly = true), Description("Describe a SQL Server table or view with compact shape, write_contract, keys, performance, or full presets and explicit include overrides. Unknown requested column names do not fail the call; inspect columnSelection.missing and the returned matches.")]
     public static Task<CallToolResult> DescribeTable(
         SqlServerToolService service,
         [Description("Schema name, usually dbo.")] string schema,
         [Description("Table or view name.")] string name,
         [Description("Preset: shape (default), write_contract, keys, performance, or full.")] string? mode = null,
-        [Description("Optional column names to return.")] string[]? columns = null,
+        [Description("Optional column names to return. Existing names are returned even when other requested names are missing; see columnSelection in the response.")] string[]? columns = null,
         [Description("Override whether index metadata is included.")] bool? includeIndexes = null,
         [Description("Override whether primary key, unique, default, and check constraints are included.")] bool? includeConstraints = null,
         [Description("Override whether outgoing and incoming foreign keys are included.")] bool? includeForeignKeys = null,
@@ -154,7 +154,7 @@ public static class SqlServerMcpTools
         return service.SearchSqlModulesAsync(keyword, objectTypes, limit, cursor, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Return a view, procedure, function, or trigger definition. Optionally return a line range or keyword-centered slices with line numbers. Response includes compare hints for local SQL file vs database object checks.")]
+    [McpServerTool(ReadOnly = true), Description("Return a known view, procedure, function, or trigger definition. Optionally return a line range or keyword-centered slices with line numbers. Use find_objects first when existence or the exact name is uncertain; response includes compare hints for local SQL file vs database object checks.")]
     public static Task<CallToolResult> GetModuleDefinition(
         SqlServerToolService service,
         [Description("Schema name, usually dbo.")] string schema,
@@ -200,7 +200,7 @@ public static class SqlServerMcpTools
         return service.ValidateTsqlScriptAsync(script, sourceName, detailLevel, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Read and statically validate a local .sql file without execution or writes. Defaults to summary output. Legacy readyToDeploy remains static-only; use deploymentReady or validate_deployment for a target-aware safety decision.")]
+    [McpServerTool(ReadOnly = true), Description("Read and statically validate one local .sql file without execution or writes. Defaults to summary output. For multiple module files prefer compare_modules_to_files; for mixed tables/modules/config patches prefer verify_deployment_set. Legacy readyToDeploy remains static-only; use deploymentReady or validate_deployment for a target-aware safety decision.")]
     public static Task<CallToolResult> ValidateTsqlFile(
         SqlServerToolService service,
         [Description("Absolute local .sql file path.")] string filePath,
@@ -250,7 +250,7 @@ public static class SqlServerMcpTools
             cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Compare a SQL Server module definition with a known local .sql file path. Use to confirm whether a repository SQL file has been executed to the database, whether the database procedure/function/view/trigger matches the local file, and what local-vs-target diff remains.")]
+    [McpServerTool(ReadOnly = true), Description("Compare one SQL Server module definition with a known local .sql file path. Use compare_modules_to_files for multiple modules. Reports current definition equivalence and local-vs-target differences; matching text does not prove execution history.")]
     public static Task<CallToolResult> CompareModuleToFile(
         SqlServerToolService service,
         [Description("Schema name, usually dbo.")] string schema,
@@ -499,7 +499,7 @@ public static class SqlServerMcpTools
         return service.RunReadonlyBatchAsync(sql, parameters, maxRows, cancellationToken);
     }
 
-    [McpServerTool(ReadOnly = true), Description("Read exactly one text or binary LOB selected by one guarded read-only query. Hashes the complete value and returns a bounded resumable chunk without MaxTextLength truncation; optional ReportString inspection validates Base64/GZip/UTF-8/XML bytes without reserialization.")]
+    [McpServerTool(ReadOnly = true), Description("Read exactly one text or binary LOB selected by one guarded read-only query. Hashes the complete value and returns a bounded resumable chunk without MaxTextLength truncation. Optional bounded searchTerms scan the complete text value and return match contexts in one call; optional ReportString inspection validates Base64/GZip/UTF-8/XML bytes without reserialization.")]
     public static Task<CallToolResult> ReadLob(
         SqlServerToolService service,
         [Description("Single guarded SELECT that must return exactly one row and one LOB column.")] string sql,
@@ -510,6 +510,9 @@ public static class SqlServerMcpTools
         [Description("Optional XML element local name that must occur exactly once.")] string? targetElementName = null,
         [Description("Optional attribute local name used with targetElementName.")] string? targetAttributeName = null,
         [Description("Optional exact attribute value used with targetAttributeName.")] string? targetAttributeValue = null,
+        [Description("Optional literal terms to search across the complete text LOB using ordinal case-insensitive matching. Up to 10 distinct terms of at most 512 UTF-16 code units; whitespace is literal, null/empty entries ignored, counts non-overlapping per term. Unsupported for non-null binary LOBs; null values have no search result. Repeat on cursor calls to search the whole current value.")] string[]? searchTerms = null,
+        [Description("UTF-16 context units before/after each match, default 160, clamped to 0..500. Original unredacted snippets have zero-based, end-exclusive offsets and a shared response byte budget.")] int? searchContextCharacters = null,
+        [Description("Maximum returned matches per search term. Defaults to 10, clamped to 1..20; byte budget may return fewer contexts, with exact total counts and search.truncated=true.")] int? maxMatchesPerTerm = null,
         CancellationToken cancellationToken = default)
     {
         return service.ReadLobAsync(
@@ -521,6 +524,9 @@ public static class SqlServerMcpTools
             targetElementName,
             targetAttributeName,
             targetAttributeValue,
+            searchTerms,
+            searchContextCharacters,
+            maxMatchesPerTerm,
             cancellationToken);
     }
 

@@ -1,5 +1,7 @@
 # SQL Server MCP
 
+当前版本：**2.5.0**（44 个只读工具）。
+
 一个面向 Windows 的只读 [Model Context Protocol](https://modelcontextprotocol.io/) 服务，可供 Codex 及其他支持 stdio 的 MCP 客户端探索和查询 Microsoft SQL Server。
 
 [English](README.md)
@@ -101,6 +103,8 @@ compact 模块差异即使截断正文，也会完整返回 `totalHunkCount`、`
 
 `compare_modules_to_files` 现在把 `deploymentState` 与 `staticValidationState` 分开；调用方提供的临时表会作为非阻断 `external_temp_table` 契约警告。`diffMode=summary` 默认不再嵌套 diff，可用 `onlyMismatches`、`includeDiff`、`maxTotalTokens` 和 `fields` 明确控制批量输出。`batch_metadata` 会把每个请求的完整受支持参数传给底层操作，包括 `describe_table(mode=full)` 和各项 include 覆盖。
 
+`describe_table(columns=[...])` 同时包含现有字段和已改名/猜测字段时，不再因其中一个字段不存在而整次失败。工具会返回所有匹配字段，并通过 `columnSelection.requested`、`matched`、`missing`、`allMatched` 明确部分命中情况；缺失字段可再用不带 `columns` 的 `describe_table` 或 `find_column` 核实。
+
 `compare_table_to_file` 会把 `CREATE TABLE`、后续 `ALTER TABLE` 和索引语句解析为最终结构，再比较字段、索引、主键/唯一/默认/检查约束及出向外键。表达式通过 ScriptDom 做语义归一，可识别标识符方括号、冗余括号、数字格式、布尔条件顺序和 SQL Server 对 `IN` 的等价 `OR` 展开；默认只返回摘要，并可用 `includeDetails`、`fields`、`maxTotalTokens` 控制输出，`includeDescriptions=true` 时还会比较表和字段的 `MS_Description`。`verify_config_patch_file` 支持字面量赋值和 `REPLACE(column, old, new)` 补丁，但只会通过参数化只读查询核验 `textSearch.targets` 白名单。`verify_deployment_set` 可一次合并表、模块和动态配置结果，并默认只返回差异项；任一本地输入缺失都会使整套状态保持 `inconclusive`，单项明确标为 `local_missing`。
 
 静态校验会绑定可完整推导的 CTE、派生表和 APPLY 投影；剩余派生源不确定性会合并为一条非阻断 `analysis_inconclusive`，并返回引用数、别名数、作用域数和首个位置。表比较详情超过 `maxTotalTokens` 时，会优先保留预算内的前几条差异，再省略完整本地/目标模型，并通过 `omittedDifferenceCount` 精确报告余量。
@@ -117,7 +121,15 @@ compact 模块差异即使截断正文，也会完整返回 `totalHunkCount`、`
 
 `run_readonly_batch` 允许 `DECLARE`、`SET @local`、创建本地 `#temp` / `SELECT INTO #temp`、直接或通过唯一可解析顶层别名针对本地 `#temp` 的 `INSERT` / `UPDATE` / `DELETE`，以及一个或多个 SELECT 结果集。响应通过 `resultSets[]` 保留全部结果集，同时用兼容字段 `columns` / `rows` 返回最后一个结果集。本地临时对象必须恰好只有一个前导 `#`；全局 `##temp` 无论读写都会被拒绝。永久对象写入、无法静态证明的写目标别名、`EXEC`、动态 SQL、显式事务、不支持的 DDL、`NEXT VALUE FOR` 和其它不确定语句会被结构化拒绝；MCP 自己建立的事务即使成功也会强制回滚。
 
-`read_lob` 要求查询精确返回一行一列文本或二进制值。每次调用只做一次顺序扫描，增量计算完整值哈希和长度，只保留请求分块；`maxLobMb` 对文本按 UTF-8 字节、对二进制按原始字节计限。顶层 `sha256` 是供跨系统比对的内容哈希：文本按替换回退后的 UTF-8、二进制按原始字节计算。文本按 UTF-16 代码单元偏移续读且不拆分有效代理项对，二进制以 Base64 分块返回。`nextCursor` 使用独立的 `cursorIdentity`：文本绑定精确 UTF-16LE 代码单元哈希（`identityEncoding=utf-16le-code-units`），二进制绑定原始字节哈希（`identityEncoding=raw-bytes`），并同时绑定 LOB kind、总长度和 SQL/参数指纹；因此两个 UTF-8 替换回退哈希相同但代码单元不同的非法代理项序列也会返回 `LOB_CURSOR_EXPIRED`。调用方必须丢弃之前的所有分块并从头读取。只有显式 `inspectBase64GzipXml=true` 才在既有字节上限内保留完整文本用于容器检查；`nvarchar` 的 UTF-16LE 数据库值哈希也继续返回。
+`read_lob` 要求查询精确返回一行一列文本或二进制值。每次调用只做一次顺序扫描，增量计算完整值哈希和长度，保留请求分块和有界搜索上下文；`maxLobMb` 对文本按 UTF-8 字节、对二进制按原始字节计限。顶层 `sha256` 是供跨系统比对的内容哈希：文本按替换回退后的 UTF-8、二进制按原始字节计算。文本按 UTF-16 代码单元偏移续读且不拆分有效代理项对，二进制以 Base64 分块返回。`nextCursor` 使用独立的 `cursorIdentity`：文本绑定精确 UTF-16LE 代码单元哈希（`identityEncoding=utf-16le-code-units`），二进制绑定原始字节哈希（`identityEncoding=raw-bytes`），并同时绑定 LOB kind、总长度和 SQL/参数指纹；因此两个 UTF-8 替换回退哈希相同但代码单元不同的非法代理项序列也会返回 `LOB_CURSOR_EXPIRED`。调用方必须丢弃之前的所有分块并从头读取。可选 `searchTerms` 最多接受 10 个不同关键词，对完整文本做 ordinal 不区分大小写搜索，并返回精确总命中数和有界上下文；`searchContextCharacters` 上限为 500，`maxMatchesPerTerm` 上限为 20，上下文不会拆开有效 UTF-16 代理项对，二进制 LOB 明确拒绝搜索。只有显式 `inspectBase64GzipXml=true` 才在既有字节上限内保留完整文本用于容器检查；`nvarchar` 的 UTF-16LE 数据库值哈希也继续返回。
+
+### 2.5.0 字段选择与 LOB 搜索契约
+
+`describe_table` 全部请求字段缺失时返回空 `columns` 和 `allMatched=false`；未传、空数组或仅空白字段列表保留完整结构及 `columnSelection=null`。字段去除首尾空白、按不区分大小写去重，返回字段保持数据库序号顺序；选择针对 `resolution` 指明的解析后对象，`batch_metadata` 内同样适用。
+
+LOB 搜索与哈希共用一次读取，只保留有界滑动窗口和返回上下文。关键词保留空白，忽略 null/空字符串，按 ordinal 不区分大小写去重，每词最多 512 个 UTF-16 代码单元；每词按非重叠方式计数。偏移从零开始，单位为 UTF-16 代码单元，结束偏移不包含该位置。带 cursor 的调用仍搜索当前完整值，需再次传入搜索参数；搜索选项不改变游标身份。NULL 值返回 `search=null`。
+
+上下文共享至多 256 KiB（或 `maxResultMb` 四分之一）的字节预算，返回数可能少于 `maxMatchesPerTerm`，但精确总数保留且 `search.truncated=true`。包含检查结果、分块和连接上下文的总响应受 `maxResultMb` 限制，超限返回 `RESULT_TOO_LARGE`。上下文和分块保留原始数据，不自动脱敏；敏感值应在 SELECT 投影中裁剪。此功能不记录关键词或上下文，既有 SQL 文本日志规则仍适用。
 
 `inspect_report_payload` 和 `compare_report_payloads` 不把内容转成 SQL Server XML，也不重新序列化，而是直接验证 Base64、GZip、UTF-8 BOM、XML 声明、CRLF/LF/CR 精确计数、Base64 规范/空白属性、XML 可解析性、根节点及可选目标节点唯一性。普通 compare 仍可用于一般差异分析，但只有同时提供 `originalFragmentBase64` 与 `replacementFragmentBase64`，并证明候选解压字节严格等于一次原始字节替换的结果时，`safeForGuardedPatch` 才可能为 true。它们不会加载 FastReport 运行库、执行脚本或数据绑定，也不宣称完成渲染校验。
 

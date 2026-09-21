@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.0 - 2026-09-22
+
+- Search uses a bounded rolling window during the hash scan, without full-text capture. Serialized snippet budgets preserve exact counts; the complete LOB response enforces maxResultMb. Literal whitespace, non-overlapping counts, null results and cursor behavior are documented and covered by regression tests.
+
+- Made `describe_table(columns=[...])` tolerant of mixed valid and stale/guessed names. It now returns every matched column plus a structured `columnSelection` summary with requested, matched, and missing names instead of failing the entire call on the first missing column.
+- Added bounded full-value text search to `read_lob` through `searchTerms`, `searchContextCharacters`, and `maxMatchesPerTerm`. One sequential scan still computes the complete hashes and cursor identity, while exact total match counts and bounded case-insensitive context snippets avoid repeated manual chunk reads of large JSON/XML/configuration LOBs. Binary LOB search remains rejected.
+- Refined tool descriptions so multi-file validation/comparison routes to `compare_modules_to_files` or `verify_deployment_set`, and uncertain module names route through `find_objects` before `get_module_definition`.
+
 ## 2.4.1 - 2026-09-11
 
 - Allowed one-level `OPENQUERY` table sources in single guarded `SELECT`/`WITH` queries and estimated-plan requests. The pass-through text must be a string literal that independently parses as one query under the same read-only, cross-database, DMV, and side-effect restrictions; nested external sources remain blocked. `OPENROWSET`, `OPENDATASOURCE`, and `OPENQUERY` inside controlled multi-statement batches remain rejected.
